@@ -4,6 +4,7 @@ package sync
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"watchparty/client-go/internal/mpv"
@@ -15,6 +16,18 @@ const (
 	PollSecs           = 2.0 // mpv poll period (master heartbeat cadence)
 	Tolerance          = 1.0 // follower drift threshold before re-seek
 	SeekScrubThreshold = 3.0 // |pos - last_pos - PollSecs| beyond this = scrub
+)
+
+// Dual-control gates (v1.4): followers also post discrete events; these
+// keep remote-application echoes from re-posting (loop prevention).
+const (
+	// mpv delivers property-change echoes in ~50ms; 1s headroom covers
+	// slow machines. shortcut: if mpv ever lags past 1s, user actions
+	// right after remote ones could be swallowed — self-heals via poll.
+	actuateQuiet = time.Second
+	// master heartbeats land within one POLL_SECS tick; +1s network slack
+	followerGrace = time.Duration(PollSecs+1.0) * time.Second
+	seekSettle    = 150 * time.Millisecond // let time-pos reach the seek target
 )
 
 // Clock is the engine's time source; fake it in tests.
@@ -40,7 +53,9 @@ type Player interface {
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
 // when nobody consumes yet.
 type UiState struct {
-	Drift float64 // follower pos - master expected, seconds
+	Drift  float64  // follower pos - master expected, seconds
+	Pos    *float64 // local playback position (master: own, follower: own)
+	Paused bool
 }
 
 type Engine struct {
@@ -55,6 +70,14 @@ type Engine struct {
 	lastPause bool
 	wasActive bool
 	snap      *snapshot // follower: latest master position heartbeat
+
+	lastActuate  time.Time // last programmatic SetPause/Seek (echo gate)
+	actuatePause *bool     // pause state that actuation set (nil = seek); an
+	// mpv event is only an echo when it matches this — the user pressing
+	// space right after a remote apply must never be swallowed
+	lastPost time.Time // last follower discrete post (grace window)
+
+	mu sync.Mutex // guards engine state: poll + mpv-event + SSE goroutines
 }
 
 type snapshot struct {
@@ -78,9 +101,26 @@ func (e *Engine) post1(ev room.Event) {
 	}
 }
 
+// setPause/seekTo mark lastActuate so the mpv events they trigger are
+// recognized as our own echoes and never re-posted.
+func (e *Engine) setPause(paused bool) {
+	e.lastActuate = e.Clock.Now()
+	p := paused
+	e.actuatePause = &p
+	_ = e.Player.SetPause(paused)
+}
+
+func (e *Engine) seekTo(t float64) {
+	e.lastActuate = e.Clock.Now()
+	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
+	_ = e.Player.Seek(t)
+}
+
 // OnRoom feeds one SSE event through the engine (client.py on_event parity;
 // position is stored, discrete events are applied to the player).
 func (e *Engine) OnRoom(ev room.Event) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	switch ev.Type {
 	case "position":
 		e.snap = &snapshot{t: ev.T, paused: ev.P, at: e.Clock.Now()}
@@ -91,11 +131,19 @@ func (e *Engine) OnRoom(ev room.Event) {
 	case "load":
 		e.load(ev.Name)
 	case "pause":
-		_ = e.Player.SetPause(true)
+		e.setPause(true)
+		e.lastPause = true // master dedup stays consistent with reality
+		if e.snap != nil {
+			e.snap.paused = true // discrete events are room truth; don't wait for the next heartbeat
+		}
 	case "play":
-		_ = e.Player.SetPause(false)
+		e.setPause(false)
+		e.lastPause = false
+		if e.snap != nil {
+			e.snap.paused = false
+		}
 	case "seek":
-		_ = e.Player.Seek(ev.T)
+		e.seekTo(ev.T)
 	case "chat":
 		// chat OSD over the video (client.py parity: 3s show-text)
 		_ = e.Player.ShowText(fmt.Sprintf("%s: %s", ev.Nick, ev.Text), 3000)
@@ -111,6 +159,8 @@ func (e *Engine) load(name string) {
 
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
 func (e *Engine) OnMpvp(s mpv.State) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.Master {
 		e.masterTick(s)
 		return
@@ -120,32 +170,77 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	}
 }
 
-// OnMpvEvent reacts to pushed mpv events (pause/unpause/seek) so the room
-// hears discrete transitions in ~100ms instead of at the next poll tick
-// (plan Q1: poll-only measured ~1.8s in the interop harness). The poll
-// loop stays as heartbeat/fallback and does not re-post (lastPause/lastPos
-// are updated here first).
+// OnMpvEvent reacts to pushed mpv events (pause/unpause/seek). The master
+// posts discrete transitions instantly (plan Q1). Followers post their own
+// user actions too (v1.4 dual control): the master applies them via OnRoom
+// and its heartbeat re-asserts a consistent room state. Events that merely
+// echo the engine's own programmatic actuation are gated so applying
+// remote state never re-posts it (loop prevention). The seek settle sleep
+// happens outside the lock so the engine keeps serving during it.
 func (e *Engine) OnMpvEvent(name string) {
-	if !e.Master || e.Player == nil {
-		return // followers never post playback state
+	if e.Player == nil {
+		return
+	}
+	if name == "seek" {
+		time.Sleep(seekSettle)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.lastActuate.IsZero() && e.Clock.Since(e.lastActuate) < actuateQuiet {
+		if name == "seek" || (e.actuatePause != nil && *e.actuatePause == (name == "pause")) {
+			return // our own SetPause/Seek echoing back as mpv events
+		}
+		// opposite-direction event inside the window: the user acted — post it
 	}
 	switch name {
-	case "pause":
-		if !e.lastPause {
-			e.post1(room.Event{Type: "pause"})
-			e.lastPause = true
+	case "pause", "unpause":
+		wantPause := name == "pause"
+		typ := "pause" // wire types are play/pause, mpv says pause/unpause
+		if !wantPause {
+			typ = "play"
 		}
-	case "unpause":
-		if e.lastPause {
-			e.post1(room.Event{Type: "play"})
-			e.lastPause = false
+		if e.Master {
+			if wantPause != e.lastPause {
+				e.postDiscrete(room.Event{Type: typ})
+				e.lastPause = wantPause
+			}
+			return
 		}
+		// follower: post only when the room does not know this state yet
+		// (a matching snapshot means this pause came from the room itself)
+		if e.snap == nil || e.snap.paused == wantPause {
+			return
+		}
+		e.lastPost = e.Clock.Now()
+		e.postDiscrete(room.Event{Type: typ})
 	case "seek":
-		time.Sleep(150 * time.Millisecond) // let time-pos settle at the target
-		if t, ok := e.Player.Pos(); ok {
-			e.post1(room.Event{Type: "seek", T: t})
-			e.lastPos = nil // poll scrub-check restarts fresh (no double post)
+		t, ok := e.Player.Pos()
+		if !ok {
+			return
 		}
+		if e.Master {
+			e.postDiscrete(room.Event{Type: "seek", T: t})
+			e.lastPos = nil // poll scrub-check restarts fresh (no double post)
+			return
+		}
+		if e.snap == nil {
+			return // nothing to sync against yet
+		}
+		e.lastPost = e.Clock.Now()
+		e.postDiscrete(room.Event{Type: "seek", T: t})
+	}
+}
+
+// postDiscrete posts one discrete event and mirrors it in the local log:
+// own SSE events are echo-filtered, so without this the actor's own
+// terminal would never show their pause/play/seek.
+func (e *Engine) postDiscrete(ev room.Event) {
+	e.post1(ev)
+	switch ev.Type {
+	case "pause", "play":
+		e.logf("> %s", ev.Type)
+	case "seek":
+		e.logf("> seek @%.1fs", ev.T)
 	}
 }
 
@@ -154,19 +249,20 @@ func (e *Engine) masterTick(s mpv.State) {
 		return // nothing loaded yet
 	}
 	if s.Pause != e.lastPause && !s.Idle {
+		typ := "play"
 		if s.Pause {
-			e.post1(room.Event{Type: "pause"})
-		} else {
-			e.post1(room.Event{Type: "play"})
+			typ = "pause"
 		}
+		e.postDiscrete(room.Event{Type: typ})
 		e.lastPause = s.Pause
 	}
 	if s.Pos != nil {
 		if e.lastPos != nil && abs(*s.Pos-*e.lastPos-PollSecs) > SeekScrubThreshold {
-			e.post1(room.Event{Type: "seek", T: *s.Pos}) // user scrubbed
+			e.postDiscrete(room.Event{Type: "seek", T: *s.Pos}) // user scrubbed
 		}
 		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause})
 		e.lastPos = s.Pos
+		e.emitUi(s, 0) // master: no drift, but the status bar wants pos/paused
 	}
 	if s.Idle && e.wasActive {
 		e.post1(room.Event{Type: "ended"}) // EOF: server auto-advances the queue
@@ -177,30 +273,36 @@ func (e *Engine) masterTick(s mpv.State) {
 }
 
 func (e *Engine) followerTick(s mpv.State) {
+	if !e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+		// we just acted (dual control): give the master's heartbeat time
+		// to reflect it before self-correcting back
+		e.emitUi(s, 0)
+		return
+	}
 	if e.snap.paused != s.Pause {
 		// self-heal: converge to the master's playback state even if the
 		// discrete play/pause event never arrived
-		_ = e.Player.SetPause(e.snap.paused)
+		e.setPause(e.snap.paused)
 		return
 	}
 	if !e.snap.paused {
 		// age must not grow while the master stands still
 		expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
 		drift := *s.Pos - expected
-		e.emitUi(drift)
+		e.emitUi(s, drift)
 		if abs(drift) > Tolerance {
-			_ = e.Player.Seek(expected)
+			e.seekTo(expected)
 		}
 	}
 	// both paused: hold position
 }
 
-func (e *Engine) emitUi(drift float64) {
+func (e *Engine) emitUi(s mpv.State, drift float64) {
 	if e.Ui == nil {
 		return
 	}
 	select {
-	case e.Ui <- UiState{Drift: drift}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause}:
 	default:
 	}
 }

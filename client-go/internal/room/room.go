@@ -43,7 +43,14 @@ func New(base, id string) *Client {
 		Base:   strings.TrimRight(base, "/"),
 		ID:     id,
 		stream: &http.Client{},
-		call:   &http.Client{Timeout: 5 * time.Second},
+		// DisableKeepAlives: the server (node) reaps idle connections after
+		// ~5s; a rare POST reusing such a connection times out instead of
+		// being processed. Heartbeat posts are 2s apart so a fresh
+		// connection per call costs nothing measurable.
+		call: &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: &http.Transport{DisableKeepAlives: true},
+		},
 	}
 }
 

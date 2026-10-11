@@ -211,6 +211,20 @@ func TestPickerQGuards(t *testing.T) {
 	}
 }
 
+func TestStatusShowsPosition(t *testing.T) {
+	m := New("t", nil, nil, false)
+	p := 65.0
+	m = upd(t, m, sync.UiState{Pos: &p, Paused: true})
+	s := m.statusLine()
+	if !strings.Contains(s, "⏸ 1:05") {
+		t.Fatalf("status missing paused clock: %q", s)
+	}
+	m = upd(t, m, sync.UiState{Pos: &p, Paused: false})
+	if !strings.Contains(m.statusLine(), "▶ 1:05") {
+		t.Fatalf("status missing playing clock: %q", m.statusLine())
+	}
+}
+
 func TestPickerFlow(t *testing.T) {
 	m := New("t", nil, nil, false)
 	m.mode = modePick

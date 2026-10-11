@@ -66,10 +66,10 @@ type Model struct {
 	log        []string
 	peers      map[string]bool
 	now        string
-	queue      []string // server queue state (hello/queue events)
-	files      []string // last known video list (typo guard, any filesMsg)
-	drift      *float64 // last follower drift, nil until the first heartbeat
-	conn       string   // connecting | connected | reconnecting | lost
+	queue      []string      // server queue state (hello/queue events)
+	files      []string      // last known video list (typo guard, any filesMsg)
+	st         *sync.UiState // live playback state for the status bar
+	conn       string        // connecting | connected | reconnecting | lost
 	mode       mode
 	pickItems  []string
 	pickCursor int
@@ -162,8 +162,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case room.Event:
 		return m.onEvent(msg), nil
 	case sync.UiState:
-		d := msg.Drift
-		m.drift = &d
+		st := msg
+		m.st = &st
 	case filesMsg:
 		if msg.err != nil {
 			return m.logf("> err: %s", msg.err), nil
@@ -472,10 +472,17 @@ func (m Model) statusLine() string {
 	mid := ""
 	if m.master {
 		mid = fmt.Sprintf("%d listener(s)", len(m.peers))
-	} else if m.drift != nil {
-		mid = fmt.Sprintf("drift %.1fs", *m.drift)
+	} else if m.st != nil {
+		mid = fmt.Sprintf("drift %.1fs", m.st.Drift)
 	} else {
 		mid = m.peerLine()
+	}
+	if m.st != nil && m.st.Pos != nil { // live play state + clock
+		icon := "▶"
+		if m.st.Paused {
+			icon = "⏸"
+		}
+		mid = icon + " " + mmss(*m.st.Pos) + " · " + mid
 	}
 	queue := ""
 	if len(m.queue) > 0 {
@@ -498,6 +505,11 @@ func (m Model) peerLine() string {
 	}
 	sort.Strings(names) // stable render, map order would flicker
 	return strings.Join(names, ", ")
+}
+
+func mmss(sec float64) string {
+	m, s := int(sec)/60, int(sec)%60
+	return fmt.Sprintf("%d:%02d", m, s)
 }
 
 func orDash(s string) string {
