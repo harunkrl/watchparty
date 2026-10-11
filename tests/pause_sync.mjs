@@ -208,6 +208,7 @@ try {
     const fp = await mpvCall(fSock, ['get_property', 'time-pos']);
     if (fp >= 59 && fp <= 65) {
       converged = true;
+      console.log(`follower converged ${Date.now() - t2}ms after master seek`);
       break;
     }
     await sleep(300);

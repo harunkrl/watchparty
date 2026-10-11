@@ -196,6 +196,21 @@ func TestPickerQEnqueues(t *testing.T) {
 	}
 }
 
+func TestPickerQGuards(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.mode = modePick
+	m = upd(t, m, filesMsg{files: []string{"a.mkv"}})
+	m = upd(t, m, room.Event{Type: "hello", Now: "a.mkv"})
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if m.mode != modeInput {
+		t.Fatal("q did not leave pick mode")
+	}
+	v := m.View()
+	if !strings.Contains(v, "already playing") || strings.Contains(v, "> queued") {
+		t.Fatalf("picker q bypassed guard:\n%s", v)
+	}
+}
+
 func TestPickerFlow(t *testing.T) {
 	m := New("t", nil, nil, false)
 	m.mode = modePick

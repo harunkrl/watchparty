@@ -252,15 +252,31 @@ func (m Model) pickKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "q":
 		if m.pickCursor < len(m.pickItems) {
-			name := m.pickItems[m.pickCursor]
 			m.mode = modeInput
-			m = m.logf("> queued %s", name)
-			return m, postEvent(m.api, room.Event{Type: "enqueue", Name: name})
+			return m.enqueue(m.pickItems[m.pickCursor])
 		}
 	case "esc":
 		m.mode = modeInput
 	}
 	return m, nil
+}
+
+// enqueue mirrors the server's enqueue conditions for instant feedback;
+// on success its queue broadcast confirms (it reaches us too).
+func (m Model) enqueue(name string) (Model, tea.Cmd) {
+	if name == m.now {
+		return m.logf("> %s is already playing", name), nil
+	}
+	for _, q := range m.queue {
+		if q == name {
+			return m.logf("> %s is already queued", name), nil
+		}
+	}
+	if !m.knownFile(name) {
+		return m.logf("> no such file: %s (list to refresh)", name), nil
+	}
+	m = m.logf("> queued %s", name)
+	return m, postEvent(m.api, room.Event{Type: "enqueue", Name: name})
 }
 
 // submit parses the input line and dispatches it.
@@ -311,20 +327,7 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// mirror the server's enqueue conditions for instant feedback;
-		// on success its queue broadcast confirms (it reaches us too)
-		if c.Arg == m.now {
-			return m.logf("> %s is already playing", c.Arg), nil
-		}
-		for _, q := range m.queue {
-			if q == c.Arg {
-				return m.logf("> %s is already queued", c.Arg), nil
-			}
-		}
-		if !m.knownFile(c.Arg) {
-			return m.logf("> no such file: %s (list to refresh)", c.Arg), nil
-		}
-		return m, postEvent(m.api, room.Event{Type: "enqueue", Name: c.Arg})
+		return m.enqueue(c.Arg)
 	case cmd.Skip:
 		return m, postEvent(m.api, room.Event{Type: "skip"})
 	}
