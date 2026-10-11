@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -92,6 +93,57 @@ func TestReconnectingAndLostStates(t *testing.T) {
 	m = upd(t, m, StreamClosedMsg{})
 	if m.conn != "lost" {
 		t.Fatalf("conn = %q, want lost", m.conn)
+	}
+}
+
+func TestInputHistory(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.input.SetValue("chat hi")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // submits -> history grows
+	if len(m.hist) != 1 || m.hist[0] != "chat hi" {
+		t.Fatalf("hist = %v", m.hist)
+	}
+	m.input.SetValue("")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	if m.input.Value() != "chat hi" {
+		t.Fatalf("up recalled %q, want chat hi", m.input.Value())
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyDown}) // back to the empty draft
+	if m.input.Value() != "" {
+		t.Fatalf("down restored %q, want empty draft", m.input.Value())
+	}
+}
+
+func TestScrollPgUpPgDown(t *testing.T) {
+	m := New("t", nil, nil, false)
+	for i := 0; i < 30; i++ {
+		m = m.logLine(fmt.Sprintf("line-%02d", i))
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyPgUp})
+	if m.scroll <= 0 {
+		t.Fatal("pgup did not scroll")
+	}
+	if !strings.Contains(m.View(), "line-00") {
+		t.Fatalf("scrolled view misses oldest line (scroll=%d)", m.scroll)
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.scroll != 0 {
+		t.Fatalf("scroll = %d, want 0 after pgdn", m.scroll)
+	}
+	if !strings.Contains(m.View(), "line-29") {
+		t.Fatal("unscrolled view misses newest line")
+	}
+}
+
+func TestQueueCountInStatus(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a", "b"}})
+	if !strings.Contains(m.statusLine(), "q:2") {
+		t.Fatalf("status missing queue count: %q", m.statusLine())
+	}
+	m = upd(t, m, room.Event{Type: "queue", Queue: nil})
+	if strings.Contains(m.statusLine(), "q:") {
+		t.Fatalf("queue count did not clear: %q", m.statusLine())
 	}
 }
 

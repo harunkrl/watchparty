@@ -1,5 +1,7 @@
 // Package mpv spawns and drives an external mpv process over its JSON IPC
 // (unix socket / windows named pipe), mirroring client.py's Player/Ipc.
+// A dedicated reader goroutine routes command replies by request_id and
+// forwards mpv events (pause/unpause/seek) for the instant sync path.
 package mpv
 
 import (
@@ -24,6 +26,7 @@ import (
 const (
 	demuxerReadaheadSecs = 300
 	demuxerMaxBytes      = "2GiB"
+	cmdTimeout           = 5 * time.Second
 )
 
 // State is one poll sample of the player, consumed by the sync engine.
@@ -34,20 +37,24 @@ type State struct {
 	Exited bool // mpv window was closed; client should shut down
 }
 
+// Event is one pushed mpv notification (Name is the mpv event id, e.g.
+// "pause", "unpause", "seek").
+type Event struct {
+	Name string
+}
+
 type Player struct {
 	base   string
 	proc   *exec.Cmd
 	conn   net.Conn
-	rd     *bufio.Reader
 	dir    string        // temp dir holding the socket (removed on Close)
 	exited chan struct{} // closed when the mpv process is reaped
-	mu     sync.Mutex
-	next   int
+	events chan Event
+	mu     sync.Mutex // guards pend, seq and writes
+	pend   map[int]chan ipcMsg
+	seq    int
 }
 
-// Start spawns mpv and connects to its IPC socket (50 x 100ms retries,
-// python parity). A nil cmd.Stdin means mpv reads from os.DevNull —
-// otherwise mpv would steal the terminal keyboard from the TUI.
 func Start(base string, extra []string) (*Player, error) {
 	var dir, sock string
 	if runtime.GOOS == "windows" {
@@ -68,12 +75,17 @@ func Start(base string, extra []string) (*Player, error) {
 		"--demuxer-max-bytes=" + demuxerMaxBytes,
 	}, extra...)
 	cmd := exec.Command("mpv", args...)
+	// Stdin nil = os.DevNull: otherwise mpv steals the keyboard from the TUI
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("could not start mpv (is it installed?): %w", err)
 	}
 	exited := make(chan struct{})
-	p := &Player{base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited}
+	p := &Player{
+		base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited,
+		events: make(chan Event, 32),
+		pend:   map[int]chan ipcMsg{},
+	}
 	go func() {
 		_ = cmd.Wait()
 		close(exited) // Poll reports this as State{Exited: true}
@@ -82,7 +94,11 @@ func Start(base string, extra []string) (*Player, error) {
 		conn, err := dialPipe(sock)
 		if err == nil {
 			p.conn = conn
-			p.rd = bufio.NewReader(conn)
+			// mpv pushes nothing to passive clients: subscribe to the
+			// pause property so the master path hears space-bar presses
+			// instantly (the reply carries request_id 0 and is dropped)
+			_ = p.tell("observe_property", 1, "pause")
+			go p.readLoop()
 			return p, nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -91,40 +107,93 @@ func Start(base string, extra []string) (*Player, error) {
 	return nil, fmt.Errorf("could not connect to mpv ipc")
 }
 
+// Events exposes mpv's pushed notifications (never closed; drops when full).
+func (p *Player) Events() <-chan Event { return p.events }
+
 type ipcMsg struct {
 	Data      json.RawMessage `json:"data"`
 	Error     string          `json:"error"`
 	RequestID int             `json:"request_id"`
+	Event     string          `json:"event"`
+	PropName  string          `json:"name"` // property-change payload
 }
 
-// cmd runs one IPC command and waits for its response. Events and stale
-// fire-and-forget replies are skipped, malformed lines ignored (python parity).
+// eventName maps mpv notifications to engine event names: the engine
+// speaks pause/unpause, not raw property changes.
+func eventName(m ipcMsg) string {
+	if m.Event == "property-change" && m.PropName == "pause" {
+		if string(m.Data) == "true" {
+			return "pause"
+		}
+		return "unpause"
+	}
+	return m.Event
+}
+
+// readLoop owns the connection: routes replies to their waiting cmd() call
+// and forwards mpv events. On connection loss it fails all waiters.
+func (p *Player) readLoop() {
+	sc := bufio.NewScanner(p.conn)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var m ipcMsg
+		if json.Unmarshal(sc.Bytes(), &m) != nil {
+			continue // malformed line: skip, python parity
+		}
+		if m.RequestID != 0 {
+			p.mu.Lock()
+			ch, ok := p.pend[m.RequestID]
+			delete(p.pend, m.RequestID)
+			p.mu.Unlock()
+			if ok {
+				ch <- m // buffered(1); the waiter may have timed out and left
+			}
+			continue
+		}
+		if m.Event != "" {
+			select {
+			case p.events <- Event{Name: eventName(m)}:
+			default: // slow consumer: drop rather than block playback control
+			}
+		}
+	}
+	p.mu.Lock()
+	for rid, ch := range p.pend {
+		delete(p.pend, rid)
+		ch <- ipcMsg{Error: "ipc closed"}
+	}
+	p.mu.Unlock()
+}
+
+// cmd runs one IPC command and waits for its response.
 func (p *Player) cmd(args ...any) (json.RawMessage, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.next++
-	if err := p.write(struct {
+	p.seq++
+	rid := p.seq
+	ch := make(chan ipcMsg, 1)
+	p.pend[rid] = ch
+	err := p.writeLocked(struct {
 		Command   []any `json:"command"`
 		RequestID int   `json:"request_id"`
-	}{args, p.next}); err != nil {
+	}{args, rid})
+	p.mu.Unlock()
+	if err != nil {
+		p.mu.Lock()
+		delete(p.pend, rid)
+		p.mu.Unlock()
 		return nil, err
 	}
-	for {
-		line, err := p.rd.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		var m ipcMsg
-		if json.Unmarshal([]byte(line), &m) != nil {
-			continue
-		}
-		if m.RequestID != p.next {
-			continue
-		}
+	select {
+	case m := <-ch:
 		if m.Error != "success" {
 			return nil, fmt.Errorf("mpv: %s: %v", m.Error, args)
 		}
 		return m.Data, nil
+	case <-time.After(cmdTimeout):
+		p.mu.Lock()
+		delete(p.pend, rid)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("mpv: timeout: %v", args)
 	}
 }
 
@@ -132,12 +201,12 @@ func (p *Player) cmd(args ...any) (json.RawMessage, error) {
 func (p *Player) tell(args ...any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.write(struct {
+	return p.writeLocked(struct {
 		Command []any `json:"command"`
 	}{args})
 }
 
-func (p *Player) write(v any) error {
+func (p *Player) writeLocked(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -154,6 +223,16 @@ func (p *Player) Get(prop string) (any, error) {
 	}
 	var v any
 	return v, json.Unmarshal(raw, &v)
+}
+
+// Pos returns the current playback position; ok=false when nothing plays.
+func (p *Player) Pos() (float64, bool) {
+	v, err := p.Get("time-pos")
+	if err != nil || v == nil {
+		return 0, false
+	}
+	f, ok := v.(float64)
+	return f, ok
 }
 
 // SetPause, Seek and ShowText are the engine's actuator surface (Player
@@ -200,8 +279,8 @@ func (p *Player) Load(name string) error {
 }
 
 // Poll samples player state every period into out until ctx is cancelled
-// or mpv exits (plan Q1: polling; observe-property only if M4 measurement
-// justifies it).
+// or mpv exits (plan Q1: polling stays the heartbeat; pushed events carry
+// the instant discrete transitions).
 func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- State) {
 	t := time.NewTicker(period)
 	defer t.Stop()
@@ -241,7 +320,7 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 // impossible (risk C) — and removes the temp socket dir.
 func (p *Player) Close() {
 	if p.conn != nil {
-		p.conn.Close() // unblocks any pending IPC read
+		p.conn.Close() // unblocks the reader and any pending cmd
 	}
 	if p.proc.Process != nil {
 		_ = terminate(p.proc.Process)

@@ -34,6 +34,7 @@ type Player interface {
 	SetPause(paused bool) error
 	Seek(t float64) error
 	ShowText(text string, ms int) error
+	Pos() (float64, bool)
 }
 
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
@@ -116,6 +117,35 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	}
 	if s.Pos != nil && e.snap != nil {
 		e.followerTick(s)
+	}
+}
+
+// OnMpvEvent reacts to pushed mpv events (pause/unpause/seek) so the room
+// hears discrete transitions in ~100ms instead of at the next poll tick
+// (plan Q1: poll-only measured ~1.8s in the interop harness). The poll
+// loop stays as heartbeat/fallback and does not re-post (lastPause/lastPos
+// are updated here first).
+func (e *Engine) OnMpvEvent(name string) {
+	if !e.Master || e.Player == nil {
+		return // followers never post playback state
+	}
+	switch name {
+	case "pause":
+		if !e.lastPause {
+			e.post1(room.Event{Type: "pause"})
+			e.lastPause = true
+		}
+	case "unpause":
+		if e.lastPause {
+			e.post1(room.Event{Type: "play"})
+			e.lastPause = false
+		}
+	case "seek":
+		time.Sleep(150 * time.Millisecond) // let time-pos settle at the target
+		if t, ok := e.Player.Pos(); ok {
+			e.post1(room.Event{Type: "seek", T: t})
+			e.lastPos = nil // poll scrub-check restarts fresh (no double post)
+		}
 	}
 }
 

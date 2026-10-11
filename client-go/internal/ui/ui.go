@@ -1,5 +1,6 @@
 // Package ui renders the Bubble Tea control surface: status bar (role,
-// drift/listeners, connection state), room log, cursor picker, input line.
+// drift/listeners, connection state, queue), room log with scroll and
+// input history, cursor picker, framed with lipgloss.
 package ui
 
 import (
@@ -17,7 +18,10 @@ import (
 	"watchparty/client-go/internal/sync"
 )
 
-const logCap = 500
+const (
+	logCap  = 500
+	histCap = 100
+)
 
 type mode int
 
@@ -27,9 +31,31 @@ const (
 )
 
 var (
-	statusStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	pickCurStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("3"))
+	frame = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	dim   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	title = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+
+	roleStyle = map[string]lipgloss.Style{
+		"master":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("3")),
+		"follower": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")),
+	}
+	connStyle = map[string]lipgloss.Style{
+		"connected":    lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+		"reconnecting": lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+		"lost":         lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+		"connecting":   dim,
+	}
+	nickColors = []lipgloss.Color{"205", "45", "214", "84", "117", "212"}
+	pickCur    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("3"))
 )
+
+func nickStyle(nick string) lipgloss.Style {
+	h := 0
+	for _, r := range nick {
+		h += int(r)
+	}
+	return lipgloss.NewStyle().Bold(true).Foreground(nickColors[h%len(nickColors)])
+}
 
 type Model struct {
 	nick       string
@@ -40,11 +66,16 @@ type Model struct {
 	log        []string
 	peers      map[string]bool
 	now        string
+	queueN     int
 	drift      *float64 // last follower drift, nil until the first heartbeat
 	conn       string   // connecting | connected | reconnecting | lost
 	mode       mode
 	pickItems  []string
 	pickCursor int
+	hist       []string // input history, newest last
+	histIdx    int      // -1 = live editing
+	draft      string   // saved while browsing history
+	scroll     int      // lines above the bottom edge (0 = follow)
 	width      int
 	height     int
 }
@@ -52,14 +83,14 @@ type Model struct {
 func New(nick string, api *room.Client, player *mpv.Player, master bool) Model {
 	in := textinput.New()
 	in.Prompt = "> "
-	in.Placeholder = "chat <msg> | list | pick | help"
+	in.Placeholder = "chat <msg> | pick | list | help"
 	in.Focus()
 	// sane defaults so the first frame renders before WindowSizeMsg arrives
 	// (and in size-less ptys used by the test harness)
 	return Model{
 		nick: nick, master: master, api: api, player: player,
 		input: in, peers: map[string]bool{}, conn: "connecting",
-		width: 80, height: 24,
+		histIdx: -1, width: 80, height: 24,
 	}
 }
 
@@ -106,7 +137,11 @@ func fetchFiles(api *room.Client) tea.Cmd {
 }
 
 func (m Model) logf(format string, args ...any) Model {
-	m.log = append(m.log, fmt.Sprintf(format, args...))
+	return m.logLine(fmt.Sprintf(format, args...))
+}
+
+func (m Model) logLine(line string) Model {
+	m.log = append(m.log, line)
 	if len(m.log) > logCap {
 		m.log = m.log[len(m.log)-logCap:]
 	}
@@ -117,23 +152,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.input.Width = msg.Width - 4
+		m.input.Width = m.contentWidth() - 4
 	case tea.KeyMsg:
 		if m.mode == modePick {
 			return m.pickKeys(msg)
 		}
-		switch msg.String() {
-		case "enter":
-			return m.submit()
-		case "esc":
-			m.input.SetValue("")
-		case "ctrl+c":
-			return m, tea.Quit
-		default:
-			var c tea.Cmd
-			m.input, c = m.input.Update(msg)
-			return m, c
-		}
+		return m.inputKeys(msg)
 	case room.Event:
 		return m.onEvent(msg), nil
 	case sync.UiState:
@@ -160,12 +184,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.logf("> err: %s", msg.err), nil
 	case ReconnectingMsg:
 		m.conn = "reconnecting"
-		return m.logf("%s", msg.Note), nil
+		return m.logLine(msg.Note), nil
 	case StreamClosedMsg:
 		m.conn = "lost"
-		return m.logf("> connection closed"), nil
+		return m.logLine("> connection closed"), nil
 	case MpvExitedMsg:
-		return m.logf("> mpv exited (window closed?) - restart the client"), tea.Quit
+		return m.logLine("> mpv exited (window closed?) - restart the client"), tea.Quit
+	}
+	return m, nil
+}
+
+// inputKeys handles typing plus history browsing and log scrolling.
+func (m Model) inputKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		return m.submit()
+	case "esc":
+		m.input.SetValue("")
+		m.scroll = 0
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up":
+		if len(m.hist) > 0 {
+			if m.histIdx == -1 {
+				m.draft, m.histIdx = m.input.Value(), len(m.hist)-1
+			} else if m.histIdx > 0 {
+				m.histIdx--
+			}
+			m.input.SetValue(m.hist[m.histIdx])
+		}
+	case "down":
+		if m.histIdx != -1 {
+			if m.histIdx < len(m.hist)-1 {
+				m.histIdx++
+				m.input.SetValue(m.hist[m.histIdx])
+			} else {
+				m.histIdx = -1
+				m.input.SetValue(m.draft)
+			}
+		}
+	case "pgup":
+		m.scroll = min(m.scroll+10, max(0, len(m.log)-1))
+	case "pgdown":
+		m.scroll = max(0, m.scroll-10)
+	default:
+		var c tea.Cmd
+		m.input, c = m.input.Update(msg)
+		return m, c
 	}
 	return m, nil
 }
@@ -196,8 +261,13 @@ func (m Model) pickKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) submit() (tea.Model, tea.Cmd) {
 	line := strings.TrimSpace(m.input.Value())
 	m.input.SetValue("")
+	m.histIdx, m.draft = -1, ""
 	if line == "" {
 		return m, nil
+	}
+	m.hist = append(m.hist, line)
+	if len(m.hist) > histCap {
+		m.hist = m.hist[len(m.hist)-histCap:]
 	}
 	c, err := cmd.Parse(line)
 	if err != nil {
@@ -210,7 +280,7 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 		return m.logf("> %s", cmd.Usage), nil
 	case cmd.Chat:
 		// local echo: the server never reflects our own chat back
-		m = m.logf("[%s] %s", m.nick, c.Arg)
+		m = m.logLine(fmt.Sprintf("[%s] %s", nickStyle(m.nick).Render(m.nick), c.Arg))
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: c.Arg})
 	case cmd.List:
 		return m, fetchFiles(m.api)
@@ -231,19 +301,25 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) onEvent(ev room.Event) Model {
-	if line := RenderEvent(ev); line != "" {
-		m = m.logf("%s", line)
+	if ev.Type == "chat" {
+		// colored nick, shared shape with RenderEvent (headless parity)
+		m = m.logLine(fmt.Sprintf("[%s] %s", nickStyle(ev.Nick).Render(ev.Nick), ev.Text))
+	} else if line := RenderEvent(ev); line != "" {
+		m = m.logLine(line)
 	}
 	switch ev.Type {
 	case "hello":
 		m.now = ev.Now
 		m.conn = "connected"
+		m.queueN = len(ev.Queue)
 	case "join":
 		m.peers[ev.Nick] = true
 	case "bye":
 		delete(m.peers, ev.Nick)
 	case "load":
 		m.now = ev.Name
+	case "queue":
+		m.queueN = len(ev.Queue)
 	}
 	// position heartbeats are deliberately not logged (client.py parity)
 	return m
@@ -273,44 +349,66 @@ func RenderEvent(ev room.Event) string {
 	return ""
 }
 
+// contentWidth is the usable width inside the frame.
+func (m Model) contentWidth() int {
+	w := m.width - frame.GetHorizontalFrameSize()
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
 func (m Model) View() string {
 	if m.height == 0 {
 		return "connecting…\n"
 	}
-	body := m.height - 2
+	inner := m.height - frame.GetVerticalFrameSize()
+	body := inner - 2 // status + input lines
+	cw := m.contentWidth()
+
 	var lines []string
 	if m.mode == modePick {
 		lines = m.pickView()
 	} else {
 		lines = m.log
 	}
-	if len(lines) > body {
-		lines = lines[len(lines)-body:]
+	// scroll: 0 pins to the newest line; >0 looks back into history
+	lo, hi := 0, len(lines)
+	if hi > body {
+		lo = hi - body
 	}
+	if m.scroll > 0 {
+		lo = max(0, lo-m.scroll)
+		hi = min(len(lines), lo+body)
+	}
+
 	var b strings.Builder
-	b.WriteString(statusStyle.Render(m.statusLine()))
+	b.WriteString(m.statusLine())
 	b.WriteByte('\n')
-	for i := 0; i < body; i++ {
-		if i < len(lines) {
-			b.WriteString(truncate(lines[i], m.width))
+	for i := lo; i < lo+body; i++ {
+		if i < hi {
+			b.WriteString(truncate(lines[i], cw))
 		}
-		if i < body-1 {
+		if i < lo+body-1 {
 			b.WriteByte('\n')
 		}
 	}
 	b.WriteByte('\n')
 	b.WriteString(m.input.View())
-	return b.String()
+	if m.scroll > 0 {
+		b.WriteString(dim.Render(fmt.Sprintf("  (scrolled %d — pgdn/end)", m.scroll)))
+	}
+	return frame.Render(b.String())
 }
 
 func (m Model) pickView() []string {
-	out := []string{"pick a film  (up/down/j/k move - enter play - esc cancel)"}
+	out := []string{title.Render("pick a film") + dim.Render("  (up/down/j/k move - enter play - esc cancel)")}
 	if len(m.pickItems) == 0 {
 		out = append(out, "(no files / loading...)")
 	}
 	for i, f := range m.pickItems {
 		if i == m.pickCursor {
-			out = append(out, pickCurStyle.Render("› "+f))
+			out = append(out, pickCur.Render("› "+f))
 		} else {
 			out = append(out, "  "+f)
 		}
@@ -331,7 +429,15 @@ func (m Model) statusLine() string {
 	} else {
 		mid = m.peerLine()
 	}
-	return fmt.Sprintf("watchparty - %s - now: %s - %s - %s", role, orDash(m.now), mid, m.conn)
+	queue := ""
+	if m.queueN > 0 {
+		queue = fmt.Sprintf(" · q:%d", m.queueN)
+	}
+	return fmt.Sprintf("%s · %s · %s · %s",
+		roleStyle[role].Render("watchparty "+role),
+		"now: "+orDash(m.now),
+		mid+queue,
+		connStyle[m.conn].Render(m.conn))
 }
 
 func (m Model) peerLine() string {
@@ -361,6 +467,11 @@ func truncate(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	// shortcut: styled (ANSI) lines are rare and short-lived; plain cut is
+	// good enough and never crashes on escape codes
 	r := []rune(s)
 	if len(r) <= w {
 		return s

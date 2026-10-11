@@ -13,11 +13,18 @@ type fakePlayer struct {
 	pauses   []bool
 	seeks    []float64
 	showText []string
+	pos      *float64
 }
 
 func (f *fakePlayer) Load(name string) error { f.loads = append(f.loads, name); return nil }
 func (f *fakePlayer) SetPause(p bool) error  { f.pauses = append(f.pauses, p); return nil }
 func (f *fakePlayer) Seek(t float64) error   { f.seeks = append(f.seeks, t); return nil }
+func (f *fakePlayer) Pos() (float64, bool) {
+	if f.pos == nil {
+		return 0, false
+	}
+	return *f.pos, true
+}
 func (f *fakePlayer) ShowText(s string, ms int) error {
 	f.showText = append(f.showText, s)
 	return nil
@@ -217,5 +224,53 @@ func TestUiStateEmittedOnFollowerTick(t *testing.T) {
 		}
 	default:
 		t.Fatal("no UiState emitted")
+	}
+}
+
+// --- instant event path (plan Q1) -----------------------------------------
+
+func countType(t *testing.T, evs []room.Event, typ string) int {
+	t.Helper()
+	n := 0
+	for _, ev := range evs {
+		if ev.Type == typ {
+			n++
+		}
+	}
+	return n
+}
+
+func TestInstantPauseNoDoublePost(t *testing.T) {
+	e, _, po := newEngine(true)
+	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: false}) // baseline heartbeat
+	e.OnMpvEvent("pause")                          // instant path posts
+	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: true})  // poll must NOT re-post
+	if n := countType(t, po.events, "pause"); n != 1 {
+		t.Fatalf("pause posted %d times, want 1 (events: %v)", n, evType(t, po.events))
+	}
+}
+
+func TestInstantSeekSinglePost(t *testing.T) {
+	e, pl, po := newEngine(true)
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // lastPos = 10
+	pl.pos = ptr(60)                                // user scrubbed
+	e.OnMpvEvent("seek")                            // instant path posts 60
+	e.OnMpvp(mpv.State{Pos: ptr(60), Pause: false}) // poll scrub-check skipped
+	if n := countType(t, po.events, "seek"); n != 1 {
+		t.Fatalf("seek posted %d times, want 1 (events: %v)", n, evType(t, po.events))
+	}
+	last := po.events[len(po.events)-2] // seek followed by its heartbeat
+	if last.Type != "seek" || last.T != 60 {
+		t.Fatalf("instant seek payload wrong: %+v", last)
+	}
+}
+
+func TestInstantEventsFollowerNeverPosts(t *testing.T) {
+	e, _, po := newEngine(false)
+	e.OnMpvEvent("pause")
+	e.OnMpvEvent("unpause")
+	e.OnMpvEvent("seek")
+	if len(po.events) != 0 {
+		t.Fatalf("follower posted on instant events: %v", evType(t, po.events))
 	}
 }

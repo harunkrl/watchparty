@@ -93,6 +93,11 @@ func main() {
 	}
 
 	go player.Poll(ctx, sync.PollSecs*time.Second, chMpv)
+	go func() { // pushed mpv events -> instant discrete posts (master only)
+		for ev := range player.Events() {
+			engine.OnMpvEvent(ev.Name)
+		}
+	}()
 	go func() {
 		for {
 			var st mpv.State
