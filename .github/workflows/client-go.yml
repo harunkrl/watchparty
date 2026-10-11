@@ -1,0 +1,51 @@
+name: client-go
+
+on:
+  push:
+    paths: [client-go/**, .github/workflows/client-go.yml]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-go
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./... && go test ./...
+      - run: >-
+          go build -trimpath -ldflags="-s -w"
+          -o watchparty${{ matrix.ext }} .
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchparty-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: client-go/watchparty${{ matrix.ext }}

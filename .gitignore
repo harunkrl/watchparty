@@ -1,0 +1,4 @@
+# local test videos: never commit media
+videos/*
+!videos/.gitkeep
+__pycache__/

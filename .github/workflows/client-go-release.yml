@@ -1,0 +1,92 @@
+name: client-go-release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-go
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./... && go test ./...
+      - run: >-
+          go build -trimpath -ldflags="-s -w"
+          -o watchparty${{ matrix.ext }} .
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchparty-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: client-go/watchparty${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: assemble zips + windows mpv bundle
+        run: |
+          mkdir dist
+          for d in artifacts/watchparty-*; do
+            plat=$(basename "$d")
+            zip -j "dist/${plat}.zip" "$d"/watchparty* \
+              client-go/README-friend.txt
+          done
+          # friend bundle: portable mpv next to the exe (plan Q2)
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
+          latest=$(curl -sL \
+            "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=1")
+          url=$(echo "$latest" | jq -r '
+            .[0].assets[]
+            | select(.name | test("mpv-x86_64-[0-9]"))
+            | .browser_download_url' | head -1)
+          # mpv-x86_64-<date>: plain x86_64; -v3- needs AVX-512, excluded
+          test -n "$url"
+          curl -sL -o /tmp/mpv.7z "$url"
+          7z x -y /tmp/mpv.7z -o/tmp/mpv-portable >/dev/null
+          mkdir /tmp/bundle
+          cp artifacts/watchparty-windows-amd64/watchparty.exe /tmp/bundle/
+          cp client-go/README-friend.txt /tmp/bundle/
+          cp -r /tmp/mpv-portable/* /tmp/bundle/
+          cd /tmp/bundle
+          zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "watchparty $GITHUB_REF_NAME" \
+            --notes-file client-go/CHANGELOG.md dist/*.zip

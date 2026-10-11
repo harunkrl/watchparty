@@ -1,0 +1,52 @@
+// Package cmd parses terminal input lines into commands.
+package cmd
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+// ChatMaxLen mirrors the plan's fixed numbers: a client-side guard,
+// the server does not limit chat length.
+const ChatMaxLen = 500
+
+const (
+	List  = "list"
+	Pick  = "pick"
+	Play  = "play"
+	Queue = "queue"
+	Skip  = "skip"
+	Chat  = "chat"
+	Quit  = "quit"
+	Help  = "help"
+)
+
+const Usage = "commands: list | pick | play <file> | queue <file> | skip | chat <msg> | quit | help"
+
+type Cmd struct {
+	Kind string
+	Arg  string
+}
+
+// Parse splits a line into verb + argument. Like client.py, verbs that
+// take no argument ignore any extra text.
+func Parse(line string) (Cmd, error) {
+	verb, arg, _ := strings.Cut(strings.TrimSpace(line), " ")
+	arg = strings.TrimSpace(arg)
+	switch verb {
+	case List, Pick, Skip, Quit, Help:
+		return Cmd{Kind: verb}, nil
+	case Play, Queue, Chat:
+		if arg == "" {
+			return Cmd{}, fmt.Errorf("%s needs an argument\n%s", verb, Usage)
+		}
+		if verb == Chat && utf8.RuneCountInString(arg) > ChatMaxLen {
+			return Cmd{}, fmt.Errorf("chat too long (max %d chars)", ChatMaxLen)
+		}
+		return Cmd{Kind: verb, Arg: arg}, nil
+	default:
+		return Cmd{}, errors.New(Usage)
+	}
+}
