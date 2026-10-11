@@ -66,7 +66,8 @@ type Model struct {
 	log        []string
 	peers      map[string]bool
 	now        string
-	queueN     int
+	queue      []string // server queue state (hello/queue events)
+	files      []string // last known video list (typo guard, any filesMsg)
 	drift      *float64 // last follower drift, nil until the first heartbeat
 	conn       string   // connecting | connected | reconnecting | lost
 	mode       mode
@@ -164,18 +165,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d := msg.Drift
 		m.drift = &d
 	case filesMsg:
+		if msg.err != nil {
+			return m.logf("> err: %s", msg.err), nil
+		}
+		m.files = msg.files // cache even outside pick mode (typo guard)
 		if m.mode == modePick {
 			m.pickItems = msg.files
 			if m.pickCursor >= len(m.pickItems) {
 				m.pickCursor = max(0, len(m.pickItems)-1)
 			}
-			if msg.err != nil {
-				return m.logf("> err: %s", msg.err), nil
-			}
 			return m, nil
-		}
-		if msg.err != nil {
-			return m.logf("> err: %s", msg.err), nil
 		}
 		for _, f := range msg.files {
 			m = m.logf("  %s", f)
@@ -251,6 +250,13 @@ func (m Model) pickKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m = m.logf("> playing %s", name)
 			return m, playFile(m.player, m.api, name)
 		}
+	case "q":
+		if m.pickCursor < len(m.pickItems) {
+			name := m.pickItems[m.pickCursor]
+			m.mode = modeInput
+			m = m.logf("> queued %s", name)
+			return m, postEvent(m.api, room.Event{Type: "enqueue", Name: name})
+		}
 	case "esc":
 		m.mode = modeInput
 	}
@@ -290,9 +296,34 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 		m.pickItems = nil
 		return m, fetchFiles(m.api)
 	case cmd.Play:
+		if !m.knownFile(c.Arg) {
+			return m.logf("> no such file: %s (list to refresh)", c.Arg), nil
+		}
 		m = m.logf("> playing %s", c.Arg) // local; own load broadcast is echo-filtered
 		return m, playFile(m.player, m.api, c.Arg)
 	case cmd.Queue:
+		if c.Arg == "" { // bare queue: show the room queue
+			if len(m.queue) == 0 {
+				return m.logLine("> queue empty (queue <file> to add)"), nil
+			}
+			for i, n := range m.queue {
+				m = m.logf("> %d. %s", i+1, n)
+			}
+			return m, nil
+		}
+		// mirror the server's enqueue conditions for instant feedback;
+		// on success its queue broadcast confirms (it reaches us too)
+		if c.Arg == m.now {
+			return m.logf("> %s is already playing", c.Arg), nil
+		}
+		for _, q := range m.queue {
+			if q == c.Arg {
+				return m.logf("> %s is already queued", c.Arg), nil
+			}
+		}
+		if !m.knownFile(c.Arg) {
+			return m.logf("> no such file: %s (list to refresh)", c.Arg), nil
+		}
 		return m, postEvent(m.api, room.Event{Type: "enqueue", Name: c.Arg})
 	case cmd.Skip:
 		return m, postEvent(m.api, room.Event{Type: "skip"})
@@ -311,7 +342,7 @@ func (m Model) onEvent(ev room.Event) Model {
 	case "hello":
 		m.now = ev.Now
 		m.conn = "connected"
-		m.queueN = len(ev.Queue)
+		m.queue = ev.Queue
 	case "join":
 		m.peers[ev.Nick] = true
 	case "bye":
@@ -319,7 +350,7 @@ func (m Model) onEvent(ev room.Event) Model {
 	case "load":
 		m.now = ev.Name
 	case "queue":
-		m.queueN = len(ev.Queue)
+		m.queue = ev.Queue
 	}
 	// position heartbeats are deliberately not logged (client.py parity)
 	return m
@@ -402,7 +433,7 @@ func (m Model) View() string {
 }
 
 func (m Model) pickView() []string {
-	out := []string{title.Render("pick a film") + dim.Render("  (up/down/j/k move - enter play - esc cancel)")}
+	out := []string{title.Render("pick a film") + dim.Render("  (up/down/j/k move - enter play / q queue - esc cancel)")}
 	if len(m.pickItems) == 0 {
 		out = append(out, "(no files / loading...)")
 	}
@@ -414,6 +445,20 @@ func (m Model) pickView() []string {
 		}
 	}
 	return out
+}
+
+// knownFile guards typos when we have a cached list; with no cache yet
+// the server stays the judge (it silently no-ops unknown enqueues).
+func (m Model) knownFile(name string) bool {
+	if len(m.files) == 0 {
+		return true
+	}
+	for _, f := range m.files {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) statusLine() string {
@@ -430,8 +475,8 @@ func (m Model) statusLine() string {
 		mid = m.peerLine()
 	}
 	queue := ""
-	if m.queueN > 0 {
-		queue = fmt.Sprintf(" · q:%d", m.queueN)
+	if len(m.queue) > 0 {
+		queue = fmt.Sprintf(" · q:%d", len(m.queue))
 	}
 	return fmt.Sprintf("%s · %s · %s · %s",
 		roleStyle[role].Render("watchparty "+role),

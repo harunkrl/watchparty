@@ -147,6 +147,55 @@ func TestQueueCountInStatus(t *testing.T) {
 	}
 }
 
+func TestBareQueueLists(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.input.SetValue("queue")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // empty queue -> hint
+	if !strings.Contains(m.View(), "queue empty") {
+		t.Fatalf("empty queue not reported: %q", m.View())
+	}
+	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv", "b.mkv"}})
+	m.input.SetValue("queue")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	v := m.View()
+	if !strings.Contains(v, "1. a.mkv") || !strings.Contains(v, "2. b.mkv") {
+		t.Fatalf("queue listing wrong:\n%s", v)
+	}
+}
+
+func TestQueueGuards(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.files = []string{"a.mkv", "b.mkv"} // cached list, like after `list`
+	m = upd(t, m, room.Event{Type: "hello", Now: "a.mkv", Queue: []string{"b.mkv"}})
+	for _, tc := range []struct{ in, want string }{
+		{"queue c.mkv", "no such file: c.mkv"},
+		{"queue a.mkv", "already playing"},
+		{"queue b.mkv", "already queued"},
+		{"play c.mkv", "no such file: c.mkv"},
+	} {
+		mm := m
+		mm.input.SetValue(tc.in)
+		mm = upd(t, mm, tea.KeyMsg{Type: tea.KeyEnter})
+		if !strings.Contains(mm.View(), tc.want) {
+			t.Fatalf("%q: want %q in log, got:\n%s", tc.in, tc.want, mm.View())
+		}
+	}
+}
+
+func TestPickerQEnqueues(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.mode = modePick
+	m = upd(t, m, filesMsg{files: []string{"a.mkv", "b.mkv"}})
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyDown}) // cursor on b.mkv
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if m.mode != modeInput {
+		t.Fatal("q did not leave pick mode")
+	}
+	if !strings.Contains(m.View(), "> queued b.mkv") {
+		t.Fatalf("no queued log:\n%s", m.View())
+	}
+}
+
 func TestPickerFlow(t *testing.T) {
 	m := New("t", nil, nil, false)
 	m.mode = modePick

@@ -22,7 +22,7 @@ func TestParse(t *testing.T) {
 		{"play movie.mkv", Play, "movie.mkv", false},
 		{"play", "", "", true},
 		{"queue  a b.mkv ", Queue, "a b.mkv", false},
-		{"queue", "", "", true},
+		{"queue", Queue, "", false}, // bare queue lists the queue
 		{"chat hi there", Chat, "hi there", false},
 		{"chat", "", "", true},
 		{strings.Repeat("x", ChatMaxLen), "", "", true},

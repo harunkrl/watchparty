@@ -23,7 +23,7 @@ const (
 	Help  = "help"
 )
 
-const Usage = "commands: list | pick | play <file> | queue <file> | skip | chat <msg> | quit | help"
+const Usage = "commands: list | pick | play <file> | queue [file] | skip | chat <msg> | quit | help"
 
 type Cmd struct {
 	Kind string
@@ -38,7 +38,10 @@ func Parse(line string) (Cmd, error) {
 	switch verb {
 	case List, Pick, Skip, Quit, Help:
 		return Cmd{Kind: verb}, nil
-	case Play, Queue, Chat:
+	case Queue:
+		// bare "queue" lists the queue; "queue <file>" enqueues
+		return Cmd{Kind: Queue, Arg: arg}, nil
+	case Play, Chat:
 		if arg == "" {
 			return Cmd{}, fmt.Errorf("%s needs an argument\n%s", verb, Usage)
 		}
