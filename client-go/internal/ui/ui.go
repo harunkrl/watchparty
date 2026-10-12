@@ -102,6 +102,7 @@ func (m Model) Init() tea.Cmd {
 type StreamClosedMsg struct{}
 type MpvExitedMsg struct{}
 type ReconnectingMsg struct{ Note string }
+type EngineLogMsg struct{ Line string } // engine log line (stderr writes would corrupt the frame)
 type errMsg struct{ err error }
 type filesMsg struct {
 	files []string
@@ -184,6 +185,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ReconnectingMsg:
 		m.conn = "reconnecting"
 		return m.logLine(msg.Note), nil
+	case EngineLogMsg:
+		return m.logLine(msg.Line), nil
 	case StreamClosedMsg:
 		m.conn = "lost"
 		return m.logLine("> connection closed"), nil

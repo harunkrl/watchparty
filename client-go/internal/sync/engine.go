@@ -89,6 +89,9 @@ type Engine struct {
 	speedSet  bool    // a Speed value has been sent (0.0 is a valid speed)
 	lastSpeed float64 // current tempo nudge; cache avoids IPC spam per tick
 
+	lastSeekT  float64    // target of the last programmatic seek (echo match)
+	lastSeekAt time.Time // when issued; slow echoes (file load) arrive late
+
 	mu sync.Mutex // guards engine state: poll + mpv-event + SSE goroutines
 }
 
@@ -125,6 +128,8 @@ func (e *Engine) setPause(paused bool) {
 func (e *Engine) seekTo(t float64) {
 	e.lastActuate = e.Clock.Now()
 	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
+	e.lastSeekT = t
+	e.lastSeekAt = e.lastActuate
 	_ = e.Player.Seek(t)
 }
 
@@ -185,7 +190,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 }
 
 func (e *Engine) load(name string) {
-	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
+	e.setSpeed(1)                // new file: clear any tempo nudge from the previous one
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
 	if err := e.Player.Load(name); err != nil {
 		e.logf("mpv: %s", err)
@@ -221,6 +226,15 @@ func (e *Engine) OnMpvEvent(name string) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if name == "seek" && !e.lastSeekAt.IsZero() && e.Clock.Since(e.lastSeekAt) < 5*time.Second {
+		// match by target: during file loads mpv can deliver the seek echo
+		// seconds later, past the actuateQuiet window; a user scrubbing to
+		// within 1s of our own recent target is indistinguishable — the
+		// heartbeat self-heals that rare case
+		if t, ok := e.Player.Pos(); ok && abs(t-e.lastSeekT) < 1.0 {
+			return
+		}
+	}
 	if !e.lastActuate.IsZero() && e.Clock.Since(e.lastActuate) < actuateQuiet {
 		if name == "seek" || (e.actuatePause != nil && *e.actuatePause == (name == "pause")) {
 			return // our own SetPause/Seek echoing back as mpv events

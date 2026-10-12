@@ -276,14 +276,19 @@ class Client:
             pos = self.player.get('time-pos')
             pause = self.player.get('pause')
             idle = self.player.get('idle-active')
+            now = time.monotonic()  # shared by master gate + follower (a)..(d)
             if self.master:
                 if pos is None and not idle:
                     continue  # nothing loaded yet
-                if pause != last_pause and not idle:
+                # gate pause post: remote pause/play echoes must not re-post
+                if pause != last_pause and not idle and (now - self.last_pause_apply) > 1.0:
                     self.post({'type': 'pause' if pause else 'play'})
-                    last_pause = pause
+                last_pause = pause  # unconditional: state tracking cannot stall
                 if pos is not None:
-                    if last_pos is not None and abs(pos - last_pos - POLL_SECS) > 3:
+                    # gate scrub post: a remote seek's position jump must not look
+                    # like a scrub; 3s = one full poll past any remote apply (a
+                    # 1s window lets ~half of the echoes escape between ticks)
+                    if last_pos is not None and abs(pos - last_pos - POLL_SECS) > 3 and (now - self.last_apply) > 3.0:
                         self.post({'type': 'seek', 't': pos})  # user scrubbed
                     self.post({'type': 'position', 't': pos, 'p': bool(pause)})
                     last_pos = pos
@@ -294,7 +299,6 @@ class Client:
                     was_active = True
             elif pos is not None and self.master_pos:
                 t0, master_paused, recv = self.master_pos
-                now = time.monotonic()
                 # (a) local pause transition (dual control): post only when
                 # our pause diverges from the room's last announcement AND
                 # we are outside the recent-apply window (which absorbs the
@@ -309,11 +313,11 @@ class Client:
                     last_pause = pause
                 # (b) scrub detection: a positional jump > 3s past the expected
                 # 2s tick is a user seek (paused or not — dragging while paused
-                # must reach the room too, go parity); suppressed in the apply
-                # window so we do not echo a remote seek back
+                # must reach the room too, go parity); 3s apply window so a
+                # remote seek's echo is never mistaken for a fresh scrub
                 if last_pos is not None and \
                    abs(pos - last_pos - POLL_SECS) > 3 and \
-                   (now - self.last_apply) > 1.0:
+                   (now - self.last_apply) > 3.0:
                     self.post({'type': 'seek', 't': pos})
                     self.last_apply = now
                     self.last_post = now

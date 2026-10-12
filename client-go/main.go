@@ -88,7 +88,9 @@ func main() {
 	if *headless {
 		engine.Logf = func(f string, a ...any) { fmt.Printf(f+"\n", a...) }
 	} else {
-		engine.Logf = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		// engine logs must go through the program: writing to stderr while
+		// the bubbletea renderer owns the screen corrupts the frame
+		engine.Logf = func(f string, a ...any) { p.Send(ui.EngineLogMsg{Line: fmt.Sprintf(f, a...)}) }
 		p = tea.NewProgram(ui.New(*name, api, player, *master)) // set before goroutines: they Send on it
 	}
 
