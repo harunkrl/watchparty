@@ -89,7 +89,7 @@ type Engine struct {
 	speedSet  bool    // a Speed value has been sent (0.0 is a valid speed)
 	lastSpeed float64 // current tempo nudge; cache avoids IPC spam per tick
 
-	lastSeekT  float64    // target of the last programmatic seek (echo match)
+	lastSeekT  float64   // target of the last programmatic seek (echo match)
 	lastSeekAt time.Time // when issued; slow echoes (file load) arrive late
 
 	mu sync.Mutex // guards engine state: poll + mpv-event + SSE goroutines

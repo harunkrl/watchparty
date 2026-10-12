@@ -209,7 +209,7 @@ func TestFollowerSpeedNudgeCached(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // drift 0.3 -> 0.97
 	e.OnRoom(masterAt(12, false))                     // heartbeat advances too
 	e.OnMpvp(mpv.State{Pos: ptr(14.3), Pause: false}) // same drift again
-	if len(pl.speeds) != 1 { // [0.97] only — second tick is silent
+	if len(pl.speeds) != 1 {                          // [0.97] only — second tick is silent
 		t.Fatalf("speeds = %v, want exactly [0.97]", pl.speeds)
 	}
 }
