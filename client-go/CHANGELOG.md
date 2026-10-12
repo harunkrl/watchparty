@@ -20,6 +20,15 @@ backward compatible (hello gained optional `pos`/`p` fields).
   dead connections reconnect instead of hanging forever
 - tests: smoke covers bad encodings/ranges and hello pos; go covers the
   watchdog and the hello snapshot
+- clients: dual control everywhere — the python follower now honors (and
+  posts) pause/play/seek instead of having them reverted by the master's
+  heartbeat; the go follower's own pause mirrors into its snapshot so a
+  quick opposite-direction move is no longer swallowed
+- clients: smooth-sync band — drift between 0.15 s and 1 s converges via a
+  ±5 % tempo nudge (mpv audio-pitch-correction keeps it inaudible) instead
+  of a visible re-seek; hard seeks stay beyond 1 s
+- tests: pause_sync covers both directions (follower pauses/seeks, master
+  follows) across the full interop matrix
 
 ## v1.0.0
 

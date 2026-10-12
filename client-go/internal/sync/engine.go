@@ -18,6 +18,14 @@ const (
 	SeekScrubThreshold = 3.0 // |pos - last_pos - PollSecs| beyond this = scrub
 )
 
+// Smooth-sync band: inside (speedBand, Tolerance] the follower nudges mpv's
+// speed instead of issuing a visible seek; the clamp keeps the tempo change
+// inaudible (mpv audio-pitch-correction is on by default).
+const (
+	speedBand = 0.15
+	speedAdj  = 0.05
+)
+
 // Dual-control gates (v1.4): followers also post discrete events; these
 // keep remote-application echoes from re-posting (loop prevention).
 const (
@@ -46,6 +54,7 @@ type Player interface {
 	Load(name string) error
 	SetPause(paused bool) error
 	Seek(t float64) error
+	Speed(f float64) error
 	ShowText(text string, ms int) error
 	Pos() (float64, bool)
 }
@@ -76,6 +85,9 @@ type Engine struct {
 	// mpv event is only an echo when it matches this — the user pressing
 	// space right after a remote apply must never be swallowed
 	lastPost time.Time // last follower discrete post (grace window)
+
+	speedSet  bool    // a Speed value has been sent (0.0 is a valid speed)
+	lastSpeed float64 // current tempo nudge; cache avoids IPC spam per tick
 
 	mu sync.Mutex // guards engine state: poll + mpv-event + SSE goroutines
 }
@@ -114,6 +126,17 @@ func (e *Engine) seekTo(t float64) {
 	e.lastActuate = e.Clock.Now()
 	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
 	_ = e.Player.Seek(t)
+}
+
+// setSpeed applies a tempo nudge once per distinct value; repeated ticks
+// with the same drift stay silent on the IPC.
+func (e *Engine) setSpeed(f float64) {
+	if e.speedSet && f == e.lastSpeed {
+		return
+	}
+	e.speedSet = true
+	e.lastSpeed = f
+	_ = e.Player.Speed(f)
 }
 
 // OnRoom feeds one SSE event through the engine (client.py on_event parity;
@@ -162,6 +185,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 }
 
 func (e *Engine) load(name string) {
+	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
 	if err := e.Player.Load(name); err != nil {
 		e.logf("mpv: %s", err)
@@ -223,6 +247,10 @@ func (e *Engine) OnMpvEvent(name string) {
 			return
 		}
 		e.lastPost = e.Clock.Now()
+		// mirror our post into the snapshot: the next heartbeat still carries
+		// the pre-post state, and without the mirror a quick opposite-direction
+		// user move is swallowed by the check above (python room_pause parity)
+		e.snap.paused = wantPause
 		e.postDiscrete(room.Event{Type: typ})
 	case "seek":
 		t, ok := e.Player.Pos()
@@ -296,16 +324,24 @@ func (e *Engine) followerTick(s mpv.State) {
 		e.setPause(e.snap.paused)
 		return
 	}
-	if !e.snap.paused {
-		// age must not grow while the master stands still
-		expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
-		drift := *s.Pos - expected
-		e.emitUi(s, drift)
-		if abs(drift) > Tolerance {
-			e.seekTo(expected)
-		}
+	if e.snap.paused {
+		e.setSpeed(1) // paused: clear any tempo nudge for a clean resume
+		// both paused: hold position
+		return
 	}
-	// both paused: hold position
+	// age must not grow while the master stands still
+	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
+	drift := *s.Pos - expected
+	e.emitUi(s, drift)
+	switch {
+	case abs(drift) > Tolerance:
+		e.seekTo(expected) // hard seek; drift resets, next tick restores speed 1
+	case abs(drift) > speedBand:
+		// smooth converge: a small tempo nudge instead of a visible seek
+		e.setSpeed(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
+	default:
+		e.setSpeed(1) // inside the dead zone: plain 1x
+	}
 }
 
 func (e *Engine) emitUi(s mpv.State, drift float64) {
@@ -321,6 +357,16 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 func abs(f float64) float64 {
 	if f < 0 {
 		return -f
+	}
+	return f
+}
+
+func clamp(f, lo, hi float64) float64 {
+	if f < lo {
+		return lo
+	}
+	if f > hi {
+		return hi
 	}
 	return f
 }

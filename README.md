@@ -57,6 +57,11 @@ Terminal commands in the client:
 You get a notice in the terminal when the other side joins or leaves.
 `skip` is a silent no-op when the queue is empty (use `list` to see what is queued).
 
+Controls are shared: **either side** can pause (space in the mpv window),
+seek and pick a new file — the master's heartbeat keeps everyone converged.
+A follower with small drift (< 1 s) micro-adjusts playback speed (±5 %,
+inaudible) instead of re-seeking, so convergence is smooth.
+
 Voice: keep a Discord/WhatsApp call open alongside.
 
 ## Subtitles

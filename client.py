@@ -182,7 +182,12 @@ class Client:
         self.name = name
         self.master = master
         self.id = f'{name}-{random.randint(1000, 9999)}'
-        self.master_pos = None  # (position, master_paused, monotonic time when received)
+        self.master_pos = None    # (position, master_paused, monotonic time when received)
+        self.room_pause = False   # last pause state the room (or our mirror) announced
+        self.last_apply = 0.0     # monotonic clock of the last discrete apply (echo gate)
+        self.last_pause_apply = 0.0  # last pause/play apply; a seek apply must not gate a pause post
+        self.last_post = 0.0      # monotonic clock of our last dual-control post (grace)
+        self.last_speed = 1.0     # last speed we told mpv (skip no-op IPC chatter)
         self.player = Player(self.base, extra_args)
 
     def post(self, obj):
@@ -212,6 +217,10 @@ class Client:
                     if p:
                         self.player.ipc.tell('set_property', 'pause', True)
                     self.master_pos = (ev['pos'], p, time.monotonic())
+                    # mirror the applied state so (a)/(c) treat it as room truth
+                    self.room_pause = p
+                    self.last_apply = time.monotonic()
+                self.last_speed = 1.0  # new file: drop any cached micro-adjust
         elif t == 'queue':
             log(f'> queue: {ev["queue"]}')
         elif t == 'join':
@@ -223,9 +232,20 @@ class Client:
             self.player.ipc.tell('show-text', f'{ev["nick"]}: {ev["text"]}', 3000)
         elif t == 'position':
             self.master_pos = (ev['t'], bool(ev.get('p')), time.monotonic())
+            self.room_pause = bool(ev.get('p'))  # heartbeat is the slow truth
         elif t in ('load', 'play', 'pause', 'seek'):
             log(f'> {t}' + (f' @{ev["t"]:.1f}s' if 't' in ev else ''))
             self.player.apply(ev)
+            # mark the apply so the next poll won't re-post the mpv echo
+            # (a) AND so (c) knows we just acted ourselves (gate window)
+            if t in ('pause', 'play'):
+                self.room_pause = (t == 'pause')
+                self.last_apply = time.monotonic()
+                self.last_pause_apply = self.last_apply
+            elif t == 'seek':
+                self.last_apply = time.monotonic()
+            elif t == 'load':
+                self.last_speed = 1.0  # new file: drop any cached micro-adjust
 
     def sse_loop(self):
         attempt = 0
@@ -274,15 +294,61 @@ class Client:
                     was_active = True
             elif pos is not None and self.master_pos:
                 t0, master_paused, recv = self.master_pos
-                if master_paused != pause:
-                    # self-heal: converge to the master's playback state even
-                    # if the discrete play/pause event never arrived
+                now = time.monotonic()
+                # (a) local pause transition (dual control): post only when
+                # our pause diverges from the room's last announcement AND
+                # we are outside the recent-apply window (which absorbs the
+                # mpv echo of a remote apply as a fresh user move)
+                if pause != last_pause:
+                    # gate on pause applies only: a just-applied remote seek
+                    # must not swallow the user's pause (go actuatePause parity)
+                    if pause != self.room_pause and (now - self.last_pause_apply) > 1.0:
+                        self.post({'type': 'pause' if pause else 'play'})
+                        self.room_pause = pause
+                        self.last_post = now
+                    last_pause = pause
+                # (b) scrub detection: a positional jump > 3s past the expected
+                # 2s tick is a user seek (paused or not — dragging while paused
+                # must reach the room too, go parity); suppressed in the apply
+                # window so we do not echo a remote seek back
+                if last_pos is not None and \
+                   abs(pos - last_pos - POLL_SECS) > 3 and \
+                   (now - self.last_apply) > 1.0:
+                    self.post({'type': 'seek', 't': pos})
+                    self.last_apply = now
+                    self.last_post = now
+                last_pos = pos
+                # (c) self-heal: room is authoritative when we are settled;
+                # grace window mirrors go's followerGrace (POLL_SECS+1) so a
+                # just-posted user move is never stomped by a stale heartbeat
+                # that still carries the pre-apply pause state
+                if master_paused != pause and \
+                   (now - max(self.last_apply, self.last_post)) > 3.0:
                     self.player.ipc.tell('set_property', 'pause', master_paused)
-                elif not master_paused:
-                    # age pay must not grow while the master stands still
-                    expected = t0 + (time.monotonic() - recv)
-                    if abs(pos - expected) > TOLERANCE:
+                    last_pause = master_paused
+                    self.room_pause = master_paused
+                    self.last_apply = now
+                # (d) drift correction (playing only): |drift|>1 hard seek;
+                # in the gentle band a speed micro-adjust so we converge
+                # silently instead of jumping every POLL_SECS tick; last_speed
+                # caches the last value so we only IPC when it actually moves
+                if not master_paused:
+                    expected = t0 + (now - recv)
+                    drift = pos - expected
+                    if abs(drift) > 1.0:
                         self.player.ipc.tell('seek', expected, 'absolute')
+                        target = 1.0
+                    elif abs(drift) > 0.15:
+                        target = max(0.95, min(1.05, 1 - drift * 0.10))
+                    else:
+                        target = 1.0
+                    if abs(target - self.last_speed) > 0.001:
+                        self.player.ipc.tell('set_property', 'speed', target)
+                        self.last_speed = target
+                elif self.last_speed != 1.0:
+                    # paused: snap speed back so the next play runs normally
+                    self.player.ipc.tell('set_property', 'speed', 1.0)
+                    self.last_speed = 1.0
                 # both paused: hold position
 
     def shutdown(self):
@@ -312,6 +378,7 @@ class Client:
                             log('  ' + f)
                 elif cmd == 'play' and arg:
                     self.player.load(arg)  # server relays to others
+                    self.last_speed = 1.0  # new file: drop cached micro-adjust
                     self.post({'type': 'load', 'name': arg})
                 elif cmd == 'queue' and arg:
                     self.post({'type': 'enqueue', 'name': arg})

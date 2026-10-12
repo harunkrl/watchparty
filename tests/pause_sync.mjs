@@ -215,7 +215,48 @@ try {
   }
   assert.ok(converged, `follower did not converge after master seek (at ${await mpvCall(fSock, ['get_property', 'time-pos'])})`);
 
-  console.log('PASS: pause/resume/seek sync held');
+  // REVERSE 1 (dual control): follower pauses -> master must follow
+  await mpvCall(fSock, ['set_property', 'pause', true]);
+  const t3 = Date.now();
+  let mPaused = false;
+  while (Date.now() - t3 < 8000) {
+    mPaused = (await mpvCall(mSock, ['get_property', 'pause'])) === true;
+    if (mPaused) break;
+    await sleep(200);
+  }
+  assert.ok(mPaused, 'master did not pause after follower pause (dual control)');
+  console.log(`master paused ${Date.now() - t3}ms after follower pause`);
+
+  // REVERSE 2: follower resumes -> master resumes; then no echo fight
+  await mpvCall(fSock, ['set_property', 'pause', false]);
+  const t4 = Date.now();
+  let mPlaying = false;
+  while (Date.now() - t4 < 8000) {
+    mPlaying = (await mpvCall(mSock, ['get_property', 'pause'])) === false;
+    if (mPlaying) break;
+    await sleep(200);
+  }
+  assert.ok(mPlaying, 'master did not resume after follower play');
+  await sleep(4000);
+  assert.equal(await mpvCall(mSock, ['get_property', 'pause']), false, 'master flipped back (echo fight)');
+  assert.equal(await mpvCall(fSock, ['get_property', 'pause']), false, 'follower flipped back (echo fight)');
+
+  // REVERSE 3: follower scrubs to 20s -> master converges
+  await mpvCall(fSock, ['seek', 20, 'absolute']);
+  const t5 = Date.now();
+  let mConv = false;
+  while (Date.now() - t5 < 12000) {
+    const mp = await mpvCall(mSock, ['get_property', 'time-pos']);
+    if (mp >= 19 && mp <= 26) {
+      mConv = true;
+      console.log(`master converged ${Date.now() - t5}ms after follower seek`);
+      break;
+    }
+    await sleep(300);
+  }
+  assert.ok(mConv, `master did not converge after follower seek (at ${await mpvCall(mSock, ['get_property', 'time-pos'])})`);
+
+  console.log('PASS: pause/resume/seek sync held (both directions)');
   cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message);

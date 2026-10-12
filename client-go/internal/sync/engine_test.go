@@ -14,6 +14,7 @@ type fakePlayer struct {
 	loads    []string
 	pauses   []bool
 	seeks    []float64
+	speeds   []float64
 	showText []string
 	pos      *float64
 }
@@ -21,6 +22,7 @@ type fakePlayer struct {
 func (f *fakePlayer) Load(name string) error { f.loads = append(f.loads, name); return nil }
 func (f *fakePlayer) SetPause(p bool) error  { f.pauses = append(f.pauses, p); return nil }
 func (f *fakePlayer) Seek(t float64) error   { f.seeks = append(f.seeks, t); return nil }
+func (f *fakePlayer) Speed(v float64) error  { f.speeds = append(f.speeds, v); return nil }
 func (f *fakePlayer) Pos() (float64, bool) {
 	if f.pos == nil {
 		return 0, false
@@ -174,6 +176,74 @@ func TestFollowerSmallDriftHolds(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // expected 12: drift 0.3
 	if len(pl.seeks) != 0 {
 		t.Fatalf("seek fired on drift 0.3: %v", pl.seeks)
+	}
+}
+
+// Inside the smooth band the follower nudges tempo instead of seeking:
+// behind -> speed up, ahead -> slow down, clamped to ±speedAdj.
+func TestFollowerMidDriftSpeedNudges(t *testing.T) {
+	e, pl, _ := newEngine(false)
+	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 3 * time.Second}
+	e.OnRoom(masterAt(10, false))
+	e.OnMpvp(mpv.State{Pos: ptr(12.5), Pause: false}) // expected 13: drift -0.5 -> 1.05
+	if len(pl.speeds) != 1 || pl.speeds[0] != 1.05 {
+		t.Fatalf("speeds = %v, want [1.05]", pl.speeds)
+	}
+	if len(pl.seeks) != 0 {
+		t.Fatalf("no seek inside the band: %v", pl.seeks)
+	}
+
+	e2, pl2, _ := newEngine(false)
+	e2.Clock = fakeClock{now: time.Unix(1000, 0), since: 3 * time.Second}
+	e2.OnRoom(masterAt(10, false))
+	e2.OnMpvp(mpv.State{Pos: ptr(13.5), Pause: false}) // drift +0.5 -> 0.95
+	if len(pl2.speeds) != 1 || pl2.speeds[0] != 0.95 {
+		t.Fatalf("ahead speeds = %v, want [0.95]", pl2.speeds)
+	}
+}
+
+// Same drift on the next tick must not re-send the speed (IPC quiet).
+func TestFollowerSpeedNudgeCached(t *testing.T) {
+	e, pl, _ := newEngine(false)
+	e.OnRoom(masterAt(10, false))
+	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // drift 0.3 -> 0.97
+	e.OnRoom(masterAt(12, false))                     // heartbeat advances too
+	e.OnMpvp(mpv.State{Pos: ptr(14.3), Pause: false}) // same drift again
+	if len(pl.speeds) != 1 { // [0.97] only — second tick is silent
+		t.Fatalf("speeds = %v, want exactly [0.97]", pl.speeds)
+	}
+}
+
+// Hard seek beyond Tolerance; a later paused tick restores speed 1.
+func TestFollowerBigDriftSeeksAndPauseResetsSpeed(t *testing.T) {
+	e, pl, _ := newEngine(false)
+	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 5 * time.Second}
+	e.OnRoom(masterAt(10, false))
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // drift -5 -> seek 15
+	if len(pl.seeks) != 1 || pl.seeks[0] != 15 {
+		t.Fatalf("seeks = %v, want [15]", pl.seeks)
+	}
+
+	// master pauses; follower converges and the nudge must clear
+	e.Clock = fakeClock{now: time.Unix(1010, 0), since: 0}
+	e.OnRoom(room.Event{Type: "pause"})
+	e.OnMpvp(mpv.State{Pos: ptr(15), Pause: false})
+	e.OnMpvp(mpv.State{Pos: ptr(15), Pause: true}) // both paused: baseline speed
+	last := pl.speeds[len(pl.speeds)-1]
+	if last != 1 {
+		t.Fatalf("speed after pause = %v, want 1", last)
+	}
+}
+
+// Loading a new file clears any leftover tempo nudge.
+func TestLoadResetsSpeed(t *testing.T) {
+	e, pl, _ := newEngine(false)
+	e.OnRoom(masterAt(10, false))
+	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // nudge 0.97
+	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"})
+	last := pl.speeds[len(pl.speeds)-1]
+	if last != 1 {
+		t.Fatalf("speed after load = %v, want 1", last)
 	}
 }
 

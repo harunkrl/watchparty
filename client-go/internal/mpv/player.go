@@ -254,6 +254,12 @@ func (p *Player) Seek(t float64) error {
 	return p.tell("seek", t, "absolute")
 }
 
+// Speed applies the follower's smooth-sync tempo nudge (set_property;
+// fires no pause/seek event, so no actuation gating is needed).
+func (p *Player) Speed(f float64) error {
+	return p.tell("set_property", "speed", f)
+}
+
 func (p *Player) ShowText(text string, ms int) error {
 	return p.tell("show-text", text, ms)
 }
