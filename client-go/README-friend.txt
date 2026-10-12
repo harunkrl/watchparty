@@ -9,5 +9,6 @@ watchparty — how to watch together (3 steps)
    http://100.101.102.103:8090), press Enter, type your name, press Enter.
 
 The movie plays in a separate mpv window. The black window is the remote
-control — type chat <your message> there and press Enter to talk.
-Commands: list | pick | play <file> | queue <file> | skip | chat <msg> | quit
+control — just type your message there and press Enter to talk.
+Commands start with "/": /list | /pick | /play <file> | /queue <file> |
+/skip | /help   (everything else you type goes to the room as chat)

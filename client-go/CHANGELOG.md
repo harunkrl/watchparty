@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.0 — slash commands, split panes
+
+- commands now require the slash prefix (`/play`, `/queue`, `/pick`,
+  `/list`, `/skip`, `/chat`, `/quit`, `/help`); plain text is ALWAYS chat —
+  a sentence that merely starts with a reserved word can no longer fire a
+  command. `//text` chats a literal leading slash; a lone `/` shows the
+  command reference. The headless test harness keeps bare-verb parsing
+  (cmd package unchanged, wire protocol unchanged)
+- the chat pane is separated from machine output: chat is its own
+  viewport, events and engine lines move to a 2-line dim "system" strip
+  under a divider (run-collapse kept); command errors flash red on the
+  input row (cleared by the next keystroke) instead of scrolling away
+
 ## v1.1.1 — chat-first input
 
 - bare text at the prompt is sent to the room as chat — no "chat" prefix

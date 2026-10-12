@@ -47,20 +47,19 @@ binary (it asks for the server URL) or:
 ./watchparty --name bo http://<your-tailscale-ip>:8090
 ```
 
-Terminal commands in the client:
+Everything you type goes to the room as chat. Commands start with `/`:
 
 | Command | Effect |
 |---|---|
-| `list` | list videos on the server |
-| `pick` | cursor list: browse and play/queue with the arrow keys |
-| `play <file>` | start playing a file for everyone (anyone can call it) |
-| `queue <file>` | append to the shared queue; auto-plays when the current file ends |
-| `skip` | jump to the next file in the queue (same as the current file ending) |
-| `chat <msg>` | chat; shown in the other side's terminal and as an mpv OSD |
-| `quit` | exit |
+| `/list` | list videos on the server |
+| `/pick` | cursor list: browse and play/queue with the arrow keys |
+| `/play <file>` | start playing a file for everyone (anyone can call it) |
+| `/queue <file>` | append to the shared queue; auto-plays when the current file ends |
+| `/skip` | jump to the next file in the queue (same as the current file ending) |
+| `/quit` | exit |
 
 You get a notice in the terminal when the other side joins or leaves.
-`skip` is a silent no-op when the queue is empty (use `list` to see what is queued).
+`/skip` is a silent no-op when the queue is empty (use `/list` to see what is queued).
 
 Controls are shared: **either side** can pause (space in the mpv window),
 seek and pick a new file — the master's heartbeat keeps everyone converged.

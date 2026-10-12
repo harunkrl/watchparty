@@ -69,6 +69,7 @@ var (
 	}
 	playingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	pausedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	nickColors   = []lipgloss.Color{"205", "45", "214", "84", "117", "212"}
 	pickCur      = lipgloss.NewStyle().Bold(true).Reverse(true)
 )
@@ -76,6 +77,10 @@ var (
 // nudgeRe matches speed-nudge log lines ("[1.050]"): pure chatter whose
 // live value is already visible as the footer drift chip.
 var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
+
+// usageTUI is the slash-style command reference shown in the TUI; the
+// bare-verb syntax stays in cmd.Usage for the headless test harness.
+const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -91,7 +96,9 @@ type Model struct {
 	api        *room.Client
 	player     *mpv.Player
 	input      textinput.Model
-	vp         viewport.Model
+	vp         viewport.Model // chat pane
+	sysVp      viewport.Model // system tail: events + engine lines
+	lastErr    string         // input-row feedback until the next keystroke
 	log        []entry
 	peers      map[string]bool
 	now        string
@@ -115,7 +122,7 @@ type Model struct {
 
 func New(nick string, api *room.Client, player *mpv.Player, master bool) Model {
 	in := textinput.New()
-	in.Placeholder = "type to chat · list | pick | play | queue | skip | help"
+	in.Placeholder = "type to chat · /pick /list /help"
 	in.Focus()
 	// sane defaults so the first frame renders before WindowSizeMsg arrives
 	// (and in size-less ptys used by the test harness)
@@ -123,7 +130,7 @@ func New(nick string, api *room.Client, player *mpv.Player, master bool) Model {
 		nick: nick, master: master, api: api, player: player,
 		input: in, peers: map[string]bool{}, conn: "connecting",
 		histIdx: -1, width: 80, height: 24,
-		vp: viewport.New(76, 17),
+		vp: viewport.New(76, 14), sysVp: viewport.New(76, 2),
 	}
 	return m.syncLayout()
 }
@@ -252,6 +259,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		m.st = &st
 	case filesMsg:
 		if msg.err != nil {
+			m.lastErr = msg.err.Error()
 			return m.logf("> err: %s", msg.err), nil
 		}
 		m.files = msg.files // cache even outside pick mode (typo guard)
@@ -266,6 +274,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			m = m.logf("  %s", f)
 		}
 	case errMsg:
+		m.lastErr = msg.err.Error()
 		return m.logf("> err: %s", msg.err), nil
 	case ReconnectingMsg:
 		m.conn = "reconnecting"
@@ -336,6 +345,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.pickItems = nil
 		return m, fetchFiles(m.api)
 	default:
+		m.lastErr = "" // fresh keystroke: the old feedback is obsolete
 		var c tea.Cmd
 		m.input, c = m.input.Update(msg)
 		return m, c
@@ -374,37 +384,30 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 // on success its queue broadcast confirms (it reaches us too).
 func (m Model) enqueue(name string) (Model, tea.Cmd) {
 	if name == m.now {
-		return m.logf("> %s is already playing", name), nil
+		return m.failf("%s is already playing", name)
 	}
 	for _, q := range m.queue {
 		if q == name {
-			return m.logf("> %s is already queued", name), nil
+			return m.failf("%s is already queued", name)
 		}
 	}
 	if !m.knownFile(name) {
-		return m.logf("> no such file: %s (list to refresh)", name), nil
+		return m.failf("no such file: %s (try /list)", name)
 	}
 	m = m.logf("> queued %s", name)
 	return m, postEvent(m.api, room.Event{Type: "enqueue", Name: name})
 }
 
-// isCommand reports whether the line starts with a reserved verb; those
-// keep their command meaning. Everything else typed at the prompt is chat —
-// talking is the primary input, no prefix needed. The explicit "chat"
-// verb keeps working (user habit, headless harness parity).
-func isCommand(line string) bool {
-	verb, _, _ := strings.Cut(line, " ")
-	switch verb {
-	case cmd.List, cmd.Pick, cmd.Play, cmd.Queue, cmd.Skip, cmd.Chat, cmd.Quit, cmd.Help:
-		return true
-	}
-	return false
+// failf reports a rejected input: red on the input row (where the user
+// is looking) plus the full line in the system log.
+func (m Model) failf(format string, args ...any) (Model, tea.Cmd) {
+	m.lastErr = fmt.Sprintf(format, args...)
+	return m.logf("> %s", m.lastErr), nil
 }
 
-// submit parses the input line and dispatches it. Bare text goes to the
-// room as chat; reserved verbs dispatch as commands with their existing
-// parse errors (a typo'd "play" without argument errors instead of
-// accidentally chatting the word "play").
+// submit stores history and splits the line: "/..." dispatches a command,
+// everything else goes to the room as chat. Chat intent is the default —
+// no bare word can ever trigger a command.
 func (m Model) submit() (Model, tea.Cmd) {
 	line := strings.TrimSpace(m.input.Value())
 	m.input.SetValue("")
@@ -416,23 +419,37 @@ func (m Model) submit() (Model, tea.Cmd) {
 	if len(m.hist) > histCap {
 		m.hist = m.hist[len(m.hist)-histCap:]
 	}
-	if !isCommand(line) {
+	if !strings.HasPrefix(line, "/") {
 		if utf8.RuneCountInString(line) > cmd.ChatMaxLen {
-			return m.logf("> chat too long (max %d chars)", cmd.ChatMaxLen), nil
+			return m.failf("chat too long (max %d chars)", cmd.ChatMaxLen)
 		}
 		// local echo: the server never reflects our own chat back
 		m = m.logChat(m.nick, line)
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: line})
 	}
-	c, err := cmd.Parse(line)
+	return m.dispatch(line)
+}
+
+// dispatch runs one slash command. "//text" escapes to chat with a literal
+// slash; a lone "/" shows the command reference.
+func (m Model) dispatch(line string) (Model, tea.Cmd) {
+	body := strings.TrimPrefix(line, "/")
+	if body == "" {
+		return m.logf("> %s", usageTUI), nil
+	}
+	if strings.HasPrefix(body, "/") {
+		m = m.logChat(m.nick, body)
+		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: body})
+	}
+	c, err := cmd.Parse(body)
 	if err != nil {
-		return m.logf("> %s", err), nil
+		return m.failf("%s", firstLine(err))
 	}
 	switch c.Kind {
 	case cmd.Quit:
 		return m, tea.Quit
 	case cmd.Help:
-		return m.logf("> %s", cmd.Usage), nil
+		return m.logf("> %s", usageTUI), nil
 	case cmd.Chat:
 		// local echo: the server never reflects our own chat back
 		m = m.logChat(m.nick, c.Arg)
@@ -446,14 +463,14 @@ func (m Model) submit() (Model, tea.Cmd) {
 		return m, fetchFiles(m.api)
 	case cmd.Play:
 		if !m.knownFile(c.Arg) {
-			return m.logf("> no such file: %s (list to refresh)", c.Arg), nil
+			return m.failf("no such file: %s (try /list)", c.Arg)
 		}
 		m = m.logf("> playing %s", c.Arg) // local; own load broadcast is echo-filtered
 		return m, playFile(m.player, m.api, c.Arg)
 	case cmd.Queue:
 		if c.Arg == "" { // bare queue: show the room queue
 			if len(m.queue) == 0 {
-				return m.logEngine("> queue empty (queue <file> to add)"), nil
+				return m.logEngine("> queue empty (/queue <file> to add)"), nil
 			}
 			for i, n := range m.queue {
 				m = m.logf("> %d. %s", i+1, n)
@@ -465,6 +482,13 @@ func (m Model) submit() (Model, tea.Cmd) {
 		return m, postEvent(m.api, room.Event{Type: "skip"})
 	}
 	return m, nil
+}
+
+// firstLine strips the usage trailer cmd.Parse appends to argument errors —
+// the full reference is one /help away, the input row has one line only.
+func firstLine(err error) string {
+	line, _, _ := strings.Cut(err.Error(), "\n")
+	return line
 }
 
 func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
@@ -529,8 +553,9 @@ func RenderEvent(ev room.Event) string {
 // syncLayout applies the derived geometry (viewport size, input width) to
 // the widgets; layout() below is the single source of the math.
 func (m Model) syncLayout() Model {
-	cw, vh, _, _ := m.layout()
+	cw, vh, _, _, _ := m.layout()
 	m.vp.Width, m.vp.Height = cw, vh
+	m.sysVp.Width, m.sysVp.Height = cw, 2
 	m.input.Prompt = m.prompt()
 	m.input.Width = max(10, cw-lipgloss.Width(m.prompt())-1)
 	return m
@@ -546,36 +571,45 @@ func (m Model) syncViewport() Model {
 		} else if m.pickCursor >= m.vp.YOffset+m.vp.Height {
 			m.vp.SetYOffset(m.pickCursor - m.vp.Height + 1)
 		}
-		return m
+	} else {
+		atBottom := m.vp.AtBottom()
+		m.vp.SetContent(strings.Join(m.renderChatLines(), "\n"))
+		if atBottom {
+			m.vp.GotoBottom()
+		}
 	}
-	atBottom := m.vp.AtBottom()
-	m.vp.SetContent(strings.Join(m.renderLines(), "\n"))
-	if atBottom {
-		m.vp.GotoBottom()
-	}
+	// the system pane is a glanceable tail, never a reading surface: always
+	// pinned to the newest line
+	m.sysVp.SetContent(strings.Join(m.renderSysLines(), "\n"))
+	m.sysVp.GotoBottom()
 	return m
 }
 
 // layout derives the content geometry from the terminal size: inner width,
-// viewport height and whether the optional rows (progress bar, footer) fit.
-// Below ~20 rows the optional rows degrade first; the layout never splits.
-func (m Model) layout() (cw, vh int, showBar, showFooter bool) {
+// chat viewport height and which optional rows fit. Below ~20 rows the
+// optional rows degrade first (bar, system strip, footer); chat survives
+// longest — the layout never splits horizontally.
+func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
 	cw = m.contentWidth()
 	inner := m.height - frame.GetVerticalFrameSize()
 	if inner < 3 {
 		inner = 3
 	}
 	fixed := 3 // two header lines + input
-	showBar = m.duration > 0 && m.st != nil && m.st.Pos != nil && inner-fixed >= 4
+	showBar = m.duration > 0 && m.st != nil && m.st.Pos != nil && inner-fixed >= 6
 	if showBar {
 		fixed++
+	}
+	showSys = inner-fixed >= 6 // divider + 2 tail rows must leave real chat room
+	if showSys {
+		fixed += 3
 	}
 	showFooter = inner-fixed >= 3
 	if showFooter {
 		fixed++
 	}
 	vh = max(1, inner-fixed)
-	return cw, vh, showBar, showFooter
+	return cw, vh, showBar, showSys, showFooter
 }
 
 // contentWidth is the usable width inside the frame.
@@ -595,9 +629,11 @@ func (m Model) View() string {
 	if m.height == 0 {
 		return "connecting…\n"
 	}
-	cw, vh, showBar, showFooter := m.layout()
-	vp := m.vp // sized copy: View must not depend on Update having run first
+	cw, vh, showBar, showSys, showFooter := m.layout()
+	vp := m.vp // sized copies: View must not depend on Update having run first
 	vp.Width, vp.Height = cw, vh
+	sysVp := m.sysVp
+	sysVp.Width, sysVp.Height = cw, 2
 
 	var b strings.Builder
 	l1, l2 := m.headerLines(cw)
@@ -606,25 +642,81 @@ func (m Model) View() string {
 		b.WriteString(m.progressBar(cw) + "\n")
 	}
 	b.WriteString(vp.View() + "\n")
+	if showSys {
+		b.WriteString(m.sysDivider(cw) + "\n")
+		b.WriteString(sysVp.View() + "\n")
+	}
 	if showFooter {
 		b.WriteString(m.footerLine(cw) + "\n")
 	}
-	hint := ""
-	if !vp.AtBottom() {
-		hint = dim.Render("↑ more")
-	}
-	b.WriteString(joinLR(m.input.View(), hint, cw))
+	// textinput pads its view to the full input width; the padding would
+	// eat the whole gap in joinLR, so measure and render without it
+	in := strings.TrimRight(m.input.View(), " ")
+	b.WriteString(joinLR(in, m.inputSideHint(vp), cw))
 	return frame.Render(b.String())
 }
 
-// renderLines converts the log into display lines: chat bright, engine and
-// event lines dim; consecutive same-type engine lines collapse to their last
-// line plus a hidden count, so sync chatter never buries the conversation.
-func (m Model) renderLines() []string {
+// sysDivider separates the chat pane from the system tail.
+func (m Model) sysDivider(cw int) string {
+	label := dim.Render("─ system ")
+	return label + dim.Render(strings.Repeat("─", max(0, cw-lipgloss.Width(label))))
+}
+
+// inputSideHint picks the right-hand input row hint: the last error wins
+// (red, truncated to fit), then the scrollback marker. The used width is
+// computed from the actual content: textinput.View() pads to its full
+// Width, which would leave no room for the hint.
+func (m Model) inputSideHint(vp viewport.Model) string {
+	if m.lastErr != "" {
+		used := lipgloss.Width(m.prompt()) + lipgloss.Width(m.input.Value())
+		if m.input.Value() == "" {
+			used += lipgloss.Width(m.input.Placeholder)
+		}
+		gap := m.contentWidth() - used - 2
+		if gap < 8 {
+			return "" // no room: the error stays in the system log
+		}
+		s, cut := m.lastErr, false
+		for lipgloss.Width(s) > gap {
+			_, sz := utf8.DecodeLastRuneInString(s)
+			s = s[:len(s)-sz]
+			cut = true
+		}
+		if cut {
+			s += "…"
+		}
+		return errStyle.Render(s)
+	}
+	if !vp.AtBottom() {
+		return dim.Render("↑ more")
+	}
+	return ""
+}
+
+// renderChatLines renders the human conversation: bright, word-wrapped,
+// never mixed with machine output.
+func (m Model) renderChatLines() []string {
+	cw := m.contentWidth()
+	var out []string
+	for _, e := range m.log {
+		if e.kind == entChat {
+			out = append(out, m.renderEntry(e, cw)...)
+		}
+	}
+	return out
+}
+
+// renderSysLines renders events and engine lines dim; consecutive same-type
+// engine lines collapse to their last line plus a hidden count, so sync
+// chatter stays a compact tail instead of burying the conversation.
+func (m Model) renderSysLines() []string {
 	cw := m.contentWidth()
 	var out []string
 	for i := 0; i < len(m.log); i++ {
 		e := m.log[i]
+		if e.kind == entChat {
+			continue // not system noise, but still breaks an engine run
+		}
 		if e.kind != entEngine {
 			out = append(out, m.renderEntry(e, cw)...)
 			continue

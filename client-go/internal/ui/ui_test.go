@@ -58,31 +58,99 @@ func TestBareTextIsChat(t *testing.T) {
 	}
 }
 
-func TestChatVerbStillWorks(t *testing.T) {
+func TestVerbSentencesStayChat(t *testing.T) {
 	m := New("ada", nil, nil, false)
-	m.input.SetValue("chat eskisi gibi")
-	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if !hasChat(m.log, "ada", "eskisi gibi") {
-		t.Fatalf("explicit chat verb broken: %v", logTexts(m.log))
+	for _, line := range []string{"skip it", "quit now please", "play", "list", "queue"} {
+		m2 := m
+		m2.input.SetValue(line)
+		m2 = upd(t, m2, tea.KeyMsg{Type: tea.KeyEnter})
+		if !hasChat(m2.log, "ada", line) {
+			t.Fatalf("%q must be chat, log = %v", line, logTexts(m2.log))
+		}
 	}
 }
 
-func TestCommandLookalikes(t *testing.T) {
+func TestSlashCommands(t *testing.T) {
 	m := New("ada", nil, nil, false)
-	// a sentence that merely contains a verb is still chat
-	m.input.SetValue("listeyi bir açar mısın")
-	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if !hasChat(m.log, "ada", "listeyi bir açar mısın") {
-		t.Fatalf("look-alike text must stay chat: %v", logTexts(m.log))
+	m.files = []string{"a.mkv"}
+	m.input.SetValue("/play a.mkv")
+	mm, c := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(Model)
+	if c == nil || !contains(logTexts(m.log), "> playing a.mkv") {
+		t.Fatalf("/play dispatch wrong: c=%v log=%v", c, logTexts(m.log))
 	}
-	// a reserved verb missing its argument errors instead of chatting it
-	m.input.SetValue("play")
-	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if hasChat(m.log, "ada", "play") {
-		t.Fatal("play without argument must error, not chat")
+	m.input.SetValue("/skip")
+	mm, c = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(Model)
+	if c == nil {
+		t.Fatal("/skip did not return a command")
 	}
-	if !contains(logTexts(m.log), "> play needs an argument\n"+cmd.Usage) {
-		t.Fatalf("missing-argument error not shown: %v", logTexts(m.log))
+	m.input.SetValue("/help")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), "/pick") {
+		t.Fatalf("/help did not show slash usage:\n%s", m.View())
+	}
+	m.input.SetValue("/")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), "plain text is chat") {
+		t.Fatalf("lone / did not show usage:\n%s", m.View())
+	}
+}
+
+func TestSlashEscapeAndErrors(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	m.input.SetValue("// /not-a-command")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "/ /not-a-command") {
+		t.Fatalf("double slash escape wrong: %v", logTexts(m.log))
+	}
+	m.input.SetValue("/play")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.lastErr, "needs an argument") {
+		t.Fatalf("error flash missing: %q", m.lastErr)
+	}
+	var inputRow string
+	for _, l := range strings.Split(m.View(), "\n") {
+		if strings.Contains(l, "ada ›") {
+			inputRow = l // the rendered input line itself, placeholder included
+		}
+	}
+	if !strings.Contains(inputRow, "needs an argument") {
+		t.Fatalf("error not on the input row: %q", inputRow)
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.lastErr != "" {
+		t.Fatalf("typing must clear the error flash: %q", m.lastErr)
+	}
+}
+
+func TestChatVerbStillWorks(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	m.input.SetValue("chat eskisi gibi") // bare: now plain chat, same outcome
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "chat eskisi gibi") {
+		t.Fatalf("bare chat-verb line mangled: %v", logTexts(m.log))
+	}
+	m.input.SetValue("/chat eskisi gibi")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "eskisi gibi") {
+		t.Fatalf("/chat verb broken: %v", logTexts(m.log))
+	}
+}
+
+func TestPaneSeparation(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: "merhaba"})
+	m = upd(t, m, EngineLogMsg{Line: "> pause"})
+	chat, sys := strings.Join(m.renderChatLines(), "\n"), strings.Join(m.renderSysLines(), "\n")
+	if !strings.Contains(chat, "merhaba") || strings.Contains(chat, "pause") {
+		t.Fatalf("chat pane wrong: %q", chat)
+	}
+	if !strings.Contains(sys, "pause") || strings.Contains(sys, "merhaba") {
+		t.Fatalf("system pane wrong: %q", sys)
+	}
+	if !strings.Contains(m.View(), "system") {
+		t.Fatal("View missing the system divider")
 	}
 }
 
@@ -211,8 +279,8 @@ func TestInputHistory(t *testing.T) {
 
 func TestScrollPgUpPgDown(t *testing.T) {
 	m := New("t", nil, nil, false)
-	for i := 0; i < 30; i++ { // route through Update: production sends EngineLogMsg
-		m = upd(t, m, EngineLogMsg{Line: fmt.Sprintf("line-%02d", i)})
+	for i := 0; i < 30; i++ { // chat history is the scrollable reading surface
+		m = upd(t, m, room.Event{Type: "chat", Nick: "t", Text: fmt.Sprintf("line-%02d", i)})
 	}
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyPgUp})
 	if m.vp.YOffset != 0 {
@@ -247,13 +315,13 @@ func TestFooterQueuePreview(t *testing.T) {
 
 func TestBareQueueLists(t *testing.T) {
 	m := New("t", nil, nil, false)
-	m.input.SetValue("queue")
+	m.input.SetValue("/queue")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // empty queue -> hint
 	if !strings.Contains(m.View(), "queue empty") {
 		t.Fatalf("empty queue not reported: %q", m.View())
 	}
 	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv", "b.mkv"}})
-	m.input.SetValue("queue")
+	m.input.SetValue("/queue")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	v := m.View()
 	if !strings.Contains(v, "1. a.mkv") || !strings.Contains(v, "2. b.mkv") {
@@ -266,10 +334,10 @@ func TestQueueGuards(t *testing.T) {
 	m.files = []string{"a.mkv", "b.mkv"} // cached list, like after `list`
 	m = upd(t, m, room.Event{Type: "hello", Now: "a.mkv", Queue: []string{"b.mkv"}})
 	for _, tc := range []struct{ in, want string }{
-		{"queue c.mkv", "no such file: c.mkv"},
-		{"queue a.mkv", "already playing"},
-		{"queue b.mkv", "already queued"},
-		{"play c.mkv", "no such file: c.mkv"},
+		{"/queue c.mkv", "no such file: c.mkv"},
+		{"/queue a.mkv", "already playing"},
+		{"/queue b.mkv", "already queued"},
+		{"/play c.mkv", "no such file: c.mkv"},
 	} {
 		mm := m
 		mm.input.SetValue(tc.in)
@@ -328,7 +396,7 @@ func TestHeaderClockShowsPosition(t *testing.T) {
 	if !strings.Contains(l2, "1:05 / 10:00") {
 		t.Fatalf("header missing total: %q", l2)
 	}
-	if _, _, showBar, _ := m.layout(); !showBar {
+	if _, _, showBar, _, _ := m.layout(); !showBar {
 		t.Fatal("progress bar should show with pos+duration")
 	}
 	if !strings.Contains(m.progressBar(m.contentWidth()), "█") {
@@ -341,19 +409,19 @@ func TestEngineRunCollapse(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m = m.logEngine("> play")
 	}
-	out := strings.Join(m.renderLines(), "\n")
+	out := strings.Join(m.renderSysLines(), "\n")
 	if strings.Count(out, "> play") != 1 || !strings.Contains(out, "(2)") {
 		t.Fatalf("3 identical engine lines did not collapse: %q", out)
 	}
 	m = m.logEngine("> pause")
-	out = strings.Join(m.renderLines(), "\n")
+	out = strings.Join(m.renderSysLines(), "\n")
 	if !strings.Contains(out, "> play") || !strings.Contains(out, "> pause") {
 		t.Fatalf("type change must end the run: %q", out)
 	}
 	m = m.logEngine("> play") // alternating play/pause: every state stays visible
 	m = m.logChat("ada", "hello")
 	m = m.logEngine("> play")
-	out = strings.Join(m.renderLines(), "\n")
+	out = strings.Join(m.renderSysLines(), "\n")
 	if strings.Count(out, "> play") != 3 { // 1 collapsed + 1 before chat + 1 after: the run did not cross the chat
 		t.Fatalf("chat must break an engine run: %q", out)
 	}
