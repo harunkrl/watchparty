@@ -12,10 +12,11 @@ Built for two people who are tired of Discord/Telegram video quality.
 - `server.js` (Node, stdlib only): serves a videos folder over HTTP with
   Range support (`/v/<file>`), plus subtitles (`/sub/<file>`), and relays
   play/pause/seek/chat/queue events between clients over SSE.
-- `client.py` (Python, stdlib only): spawns `mpv`, connects to its JSON IPC
-  socket, and keeps it in sync with the room. Exactly one client runs with
-  `--master` (the host); its player is the clock authority. Followers apply
-  the master's state and re-seek when drift exceeds ~1s.
+- `client-go` (Go, single binary): a TUI that spawns `mpv`, connects to its
+  JSON IPC socket, and keeps it in sync with the room. Exactly one client
+  runs with `--master` (the host); its player is the clock authority.
+  Followers apply the master's state, micro-adjust speed on small drift and
+  re-seek when drift exceeds ~1s.
 - Quality is preserved by never touching the video: mpv decodes the original
   stream. mpv buffers up to 5 minutes ahead, so upload hiccups don't stall
   playback.
@@ -25,7 +26,9 @@ Tailnet-only by design: **no auth, no TLS. Do not port-forward this.**
 ## Requirements
 
 - Host: [Node](https://nodejs.org) 18+, videos in a folder, [Tailscale](https://tailscale.com)
-- Guests: Python 3.9+, `mpv`, Tailscale
+- Guests: the watchparty binary ([release zips](../../releases); the Windows
+  zip bundles a portable mpv — nothing else to install) + Tailscale
+- Building from source: Go 1.26+ (`cd client-go && go build`)
 - On NixOS: `nix-shell -p mpv` (or add mpv to your profile)
 
 ## Quickstart
@@ -34,13 +37,14 @@ Host (the machine with the videos):
 
 ```sh
 VIDEOS_DIR=~/Videos node server.js
-python3 client.py http://localhost:8090 --master --name ada
+client-go/watchparty --master --name ada http://localhost:8090
 ```
 
-Guest (e.g. in Spain):
+Guest (e.g. in Spain): unzip the release, then either double-click the
+binary (it asks for the server URL) or:
 
 ```sh
-python3 client.py http://<your-tailscale-ip>:8090 --name bo
+./watchparty --name bo http://<your-tailscale-ip>:8090
 ```
 
 Terminal commands in the client:
@@ -48,6 +52,7 @@ Terminal commands in the client:
 | Command | Effect |
 |---|---|
 | `list` | list videos on the server |
+| `pick` | cursor list: browse and play/queue with the arrow keys |
 | `play <file>` | start playing a file for everyone (anyone can call it) |
 | `queue <file>` | append to the shared queue; auto-plays when the current file ends |
 | `skip` | jump to the next file in the queue (same as the current file ending) |
@@ -82,8 +87,10 @@ everyone.
 
 ```sh
 node tests/smoke.mjs   # spawns its own server on a random port
+cd client-go && go build && cd ..   # the mpv tests drive this binary
 nix-shell -p mpv ffmpeg --run "node tests/integration.mjs"   # real-mpv Phase A (skips if mpv/ffmpeg missing)
-nix-shell -p mpv ffmpeg --run "node tests/pause_sync.mjs"   # two real clients: pause/resume/seek sync
+nix-shell -p mpv ffmpeg --run "node tests/pause_sync.mjs"   # two real clients: pause/resume/seek sync, both directions
+nix-shell -p mpv ffmpeg --run "node tests/soak.mjs"         # both sides act; no echo storms, convergence holds
 ```
 
 ## Deployment (homelab)
@@ -119,11 +126,11 @@ WantedBy=multi-user.target
 ```
 
 Add a video: `scp file.mp4 root@<host>:/opt/watchparty/videos/` — visible in
-`list` immediately, no restart. Update code: `scp server.js client.py` into
+`list` immediately, no restart. Update code: `scp server.js` into
 `/opt/watchparty`, then `systemctl restart watchparty`.
 
-Friends fetch the client from the server itself:
-`curl -O http://<tailnet-ip>:8090/client.py`
+Guests get the client from the GitHub releases page (tag a version and CI
+builds the zips, Windows one with mpv bundled).
 
 ## Known limits
 

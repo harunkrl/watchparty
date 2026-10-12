@@ -119,13 +119,6 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify(list()));
   }
 
-  if (req.method === 'GET' && u.pathname === '/client.py') {
-    const f = path.join(__dirname, 'client.py');
-    if (fs.existsSync(f)) return serveFile(req, res, f, 'text/x-python');
-    res.writeHead(404);
-    return res.end();
-  }
-
   if (req.method === 'GET' && u.pathname === '/events') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',

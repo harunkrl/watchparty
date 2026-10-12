@@ -32,23 +32,12 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MPV_ARGS = '--vo=null --ao=null --no-config --force-window=no';
 
-// interop matrix (M3): {python,go} x {master,follower}
-function arg(name, dflt) {
-  const i = process.argv.indexOf('--' + name);
-  return i >= 0 ? process.argv[i + 1] : dflt;
-}
-const masterEngine = arg('master-engine', 'python');
-const followerEngine = arg('follower-engine', 'python');
-if (!['python', 'go'].includes(masterEngine) || !['python', 'go'].includes(followerEngine)) {
-  console.error('--master-engine/--follower-engine must be python or go');
-  process.exit(2);
-}
+// two real go clients: master + follower
 const GO_BIN = join(ROOT, 'client-go/watchparty');
-if ((masterEngine === 'go' || followerEngine === 'go') && !existsSync(GO_BIN)) {
+if (!existsSync(GO_BIN)) {
   console.error(`missing ${GO_BIN} — build it first: cd client-go && go build`);
   process.exit(2);
 }
-console.log(`interop: master=${masterEngine} follower=${followerEngine}`);
 
 const dir = mkdtempSync(join(tmpdir(), 'wp-pause-'));
 execSync(
@@ -61,11 +50,9 @@ const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
   env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
-function client(name, extra, engine) {
-  // go needs flags before the positional url; python's argparse takes either
-  const argv = engine === 'go'
-    ? [GO_BIN, '--headless', '--name', name, ...extra, BASE]
-    : ['python3', join(ROOT, 'client.py'), BASE, '--name', name, ...extra];
+function client(name, extra) {
+  // flags before the positional url
+  const argv = [GO_BIN, '--headless', '--name', name, ...extra, BASE];
   const c = spawn(argv[0], argv.slice(1), {
     env: { ...process.env, WATCHPARTY_MPV: MPV_ARGS },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -79,12 +66,12 @@ function client(name, extra, engine) {
   });
   return c;
 }
-const master = client('M', ['--master'], masterEngine);
-const follower = client('F', [], followerEngine);
+const master = client('M', ['--master']);
+const follower = client('F', []);
 
 // find the mpv IPC socket path of a client's mpv child
-function mpvSocket(pyProc) {
-  const mpvPid = execSync(`pgrep -P ${pyProc.pid}`).toString().trim();
+function mpvSocket(p) {
+  const mpvPid = execSync(`pgrep -P ${p.pid}`).toString().trim();
   const cmdline = readFileSync(`/proc/${mpvPid}/cmdline`, 'utf8').split('\0');
   return cmdline.find((a) => a.startsWith('--input-ipc-server=')).slice('--input-ipc-server='.length);
 }
@@ -104,7 +91,8 @@ function mpvCall(sockPath, command) {
         const msg = JSON.parse(buf.slice(0, i));
         if (msg.request_id === 42) {
           s.end();
-          msg.error === 'success' ? resolve(msg.data) : reject(new Error(msg.error));
+          if (msg.error === 'success') resolve(msg.data);
+          else reject(new Error(msg.error));
         }
       } catch {
         reject(new Error('bad ipc line: ' + buf));

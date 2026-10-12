@@ -5,6 +5,7 @@
 
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,6 +13,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const BASE = process.argv[2] || 'http://pve:8090';
 const FILE = process.argv[3] || 'vid.mp4';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const GO_BIN = join(ROOT, 'client-go/watchparty');
+if (!existsSync(GO_BIN)) {
+  console.error(`missing ${GO_BIN} — build it first: cd client-go && go build`);
+  process.exit(2);
+}
 
 async function* sse() {
   const res = await fetch(`${BASE}/events?id=wansmoke-obs&nick=obs`);
@@ -33,7 +40,7 @@ async function* sse() {
   }
 }
 
-const client = spawn('python3', [join(ROOT, 'client.py'), BASE, '--master', '--name', 'wansmoke'], {
+const client = spawn(GO_BIN, ['--headless', '--master', '--name', 'wansmoke', BASE], {
   env: { ...process.env, WATCHPARTY_MPV: '--vo=null --ao=null --no-config --force-window=no' },
   stdio: ['pipe', 'pipe', 'inherit'],
 });

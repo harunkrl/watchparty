@@ -29,6 +29,10 @@ backward compatible (hello gained optional `pos`/`p` fields).
   of a visible re-seek; hard seeks stay beyond 1 s
 - tests: pause_sync covers both directions (follower pauses/seeks, master
   follows) across the full interop matrix
+- removed the python client — the Go binary is the only client (one engine
+  to fix, not two; the interop matrix collapses to go x go). Guests get
+  the release zips; the Windows one bundles mpv. Server no longer serves
+  /client.py
 
 ## v1.0.0
 

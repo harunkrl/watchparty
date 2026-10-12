@@ -32,18 +32,11 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MPV_ARGS = '--vo=null --ao=null --no-config --force-window=no';
 
-function arg(name, dflt) {
-  const i = process.argv.indexOf('--' + name);
-  return i >= 0 ? process.argv[i + 1] : dflt;
-}
-const masterEngine = arg('master-engine', 'python');
-const followerEngine = arg('follower-engine', 'python');
 const GO_BIN = join(ROOT, 'client-go/watchparty');
-if ((masterEngine === 'go' || followerEngine === 'go') && !existsSync(GO_BIN)) {
-  console.error(`missing ${GO_BIN} — build it first`);
+if (!existsSync(GO_BIN)) {
+  console.error(`missing ${GO_BIN} — build it first: cd client-go && go build`);
   process.exit(2);
 }
-console.log(`soak: master=${masterEngine} follower=${followerEngine}`);
 
 const dir = mkdtempSync(join(tmpdir(), 'wp-soak-'));
 execSync(
@@ -56,10 +49,8 @@ const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
   env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
-function client(name, extra, engine) {
-  const argv = engine === 'go'
-    ? [GO_BIN, '--headless', '--name', name, ...extra, BASE]
-    : ['python3', join(ROOT, 'client.py'), BASE, '--name', name, ...extra];
+function client(name, extra) {
+  const argv = [GO_BIN, '--headless', '--name', name, ...extra, BASE];
   const c = spawn(argv[0], argv.slice(1), {
     env: { ...process.env, WATCHPARTY_MPV: MPV_ARGS },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -88,7 +79,8 @@ const mpvCall = (sockPath, command) =>
       if (i < 0) return;
       const msg = JSON.parse(buf.slice(0, i));
       s.end();
-      msg.error === 'success' ? resolve(msg.data) : reject(new Error(msg.error));
+      if (msg.error === 'success') resolve(msg.data);
+      else reject(new Error(msg.error));
     });
     s.on('error', reject);
   });
@@ -117,8 +109,8 @@ async function observe() {
   }
 }
 
-const master = client('M', ['--master'], masterEngine);
-const follower = client('F', [], followerEngine);
+const master = client('M', ['--master']);
+const follower = client('F', []);
 const cleanup = (code) => {
   for (const p of [master, follower]) {
     try { execSync(`pkill -TERM -P ${p.pid}`); } catch {}

@@ -4,7 +4,7 @@
 
 import { strict as assert } from 'node:assert';
 import { execSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,11 @@ if (!has('mpv') || !has('ffmpeg')) {
   console.log('      try: nix-shell -p mpv ffmpeg --run "node tests/integration.mjs"');
   process.exit(0);
 }
+const GO_BIN = join(ROOT, 'client-go/watchparty');
+if (!existsSync(GO_BIN)) {
+  console.error(`missing ${GO_BIN} — build it first: cd client-go && go build`);
+  process.exit(2);
+}
 
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -40,7 +45,7 @@ const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
   env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
-const client = spawn('python3', [join(ROOT, 'client.py'), BASE, '--master', '--name', 'tester'], {
+const client = spawn(GO_BIN, ['--headless', '--master', '--name', 'tester', BASE], {
   env: { ...process.env, WATCHPARTY_MPV: '--vo=null --ao=null --no-config --force-window=no' },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -92,8 +97,8 @@ function waitUntil(fn, ms = 20000) {
 }
 
 // the client's own mpv child (hermetic: ignores other watchparty mpvs on the machine)
-function mpvChildPid(pyPid) {
-  return Number(execSync(`pgrep -P ${pyPid}`).toString().trim());
+function mpvChildPid(pid) {
+  return Number(execSync(`pgrep -P ${pid}`).toString().trim());
 }
 function alive(pid) {
   try {
@@ -154,7 +159,7 @@ try {
   await waitUntil(() => client.exitCode !== null, 10000);
   await sleep(500);
   assert.ok(!alive(mpvPid), 'mpv should be gone after quit');
-  assert.ok(!out.includes('Traceback'), `client crashed:\n${out}`);
+  assert.ok(!out.includes('panic:'), `client crashed:\n${out}`);
 
   console.log('PASS: integration with real mpv held');
   cleanup(0);
