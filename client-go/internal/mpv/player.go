@@ -266,9 +266,12 @@ func (p *Player) Load(name string) error {
 	if err := p.tell("loadfile", vurl); err != nil {
 		return err
 	}
-	for i := 0; i < 50; i++ { // wait until the file is actually live
+	for i := 0; i < 50; i++ { // wait until loaded AND seekable: a seek issued
+		// between loadfile and file-loaded is silently dropped by mpv
 		if got, _ := p.Get("path"); got == vurl {
-			break
+			if v, _ := p.Get("seekable"); v == true {
+				break
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

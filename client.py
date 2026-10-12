@@ -148,8 +148,9 @@ class Player:
         log(f'> playing {name}')
         self.ipc.tell('loadfile', url)
         self.name = name
-        for _ in range(50):  # wait until the file is actually live
-            if self.get('path') == url:
+        for _ in range(50):  # wait until loaded AND seekable: a seek issued
+            # between loadfile and file-loaded is silently dropped by mpv
+            if self.get('path') == url and self.get('seekable'):
                 break
             time.sleep(0.1)
         # attach a sidecar subtitle if one sits next to the video;
