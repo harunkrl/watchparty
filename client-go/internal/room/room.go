@@ -104,7 +104,7 @@ func (c *Client) Stream(ctx context.Context, nick string, out chan<- Event, onCo
 					}
 				}
 				t.Reset(readIdle)
-						case <-t.C:
+			case <-t.C:
 				resp.Body.Close() // unblocks scanner; outer defer is idempotent
 				return
 			}

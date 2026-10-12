@@ -75,8 +75,8 @@ func TestStreamPingsKeepAlive(t *testing.T) {
 			case <-ticker.C:
 				fmt.Fprint(w, ": ping\n\n")
 				if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
+					f.Flush()
+				}
 			}
 		}
 	}))
