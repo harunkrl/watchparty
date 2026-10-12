@@ -122,6 +122,21 @@ try {
   assert.equal(part.headers.get('content-range'), 'bytes 0-99/10000');
   assert.equal((await part.arrayBuffer()).byteLength, 100);
 
+  // suffix ranges serve the last N bytes (RFC 9110)
+  const last = await fetch(`${BASE}/v/${name}`, { headers: { range: 'bytes=-100' } });
+  assert.equal(last.status, 206);
+  assert.equal(last.headers.get('content-range'), 'bytes 9900-9999/10000');
+  assert.equal(last.headers.get('content-length'), '100');
+  const lastByte = await fetch(`${BASE}/v/${name}`, { headers: { range: 'bytes=-1' } });
+  assert.equal(lastByte.status, 206);
+  assert.equal(lastByte.headers.get('content-range'), 'bytes 9999-9999/10000');
+
+  // malformed percent-encoding answers 400 and never kills the process
+  for (const bad of ['%', '%fg', '%2']) {
+    assert.equal((await fetch(`${BASE}/v/${bad}`)).status, 400);
+  }
+  assert.ok((await fetch(`${BASE}/files`)).ok, 'server alive after bad requests');
+
   // path traversal is rejected
   const evil = await fetch(`${BASE}/v/${encodeURIComponent('../../etc/passwd')}`);
   assert.equal(evil.status, 404);
@@ -153,8 +168,32 @@ try {
   }
   await waitUntil(() => a.events.some((e) => e.type === 'position'));
   for (const t of ['pause', 'play', 'seek', 'position']) {
-    assert.ok(a.events.some((e) => e.type === t), `missing ${t}`);
+    assert.ok(a.events.some((ev) => ev.type === t), `missing ${t}`);
   }
+
+  // hello carries the live room position (age-adjusted) for late joiners
+  await post({ type: 'position', from: 'bob', t: 43.5, p: true }); // paused master
+  const c = sse('carol', 'Carol');
+  await waitUntil(() => c.events[0]);
+  assert.equal(c.events[0].type, 'hello');
+  assert.equal(c.events[0].p, true);
+  assert.ok(Math.abs(c.events[0].pos - 43.5) < 0.5, `pos ${c.events[0].pos}`);
+  c.close();
+
+  await post({ type: 'play', from: 'bob' });
+  const d = sse('dave', 'Dave');
+  await waitUntil(() => d.events[0]);
+  assert.equal(d.events[0].p, false);
+  assert.ok(d.events[0].pos >= 43.5, 'pos age-adjusted while playing');
+  d.close();
+
+  // a fresh load resets the position: joiners are not dragged to stale offsets
+  await post({ type: 'load', from: 'bob', name: 'movie one.mkv' });
+  await waitUntil(() => a.events.filter((ev) => ev.type === 'load').length === 3);
+  const er = sse('erin', 'Erin');
+  await waitUntil(() => er.events[0]);
+  assert.equal(er.events[0].pos, undefined);
+  er.close();
 
   b.close();
   await waitUntil(() => a.events.some((e) => e.type === 'bye' && e.nick === 'Bob'));

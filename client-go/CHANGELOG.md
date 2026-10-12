@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+Hardening and sync fixes after a two-agent review; wire protocol stays
+backward compatible (hello gained optional `pos`/`p` fields).
+
+- server: malformed percent-encoding in /v and /sub paths answers 400
+  instead of crashing the whole process (a single `GET /v/%` killed it)
+- server: suffix Range requests (`bytes=-N`) serve the last N bytes per
+  RFC 9110 (previously wrong end offset or a spurious 416)
+- server + clients: hello carries the live room position (age-adjusted)
+  and paused flag; late joiners and reconnecting followers seek straight
+  to it — also while the master is paused
+- go: bundled Windows mpv.exe next to watchparty.exe starts again
+  (Go 1.19+ ErrDot refused the cwd lookup the friend bundle relies on)
+- go: subtitle probe uses a 5s timeout (a hung probe no longer stalls
+  the sync engine)
+- go: SSE stream has a keepalive-aware idle watchdog (45s) so silently
+  dead connections reconnect instead of hanging forever
+- tests: smoke covers bad encodings/ranges and hello pos; go covers the
+  watchdog and the hello snapshot
+
 ## v1.0.0
 
 First release of the Go TUI client. Server and wire protocol unchanged;

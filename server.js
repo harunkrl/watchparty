@@ -15,7 +15,9 @@ const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts|flv|wmv|mpg|mpeg)$/i;
 fs.mkdirSync(VIDEOS, { recursive: true });
 
 const listeners = new Map(); // sse response -> client id
-const state = { now: null, queue: [] };
+// pos/paused/posAt: last master heartbeat, so late joiners can seek
+// straight to the live room position instead of converging over seconds.
+const state = { now: null, queue: [], pos: null, paused: false, posAt: 0 };
 
 const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort();
 
@@ -27,15 +29,24 @@ function broadcast(ev, exceptId) {
 function handleCmd(cmd) {
   switch (cmd.type) {
     case 'chat':
+    case 'seek':
+      broadcast(cmd, cmd.from);
+      break;
     case 'play':
     case 'pause':
-    case 'seek':
+      state.paused = cmd.type === 'pause';
+      broadcast(cmd, cmd.from);
+      break;
     case 'position':
+      state.pos = cmd.t;
+      state.paused = !!cmd.p;
+      state.posAt = Date.now();
       broadcast(cmd, cmd.from);
       break;
     case 'load':
       if (!list().includes(cmd.name)) break;
       state.now = cmd.name;
+      state.pos = null; // old file's position is meaningless now
       state.queue = state.queue.filter((n) => n !== cmd.name);
       broadcast(cmd, cmd.from);
       break;
@@ -49,6 +60,7 @@ function handleCmd(cmd) {
     case 'skip': // same, on demand
       if (state.queue.length && state.now) {
         state.now = state.queue.shift();
+        state.pos = null; // positions belong to the previous file
         broadcast({ type: 'load', name: state.now, from: null });
         broadcast({ type: 'queue', queue: state.queue });
       }
@@ -75,7 +87,7 @@ function serveFile(req, res, file, ctype) {
       status = 206;
       if (m[1]) start = parseInt(m[1], 10);
       else if (m[2]) start = Math.max(0, size - parseInt(m[2], 10)); // suffix range
-      if (m[2]) end = parseInt(m[2], 10);
+      if (m[1] && m[2]) end = parseInt(m[2], 10); // explicit end only; suffix keeps size-1
       if (!Number.isFinite(start) || start > end || start >= size) {
         res.writeHead(416, { 'content-range': `bytes */${size}` });
         return res.end();
@@ -123,7 +135,13 @@ const server = http.createServer((req, res) => {
     const id = u.searchParams.get('id') || '';
     const nick = u.searchParams.get('nick') || id;
     listeners.set(res, id);
-    res.write(`data: ${JSON.stringify({ type: 'hello', now: state.now, queue: state.queue })}\n\n`);
+    const hello = { type: 'hello', now: state.now, queue: state.queue };
+    if (state.now && state.pos != null) {
+      // age-adjusted: where the master is right now, not at heartbeat time
+      hello.pos = state.pos + (state.paused ? 0 : (Date.now() - state.posAt) / 1000);
+      hello.p = state.paused;
+    }
+    res.write(`data: ${JSON.stringify(hello)}\n\n`);
     broadcast({ type: 'join', nick }, id);
     const ping = setInterval(() => res.write(': ping\n\n'), 15000);
     req.on('close', () => {
@@ -159,7 +177,13 @@ const server = http.createServer((req, res) => {
 
   const m = (req.method === 'GET' || req.method === 'HEAD') && u.pathname.match(/^\/(v|sub)\/(.+)$/);
   if (m) {
-    const name = decodeURIComponent(m[2]);
+    let name;
+    try {
+      name = decodeURIComponent(m[2]);
+    } catch {
+      res.writeHead(400); // malformed percent-encoding must not kill the process
+      return res.end();
+    }
     const file = path.resolve(VIDEOS, name);
     if (!file.startsWith(VIDEOS + path.sep) || !fs.existsSync(file)) {
       res.writeHead(404);

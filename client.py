@@ -201,6 +201,16 @@ class Client:
             log(f"> room: now={ev['now']} queue={ev['queue']}")
             if ev['now']:
                 self.player.load(ev['now'])
+                # server may carry an age-adjusted media pos + paused
+                # flag from the room's live snapshot; converge now instead
+                # of waiting for the next heartbeat (avoids ~2s of wrong
+                # playback while master_pos trickles in)
+                if ev.get('pos') is not None:
+                    p = bool(ev.get('p'))
+                    self.player.ipc.tell('seek', ev['pos'], 'absolute')
+                    if p:
+                        self.player.ipc.tell('set_property', 'pause', True)
+                    self.master_pos = (ev['pos'], p, time.monotonic())
         elif t == 'queue':
             log(f'> queue: {ev["queue"]}')
         elif t == 'join':

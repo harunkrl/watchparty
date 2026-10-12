@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -20,6 +21,9 @@ import (
 	"sync"
 	"time"
 )
+
+// subClient caps the sidecar subtitle probe; matches client.py's timeout=5.
+var subClient = &http.Client{Timeout: 5 * time.Second}
 
 // Fixed numbers from the plan: aggressive LAN readahead so upload hiccups
 // never stall playback (user-overridable via WATCHPARTY_MPV).
@@ -75,6 +79,11 @@ func Start(base string, extra []string) (*Player, error) {
 		"--demuxer-max-bytes=" + demuxerMaxBytes,
 	}, extra...)
 	cmd := exec.Command("mpv", args...)
+	// mpv.exe is bundled next to watchparty.exe; LookPath warns relative-cwd
+	// resolution (Go 1.19+ ErrDot); we deliberately accept the sibling.
+	if errors.Is(cmd.Err, exec.ErrDot) {
+		cmd.Err = nil
+	}
 	// Stdin nil = os.DevNull: otherwise mpv steals the keyboard from the TUI
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(dir)
@@ -266,7 +275,7 @@ func (p *Player) Load(name string) error {
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
 	for _, ext := range []string{".srt", ".ass"} {
 		sub := fmt.Sprintf("%s/sub/%s", p.base, url.PathEscape(stem+ext))
-		resp, err := http.Get(sub)
+		resp, err := subClient.Get(sub)
 		if err != nil {
 			continue
 		}

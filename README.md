@@ -128,5 +128,6 @@ Friends fetch the client from the server itself:
 - Windows client (named-pipe IPC) is untested; treat it as best-effort.
 - Browsers are unsupported by design: generic Content-Type, no CORS — use mpv.
 - Follower drift correction is covered by `tests/pause_sync.mjs` (pause, resume,
-  seek convergence); SSE reconnect replay is not — a follower that reconnects
-  catches up within one heartbeat (~2 s) via position convergence.
+  seek convergence). A reconnecting or late-joining client is seeked straight to
+  the live room position: hello carries the age-adjusted master position and
+  paused flag (works while the master is paused too).

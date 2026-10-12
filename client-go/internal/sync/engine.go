@@ -128,6 +128,17 @@ func (e *Engine) OnRoom(ev room.Event) {
 		if ev.Now != "" {
 			e.load(ev.Now)
 		}
+		// Server may carry an age-adjusted media position + paused flag
+		// from the room's live snapshot (set after every position relay,
+		// cleared by load/ended/skip). When present, snap now and seek
+		// before the first heartbeat would even arrive.
+		if ev.Pos != nil {
+			e.snap = &snapshot{t: *ev.Pos, paused: ev.P, at: e.Clock.Now()}
+			e.seekTo(*ev.Pos)
+			if ev.P {
+				e.setPause(true)
+			}
+		}
 	case "load":
 		e.load(ev.Name)
 	case "pause":
