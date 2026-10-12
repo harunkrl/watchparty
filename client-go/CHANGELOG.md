@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 — UI redesign
+
+- A+ layout: two-line header (identity/connection with up-time and retry
+  backoff, now playing + clock), full-width progress bar with elapsed/
+  total (duration via bounded mpv retry), chat-first viewport, footer with
+  queue preview and drift chip (green/amber/red), input on its own line
+- engine log lines stay in the flow but dimmed and collapsed (+N marker);
+  speed-nudge lines move to the drift chip instead of the chat flow
+- long chat lines word-wrap aligned under the nick (truncate stays as the
+  pathological-token fallback); 80x24 safe, single render path
+- master's own play now reflects in the UI immediately (loadedMsg) — the
+  server never echoes our own load back, so "now" used to stick at "-"
+- pick overlay on ctrl+p in addition to the command; headless parity kept
+
+## Unreleased (v1.0.x line)
 
 Hardening and sync fixes after a two-agent review; wire protocol stays
 backward compatible (hello gained optional `pos`/`p` fields).

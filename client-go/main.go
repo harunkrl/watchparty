@@ -136,7 +136,7 @@ func main() {
 			if *headless {
 				fmt.Println(note)
 			} else {
-				p.Send(ui.ReconnectingMsg{Note: note})
+				p.Send(ui.ReconnectingMsg{Note: note, Try: attempt, Delay: delay})
 			}
 			select {
 			case <-ctx.Done():
