@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"watchparty/client-go/internal/cmd"
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
 )
@@ -46,6 +47,56 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func TestBareTextIsChat(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	m.input.SetValue("selam, ne izliyoruz?")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "selam, ne izliyoruz?") {
+		t.Fatalf("bare text not treated as chat: %v", logTexts(m.log))
+	}
+}
+
+func TestChatVerbStillWorks(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	m.input.SetValue("chat eskisi gibi")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "eskisi gibi") {
+		t.Fatalf("explicit chat verb broken: %v", logTexts(m.log))
+	}
+}
+
+func TestCommandLookalikes(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	// a sentence that merely contains a verb is still chat
+	m.input.SetValue("listeyi bir açar mısın")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !hasChat(m.log, "ada", "listeyi bir açar mısın") {
+		t.Fatalf("look-alike text must stay chat: %v", logTexts(m.log))
+	}
+	// a reserved verb missing its argument errors instead of chatting it
+	m.input.SetValue("play")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if hasChat(m.log, "ada", "play") {
+		t.Fatal("play without argument must error, not chat")
+	}
+	if !contains(logTexts(m.log), "> play needs an argument\n"+cmd.Usage) {
+		t.Fatalf("missing-argument error not shown: %v", logTexts(m.log))
+	}
+}
+
+func TestBareChatTooLong(t *testing.T) {
+	m := New("ada", nil, nil, false)
+	long := strings.Repeat("x", cmd.ChatMaxLen+1)
+	m.input.SetValue(long)
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), "chat too long") {
+		t.Fatalf("length guard missing:\n%s", m.View())
+	}
+	if hasChat(m.log, "ada", long) {
+		t.Fatal("over-long chat must not be sent")
+	}
 }
 
 func TestRenderEventTable(t *testing.T) {

@@ -115,7 +115,7 @@ type Model struct {
 
 func New(nick string, api *room.Client, player *mpv.Player, master bool) Model {
 	in := textinput.New()
-	in.Placeholder = "chat <msg> | pick | list | help"
+	in.Placeholder = "type to chat · list | pick | play | queue | skip | help"
 	in.Focus()
 	// sane defaults so the first frame renders before WindowSizeMsg arrives
 	// (and in size-less ptys used by the test harness)
@@ -388,7 +388,23 @@ func (m Model) enqueue(name string) (Model, tea.Cmd) {
 	return m, postEvent(m.api, room.Event{Type: "enqueue", Name: name})
 }
 
-// submit parses the input line and dispatches it.
+// isCommand reports whether the line starts with a reserved verb; those
+// keep their command meaning. Everything else typed at the prompt is chat —
+// talking is the primary input, no prefix needed. The explicit "chat"
+// verb keeps working (user habit, headless harness parity).
+func isCommand(line string) bool {
+	verb, _, _ := strings.Cut(line, " ")
+	switch verb {
+	case cmd.List, cmd.Pick, cmd.Play, cmd.Queue, cmd.Skip, cmd.Chat, cmd.Quit, cmd.Help:
+		return true
+	}
+	return false
+}
+
+// submit parses the input line and dispatches it. Bare text goes to the
+// room as chat; reserved verbs dispatch as commands with their existing
+// parse errors (a typo'd "play" without argument errors instead of
+// accidentally chatting the word "play").
 func (m Model) submit() (Model, tea.Cmd) {
 	line := strings.TrimSpace(m.input.Value())
 	m.input.SetValue("")
@@ -399,6 +415,14 @@ func (m Model) submit() (Model, tea.Cmd) {
 	m.hist = append(m.hist, line)
 	if len(m.hist) > histCap {
 		m.hist = m.hist[len(m.hist)-histCap:]
+	}
+	if !isCommand(line) {
+		if utf8.RuneCountInString(line) > cmd.ChatMaxLen {
+			return m.logf("> chat too long (max %d chars)", cmd.ChatMaxLen), nil
+		}
+		// local echo: the server never reflects our own chat back
+		m = m.logChat(m.nick, line)
+		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: line})
 	}
 	c, err := cmd.Parse(line)
 	if err != nil {

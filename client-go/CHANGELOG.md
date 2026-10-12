@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.1 — chat-first input
+
+- bare text at the prompt is sent to the room as chat — no "chat" prefix
+  needed; the reserved verbs (list, pick, play, queue, skip, chat, quit,
+  help) keep their command meaning and their parse errors ("play" without
+  an argument errors instead of chatting the word). A line that merely
+  STARTS with a verb still runs the command ("skip it" skips) — prefix
+  "chat ..." for sentences that begin with a reserved word; headless
+  harness parsing unchanged
+
 ## v1.1.0 — UI redesign
 
 - A+ layout: two-line header (identity/connection with up-time and retry
