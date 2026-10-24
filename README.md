@@ -21,7 +21,7 @@ Built for two people who are tired of Discord/Telegram video quality.
   stream. mpv buffers up to 5 minutes ahead, so upload hiccups don't stall
   playback.
 
-Tailnet-only by design: **no auth, no TLS. Do not port-forward this.**
+Tailnet and home LAN only by design: **no auth, no TLS. Do not port-forward this.**
 
 ## Requirements
 

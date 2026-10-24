@@ -500,6 +500,15 @@ func TestCtrlPOpensPicker(t *testing.T) {
 	}
 }
 
+func TestListOpensPicker(t *testing.T) {
+	m := New("t", nil, nil, false)
+	m.input.SetValue("/list")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.mode != modePick {
+		t.Fatal("/list did not open the picker (2-line system strip cannot hold a file dump)")
+	}
+}
+
 func TestOwnLoadUpdatesNow(t *testing.T) {
 	m := New("t", nil, nil, false)
 	m = upd(t, m, loadedMsg{name: "movie.mkv"})

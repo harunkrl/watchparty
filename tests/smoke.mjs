@@ -166,6 +166,14 @@ try {
   await waitUntil(() => a.events.some((e) => e.type === 'queue'));
   await post({ type: 'load', from: 'bob', name: 'movie one.mkv' });
   await waitUntil(() => a.events.some((e) => e.type === 'load'));
+
+  // hello age-adjustment runs on monotonic time: a fresh joiner lands at
+  // posted pos + actual elapsed (an NTP wall-clock jump cannot skew it)
+  await post({ type: 'position', from: 'bob', t: 100, p: false });
+  await sleep(600);
+  const latecomer = sse('late2', 'late2');
+  await waitUntil(() => latecomer.events.some((e) => e.type === 'hello' && e.pos >= 100.3 && e.pos <= 102));
+  latecomer.close();
   await post({ type: 'ended', from: 'bob' });
   await sleep(300);
   assert.equal(a.events.filter((e) => e.type === 'load').length, 1);

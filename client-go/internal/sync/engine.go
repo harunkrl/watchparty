@@ -153,6 +153,12 @@ func (e *Engine) OnRoom(ev room.Event) {
 	case "position":
 		e.snap = &snapshot{t: ev.T, paused: ev.P, at: e.Clock.Now()}
 	case "hello":
+		// Resume-by-design: a reconnecting client (follower OR master)
+		// reloads the room's file and seeks to the live position. For a
+		// restarted master this rewinds followers to the crash-time position
+		// — bounded, self-consistent (the master is the authority), and far
+		// better than starting empty while the room still carries state.
+		// End-to-end: tests/master_restart.mjs.
 		if ev.Now != "" {
 			e.load(ev.Now)
 		}

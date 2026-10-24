@@ -454,9 +454,7 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		// local echo: the server never reflects our own chat back
 		m = m.logChat(m.nick, c.Arg)
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: c.Arg})
-	case cmd.List:
-		return m, fetchFiles(m.api)
-	case cmd.Pick:
+	case cmd.List, cmd.Pick: // /list opens the picker too: a 2-line system strip is no place for a file dump
 		m.mode = modePick
 		m.pickCursor = 0
 		m.pickItems = nil

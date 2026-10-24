@@ -19,6 +19,9 @@ fs.mkdirSync(VIDEOS, { recursive: true });
 const listeners = new Map(); // sse response -> client id
 // pos/paused/posAt: last master heartbeat, so late joiners can seek
 // straight to the live room position instead of converging over seconds.
+// posAt is hrtime-based (monotonic): an NTP wall-clock jump between
+// heartbeats can no longer skew the age adjustment.
+const mono = () => Number(process.hrtime.bigint() / 1000000n);
 const state = { now: null, queue: [], pos: null, paused: false, posAt: 0 };
 
 const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort();
@@ -52,7 +55,7 @@ function handleCmd(cmd) {
     case 'position':
       state.pos = cmd.t;
       state.paused = !!cmd.p;
-      state.posAt = Date.now();
+      state.posAt = mono();
       broadcast(cmd, cmd.from);
       break;
     case 'load':
@@ -143,7 +146,7 @@ const server = http.createServer((req, res) => {
     const hello = { type: 'hello', now: state.now, queue: state.queue };
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
-      hello.pos = state.pos + (state.paused ? 0 : (Date.now() - state.posAt) / 1000);
+      hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
       hello.p = state.paused;
     }
     res.write(`data: ${JSON.stringify(hello)}\n\n`);
