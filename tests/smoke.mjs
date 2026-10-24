@@ -5,7 +5,7 @@
 
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -139,12 +139,27 @@ try {
 
   // path traversal is rejected
   const evil = await fetch(`${BASE}/v/${encodeURIComponent('../../etc/passwd')}`);
-  assert.equal(evil.status, 404);
+  assert.equal(evil.status, 404, 'traversal must be rejected');
+
+  // a symlink planted inside the videos dir cannot escape it
+  symlinkSync('/etc/passwd', join(dir, 'evil.mp4'));
+  const viaLink = await fetch(`${BASE}/v/evil.mp4`);
+  assert.equal(viaLink.status, 404, 'symlink escape must be rejected');
+  assert.ok(!(await viaLink.text()).includes('root:'), 'no passwd content leaks');
 
   // chat relay: bob speaks, alice hears, bob does not hear himself
   await post({ type: 'chat', from: 'bob', nick: 'bob', text: 'selam' });
   await waitUntil(() => a.events.some((e) => e.type === 'chat'));
   assert.equal(b.events.filter((e) => e.type === 'chat').length, 0);
+
+  // nicks and chat text are sanitized at the server (control chars, length)
+  const evilSse = sse('evil', 'a\x1b[2Jb\nc\x07'.repeat(40));
+  await waitUntil(() => a.events.some((e) => e.type === 'join' && e.nick === 'a[2Jbc'.repeat(40).slice(0, 32)));
+  await post({ type: 'chat', from: 'evil', nick: 'x\x1b[2Jy', text: 't\nu\x1b]0;evil' });
+  await waitUntil(() => a.events.some((e) => e.type === 'chat' && e.nick === 'x[2Jy'));
+  const gotChat = a.events.find((e) => e.type === 'chat' && e.nick === 'x[2Jy');
+  assert.equal(gotChat.text, 'tu]0;evil');
+  evilSse.close();
 
   // load + queue + auto-advance (empty queue => no second load)
   await post({ type: 'enqueue', from: 'bob', name: 'movie one.mkv' });

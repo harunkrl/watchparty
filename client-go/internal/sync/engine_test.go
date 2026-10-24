@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -17,9 +18,10 @@ type fakePlayer struct {
 	speeds   []float64
 	showText []string
 	pos      *float64
+	loadErr  error // returned by Load to simulate a failed loadfile
 }
 
-func (f *fakePlayer) Load(name string) error { f.loads = append(f.loads, name); return nil }
+func (f *fakePlayer) Load(name string) error { f.loads = append(f.loads, name); return f.loadErr }
 func (f *fakePlayer) SetPause(p bool) error  { f.pauses = append(f.pauses, p); return nil }
 func (f *fakePlayer) Seek(t float64) error   { f.seeks = append(f.seeks, t); return nil }
 func (f *fakePlayer) Speed(v float64) error  { f.speeds = append(f.speeds, v); return nil }
@@ -361,6 +363,17 @@ func TestFollowerNoSnapshotNeverPosts(t *testing.T) {
 	e.OnMpvEvent("seek")
 	if len(po.events) != 0 {
 		t.Fatalf("follower posted without snapshot: %v", evType(t, po.events))
+	}
+}
+
+func TestLoadFailureLogged(t *testing.T) {
+	logs, sink := logSink()
+	e, pl, _ := newEngine(false)
+	e.Logf = sink
+	pl.loadErr = errors.New("load failed: nope.mkv")
+	e.OnRoom(room.Event{Type: "load", Name: "nope.mkv"})
+	if !hasLine(*logs, "> playing nope.mkv") || !hasLine(*logs, "mpv: load failed: nope.mkv") {
+		t.Fatalf("failed load not surfaced: %v", *logs)
 	}
 }
 

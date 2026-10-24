@@ -172,7 +172,7 @@ func main() {
 	}()
 	go func() { // dispatcher: one chRoom consumer fans out to ui + engine
 		for ev := range chRoom {
-			p.Send(ev) // ui first: stays live while OnRoom blocks on loadfile
+			p.Send(ev) // ui first: stays live while OnRoom blocks on loadfile (tea.Program.Send is goroutine-safe)
 			engine.OnRoom(ev)
 		}
 		p.Send(ui.StreamClosedMsg{})

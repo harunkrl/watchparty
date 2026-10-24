@@ -10,6 +10,8 @@ const path = require('path');
 
 const PORT = Number(process.env.PORT) || 8090;
 const VIDEOS = path.resolve(process.env.VIDEOS_DIR || path.join(__dirname, 'videos'));
+// resolved lazily on first /v or /sub request: the videos dir may not exist at boot
+let realBase;
 const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts|flv|wmv|mpg|mpeg)$/i;
 
 fs.mkdirSync(VIDEOS, { recursive: true });
@@ -26,7 +28,17 @@ function broadcast(ev, exceptId) {
   for (const [res, id] of listeners) if (id !== exceptId) res.write(line);
 }
 
+function clean(s, max) {
+  // strip control chars (newlines, ANSI escapes) and cap length: the
+  // server is the trust boundary for what every TUI prints
+  return String(s).replace(/[\x00-\x1f\x7f]/g, '').slice(0, max);
+}
+
 function handleCmd(cmd) {
+  if (cmd.type === 'chat') {
+    cmd.nick = clean(cmd.nick || '', 32);
+    cmd.text = clean(cmd.text || '', 500); // mirrors client ChatMaxLen
+  }
   switch (cmd.type) {
     case 'chat':
     case 'seek':
@@ -126,7 +138,7 @@ const server = http.createServer((req, res) => {
       connection: 'keep-alive',
     });
     const id = u.searchParams.get('id') || '';
-    const nick = u.searchParams.get('nick') || id;
+    const nick = clean(u.searchParams.get('nick') || id, 32);
     listeners.set(res, id);
     const hello = { type: 'hello', now: state.now, queue: state.queue };
     if (state.now && state.pos != null) {
@@ -177,8 +189,17 @@ const server = http.createServer((req, res) => {
       res.writeHead(400); // malformed percent-encoding must not kill the process
       return res.end();
     }
-    const file = path.resolve(VIDEOS, name);
-    if (!file.startsWith(VIDEOS + path.sep) || !fs.existsSync(file)) {
+    let file;
+    try {
+      // realpath resolves symlinks: lexical containment alone is not enough,
+      // createReadStream would happily follow a symlink planted in VIDEOS
+      file = fs.realpathSync(path.resolve(VIDEOS, name));
+      realBase ||= fs.realpathSync(VIDEOS);
+    } catch {
+      res.writeHead(404);
+      return res.end();
+    }
+    if (!file.startsWith(realBase + path.sep)) {
       res.writeHead(404);
       return res.end();
     }

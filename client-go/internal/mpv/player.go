@@ -281,6 +281,14 @@ func (p *Player) Load(name string) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// a loadfile that failed (bad file, 404, unsupported) drops mpv back to
+	// idle — surface it instead of returning success for a player that never
+	// started (the engine logs this as "mpv: ..." next to its "playing" line)
+	if got, _ := p.Get("path"); got != vurl {
+		if idle, _ := p.Get("idle-active"); idle == true {
+			return fmt.Errorf("load failed: %s", name)
+		}
+	}
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
 	for _, ext := range []string{".srt", ".ass"} {
 		sub := fmt.Sprintf("%s/sub/%s", p.base, url.PathEscape(stem+ext))
