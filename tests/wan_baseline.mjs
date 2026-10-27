@@ -390,6 +390,66 @@ async function phaseR4(ctx) {
   return res;
 }
 
+// ---------------------------------------------------------------- pause/resume on a throttled link
+async function phasePause(ctx) {
+  const server = startServer(ctx.port, ctx.dir, ctx.stateFile);
+  await waitServer(ctx.port);
+  const proxyF = new Proxy(ctx.proxyFPort, ctx.port, ctx.cap, 'F');
+  const proxyM = new Proxy(ctx.proxyMPort, ctx.port, 0, 'M');
+  await proxyF.listen(); await proxyM.listen();
+  const master = startClient('M', true, `http://127.0.0.1:${ctx.proxyMPort}`);
+  const follower = startClient('F', false, `http://127.0.0.1:${ctx.proxyFPort}`);
+  await sleep(2500);
+  master.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(8000);
+  const mIpc = await new MpvIpc(await mpvSocketPath(master)).connect();
+  const fIpc = await new MpvIpc(await mpvSocketPath(follower)).connect();
+  await mIpc.observe('pause'); await fIpc.observe('pause');
+
+  const pos = async () => ({
+    mp: await mIpc.get('time-pos'), fp: await fIpc.get('time-pos'),
+    mpaused: await mIpc.get('pause'), fpaused: await fIpc.get('pause'),
+  });
+  const post = (type) => fetch(`http://127.0.0.1:${ctx.port}/cmd`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type, from: 'harness' }),
+  });
+
+  const prePause = await pos();
+  const seeksBefore = fIpc.events.filter((e) => e.event === 'seek').length;
+  const tPause = Date.now();
+  await post('pause');
+  await sleep(20000); // the room stays paused for 20 s
+  const duringPause = await pos();
+  const tResume = Date.now();
+  await post('play');
+  await sleep(6000); // the first 6 s after the resume: no forward seek allowed
+  const postResume = await pos();
+  const seeksAfterResume = fIpc.events.filter((e) => e.event === 'seek' && e.at >= tResume);
+  const seeksInWindow = seeksAfterResume.filter((e) => e.at < tResume + 6000);
+
+  const res = {
+    prePause, duringPause, postResume,
+    pauseAtSec: +((tPause - tPause) / 1000).toFixed(1),
+    pauseDurationSec: +((tResume - tPause) / 1000).toFixed(1),
+    followerSeeksBefore: seeksBefore,
+    followerSeeksAfterResume: seeksAfterResume.length,
+    followerSeeksInFirst6s: seeksInWindow.length,
+    followerSeeksAfterResumeDetail: seeksAfterResume.map((e) => +((e.at - tResume) / 1000).toFixed(2)),
+    forwardJumpSec: (prePause.fp != null && postResume.fp != null) ? +(postResume.fp - prePause.fp).toFixed(2) : null,
+    positionDuringPauseSec: (prePause.fp != null && duringPause.fp != null) ? +(duringPause.fp - prePause.fp).toFixed(2) : null,
+    masterMovedDuringPauseSec: (prePause.mp != null && duringPause.mp != null) ? +(duringPause.mp - prePause.mp).toFixed(2) : null,
+    roomPauseLines: linesMatching(master, /^> pause/).map((l) => +((l.t - tPause) / 1000).toFixed(1)),
+    roomPlayLines: linesMatching(master, /^> play/).map((l) => +((l.t - tPause) / 1000).toFixed(1)),
+    masterOut: master.out,
+    followerOut: follower.out,
+    serverLog: server.out,
+  };
+  for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
+  proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close();
+  return res;
+}
+
 // ---------------------------------------------------------------- main
 (async () => {
   if (!existsSync(OPT.bin)) { console.error(`missing client binary ${OPT.bin}`); process.exit(2); }
@@ -422,6 +482,10 @@ async function phaseR4(ctx) {
   if (OPT.phase === 'both' || OPT.phase === 'r4') {
     console.error('# R4: server crash + state restore');
     out.r4 = await phaseR4(ctx);
+  }
+  if (OPT.phase === 'both' || OPT.phase === 'pause') {
+    console.error('# pause/resume on a throttled link');
+    out.pause = await phasePause(ctx);
   }
   const slim = JSON.parse(JSON.stringify(out));
   if (slim.f2) { delete slim.f2.followerOut; delete slim.f2.masterOut; }
