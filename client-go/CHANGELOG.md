@@ -27,6 +27,11 @@ WAN livability (P0):
 - server: mid-body stream aborts are logged (`aborted <file> bytes ...`)
   — the first diagnostic for the rare both-streams-ended-early outlier
   seen once in live WAN runs
+- follower: resume no longer jumps forward — the play event re-anchors
+  the master snapshot, so the pause's duration cannot age into expected
+  (spurious 1–3 s catch-up seek right after resuming)
+- follower: paused-for-cache feeds the same stall runway as behind-live,
+  ending the rare 2 s duplicate stall pause right after a resume
 
 ## v1.2.0 — slash commands, split panes
 

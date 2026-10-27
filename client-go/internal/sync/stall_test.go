@@ -49,19 +49,52 @@ func TestStallNoSeekStorm(t *testing.T) {
 	}
 }
 
-// TestBufferingFlagStallsInstantly: mpv's paused-for-cache counts as a
-// stall on the very first tick (no behind-live runway needed).
-func TestBufferingFlagStallsInstantly(t *testing.T) {
+// stepClock measures Since against now, unlike fakeClock's fixed since,
+// so snapshot re-anchoring (R5) is observable in tests.
+type stepClock struct{ now time.Time }
+
+func (c stepClock) Now() time.Time                  { return c.now }
+func (c stepClock) Since(t time.Time) time.Duration { return c.now.Sub(t) }
+
+// TestResumeDoesNotJump (R5): after a pause the snapshot's age spans the
+// pause; without re-anchoring, expected over-ages on resume and the
+// follower jumps forward to chase it. Here 10 s of pause must NOT turn
+// into a seek when the follower sits 0.05 s off the master.
+func TestResumeDoesNotJump(t *testing.T) {
+	e, pl, po := newEngine(false)
+	t0 := time.Unix(3000, 0)
+	e.Clock = stepClock{now: t0}
+	e.OnRoom(masterAt(12, true))                       // paused master snapshot, anchored at t0
+	e.Clock = stepClock{now: t0.Add(10 * time.Second)} // the pause lasts 10 s
+	e.OnRoom(room.Event{Type: "play"})                 // resume: snapshot re-anchored NOW
+	e.Clock = stepClock{now: t0.Add(10*time.Second + 100*time.Millisecond)}
+	e.OnMpvp(mpv.State{Pos: ptr(12.05), Pause: false})
+	if len(pl.seeks) != 0 {
+		t.Fatalf("resume raced into a seek (jump): %v", pl.seeks)
+	}
+	if len(po.events) != 0 {
+		t.Fatalf("unexpected posts on resume: %v", evType(t, po.events))
+	}
+}
+
+// TestBufferingCountsTowardStall: mpv's paused-for-cache feeds the same
+// stall counter as behind-live — full runway before the pause, never an
+// instant duplicate right after a resume (R-out1).
+func TestBufferingCountsTowardStall(t *testing.T) {
 	e, pl, po := newEngine(false)
 	e.OnRoom(masterAt(12, false))
 	e.Clock = pastGrace()
 
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false, Buffering: true})
+	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false, Buffering: true}) // behind 1
+	if n := countType(t, po.events, "pause"); n != 0 {
+		t.Fatalf("paused on the first buffering tick: %v", evType(t, po.events))
+	}
+	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false, Buffering: true}) // behind 2 -> stall
 	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("buffering flag did not stall: %v", evType(t, po.events))
+		t.Fatalf("buffering did not stall after the runway: %v", evType(t, po.events))
 	}
 	if len(pl.seeks) != 0 {
-		t.Fatalf("seek during buffering: %v", pl.seeks)
+		t.Fatalf("seek while buffering: %v", pl.seeks)
 	}
 }
 

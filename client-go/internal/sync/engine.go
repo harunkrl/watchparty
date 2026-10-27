@@ -209,6 +209,9 @@ func (e *Engine) OnRoom(ev room.Event) {
 		e.lastPause = false
 		if e.snap != nil {
 			e.snap.paused = false
+			// re-anchor: the snapshot's age spans the pause; aging it into
+			// expected right after resume causes a spurious forward jump (F5)
+			e.snap.at = e.Clock.Now()
 		}
 	case "seek":
 		e.seekTo(ev.T)
@@ -386,7 +389,18 @@ func (e *Engine) followerTick(s mpv.State) {
 		return
 	}
 	if s.Buffering {
-		e.stallBlock(s)
+		// mpv says the cache is dry. Feed the same stall counter as the
+		// behind-live detector: the play event resets it, so a resume into a
+		// still-dry cache re-pauses only after the full runway (no 2 s
+		// duplicate), and we never seek while the cache is dry (F2).
+		e.behind++
+		if e.behind >= stallTicks {
+			e.stallBlock(s)
+			return
+		}
+		e.setSpeed(1)
+		expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
+		e.emitUi(s, *s.Pos-expected)
 		return
 	}
 	// age must not grow while the master stands still
