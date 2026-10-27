@@ -18,8 +18,9 @@ Built for two people who are tired of Discord/Telegram video quality.
   Followers apply the master's state, micro-adjust speed on small drift and
   re-seek when drift exceeds ~1s.
 - Quality is preserved by never touching the video: mpv decodes the original
-  stream. mpv buffers up to 5 minutes ahead, so upload hiccups don't stall
-  playback.
+  stream. mpv buffers up to 5 minutes ahead, so transient upload dips don't
+  stall playback; a link that cannot sustain the file's bitrate will (see
+  "Watching over a WAN" below).
 
 Tailnet and home LAN only by design: **no auth, no TLS. Do not port-forward this.**
 
@@ -130,6 +131,32 @@ Add a video: `scp file.mp4 root@<host>:/opt/watchparty/videos/` — visible in
 
 Guests get the client from the GitHub releases page (tag a version and CI
 builds the zips, Windows one with mpv bundled).
+
+## Watching over a WAN (long distance)
+
+Zero-transcode means the file's own bitrate must fit the host's upload —
+the guest streams over it, while the host watches over the LAN for free:
+
+| Host upload | Safe video bitrate | Fits |
+|---|---|---|
+| 10 Mbps | ~6–7 Mbps | streaming-grade 1080p encodes |
+| 25 Mbps | ~17–18 Mbps | most 1080p encodes |
+| 40 Mbps | ~27–30 Mbps | 1080p remux; UHD remux (50–80 Mbps) never |
+
+Keep ~1 Mbps of headroom for the voice call running alongside; the sweet
+spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
+
+- Before movie night, check `tailscale status` shows a **direct**
+  connection to the guest. A DERP relay caps throughput at a few Mbps and
+  will not carry a high-bitrate file.
+- If the guest's link cannot sustain the bitrate, the follower falls
+  behind: after one catch-up attempt the client stops seeking, shows the
+  backlog in the drift chip and pauses the room once ("buffering - room
+  paused" on screen) so the cache can refill. Press play when ready.
+- Prefer MKV, or faststart MP4s (`ffmpeg -i in.mp4 -c copy -movflags
+  +faststart out.mp4`): an MP4 with its index (moov) at the end must be
+  fetched from the far end of the file before playback starts, which can
+  time out on a slow link.
 
 ## Known limits
 

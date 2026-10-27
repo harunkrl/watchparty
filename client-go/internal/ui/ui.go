@@ -95,6 +95,7 @@ type Model struct {
 	master     bool
 	api        *room.Client
 	player     *mpv.Player
+	engine     *sync.Engine
 	input      textinput.Model
 	vp         viewport.Model // chat pane
 	sysVp      viewport.Model // system tail: events + engine lines
@@ -120,14 +121,14 @@ type Model struct {
 	height     int
 }
 
-func New(nick string, api *room.Client, player *mpv.Player, master bool) Model {
+func New(nick string, api *room.Client, player *mpv.Player, master bool, engine *sync.Engine) Model {
 	in := textinput.New()
 	in.Placeholder = "type to chat · /pick /list /help"
 	in.Focus()
 	// sane defaults so the first frame renders before WindowSizeMsg arrives
 	// (and in size-less ptys used by the test harness)
 	m := Model{
-		nick: nick, master: master, api: api, player: player,
+		nick: nick, master: master, api: api, player: player, engine: engine,
 		input: in, peers: map[string]bool{}, conn: "connecting",
 		histIdx: -1, width: 80, height: 24,
 		vp: viewport.New(76, 14), sysVp: viewport.New(76, 2),
@@ -167,12 +168,16 @@ func postEvent(api *room.Client, ev room.Event) tea.Cmd {
 	}
 }
 
-// playFile mirrors client.py's play: load locally first, then tell the room.
-func playFile(pl *mpv.Player, api *room.Client, name string) tea.Cmd {
+// playFile mirrors client.py's play: load locally first, then tell the
+// room. The engine is told too (OwnLoad) — our own load never comes back
+// as a room event, and without it a later hello would reload the very
+// file mpv is already playing (F3, master half).
+func playFile(pl *mpv.Player, api *room.Client, engine *sync.Engine, name string) tea.Cmd {
 	return func() tea.Msg {
 		if err := pl.Load(name); err != nil {
 			return errMsg{err}
 		}
+		engine.OwnLoad(name)
 		if err := api.Post(room.Event{Type: "load", Name: name}); err != nil {
 			return errMsg{err}
 		}
@@ -367,7 +372,7 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			name := m.pickItems[m.pickCursor]
 			m.mode = modeInput
 			m = m.logf("> playing %s", name)
-			return m, playFile(m.player, m.api, name)
+			return m, playFile(m.player, m.api, m.engine, name)
 		}
 	case "q":
 		if m.pickCursor < len(m.pickItems) {
@@ -464,7 +469,7 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 			return m.failf("no such file: %s (try /list)", c.Arg)
 		}
 		m = m.logf("> playing %s", c.Arg) // local; own load broadcast is echo-filtered
-		return m, playFile(m.player, m.api, c.Arg)
+		return m, playFile(m.player, m.api, m.engine, c.Arg)
 	case cmd.Queue:
 		if c.Arg == "" { // bare queue: show the room queue
 			if len(m.queue) == 0 {

@@ -50,7 +50,7 @@ func contains(list []string, s string) bool {
 }
 
 func TestBareTextIsChat(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	m.input.SetValue("selam, ne izliyoruz?")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !hasChat(m.log, "ada", "selam, ne izliyoruz?") {
@@ -59,7 +59,7 @@ func TestBareTextIsChat(t *testing.T) {
 }
 
 func TestVerbSentencesStayChat(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	for _, line := range []string{"skip it", "quit now please", "play", "list", "queue"} {
 		m2 := m
 		m2.input.SetValue(line)
@@ -71,7 +71,7 @@ func TestVerbSentencesStayChat(t *testing.T) {
 }
 
 func TestSlashCommands(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	m.files = []string{"a.mkv"}
 	m.input.SetValue("/play a.mkv")
 	mm, c := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -98,7 +98,7 @@ func TestSlashCommands(t *testing.T) {
 }
 
 func TestSlashEscapeAndErrors(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	m.input.SetValue("// /not-a-command")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !hasChat(m.log, "ada", "/ /not-a-command") {
@@ -125,7 +125,7 @@ func TestSlashEscapeAndErrors(t *testing.T) {
 }
 
 func TestChatVerbStillWorks(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	m.input.SetValue("chat eskisi gibi") // bare: now plain chat, same outcome
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !hasChat(m.log, "ada", "chat eskisi gibi") {
@@ -139,7 +139,7 @@ func TestChatVerbStillWorks(t *testing.T) {
 }
 
 func TestPaneSeparation(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: "merhaba"})
 	m = upd(t, m, EngineLogMsg{Line: "> pause"})
 	chat, sys := strings.Join(m.renderChatLines(), "\n"), strings.Join(m.renderSysLines(), "\n")
@@ -155,7 +155,7 @@ func TestPaneSeparation(t *testing.T) {
 }
 
 func TestBareChatTooLong(t *testing.T) {
-	m := New("ada", nil, nil, false)
+	m := New("ada", nil, nil, false, nil)
 	long := strings.Repeat("x", cmd.ChatMaxLen+1)
 	m.input.SetValue(long)
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -193,7 +193,7 @@ func TestRenderEventTable(t *testing.T) {
 }
 
 func TestUpdateDiscreteEvents(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, room.Event{Type: "join", Nick: "a"})
 	m = upd(t, m, room.Event{Type: "join", Nick: "b"})
 	if len(m.peers) != 2 {
@@ -219,12 +219,12 @@ func TestUpdateDiscreteEvents(t *testing.T) {
 
 func TestFooterShowsDriftAndListeners(t *testing.T) {
 	p := 10.0
-	f := New("t", nil, nil, false)
+	f := New("t", nil, nil, false, nil)
 	m := upd(t, f, sync.UiState{Drift: 0.42, Pos: &p})
 	if !strings.Contains(m.footerLine(m.contentWidth()), "drift +0.4s") {
 		t.Fatalf("footer missing drift: %q", m.footerLine(m.contentWidth()))
 	}
-	mm := New("t", nil, nil, true)
+	mm := New("t", nil, nil, true, nil)
 	mm = upd(t, mm, room.Event{Type: "join", Nick: "a"})
 	if !strings.Contains(mm.footerLine(mm.contentWidth()), "1 listening") {
 		t.Fatalf("master footer wrong: %q", mm.footerLine(mm.contentWidth()))
@@ -236,7 +236,7 @@ func TestFooterShowsDriftAndListeners(t *testing.T) {
 }
 
 func TestReconnectingAndLostStates(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, ReconnectingMsg{Note: "> [conn] lost (x), retrying in 3s", Try: 2, Delay: 3})
 	if m.conn != "reconnecting" || m.retry != 2 || m.retryDelay != 3 ||
 		!contains(logTexts(m.log), "> [conn] lost (x), retrying in 3s") {
@@ -260,7 +260,7 @@ func TestReconnectingAndLostStates(t *testing.T) {
 }
 
 func TestInputHistory(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.input.SetValue("chat hi")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // submits -> history grows
 	if len(m.hist) != 1 || m.hist[0] != "chat hi" {
@@ -278,7 +278,7 @@ func TestInputHistory(t *testing.T) {
 }
 
 func TestScrollPgUpPgDown(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	for i := 0; i < 30; i++ { // chat history is the scrollable reading surface
 		m = upd(t, m, room.Event{Type: "chat", Nick: "t", Text: fmt.Sprintf("line-%02d", i)})
 	}
@@ -299,7 +299,7 @@ func TestScrollPgUpPgDown(t *testing.T) {
 }
 
 func TestFooterQueuePreview(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv", "b.mkv", "c.mkv"}})
 	f := m.footerLine(m.contentWidth())
 	for _, want := range []string{"1. a.mkv", "2. b.mkv", "(+1)"} {
@@ -314,7 +314,7 @@ func TestFooterQueuePreview(t *testing.T) {
 }
 
 func TestBareQueueLists(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.input.SetValue("/queue")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // empty queue -> hint
 	if !strings.Contains(m.View(), "queue empty") {
@@ -330,7 +330,7 @@ func TestBareQueueLists(t *testing.T) {
 }
 
 func TestQueueGuards(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.files = []string{"a.mkv", "b.mkv"} // cached list, like after `list`
 	m = upd(t, m, room.Event{Type: "hello", Now: "a.mkv", Queue: []string{"b.mkv"}})
 	for _, tc := range []struct{ in, want string }{
@@ -349,7 +349,7 @@ func TestQueueGuards(t *testing.T) {
 }
 
 func TestPickerQEnqueues(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.mode = modePick
 	m = upd(t, m, filesMsg{files: []string{"a.mkv", "b.mkv"}})
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyDown}) // cursor on b.mkv
@@ -363,7 +363,7 @@ func TestPickerQEnqueues(t *testing.T) {
 }
 
 func TestPickerQGuards(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.mode = modePick
 	m = upd(t, m, filesMsg{files: []string{"a.mkv"}})
 	m = upd(t, m, room.Event{Type: "hello", Now: "a.mkv"})
@@ -379,7 +379,7 @@ func TestPickerQGuards(t *testing.T) {
 
 func TestHeaderClockShowsPosition(t *testing.T) {
 	p := 65.0
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.now = "movie.mkv"
 	m = upd(t, m, sync.UiState{Pos: &p, Paused: true})
 	_, l2 := m.headerLines(m.contentWidth())
@@ -405,7 +405,7 @@ func TestHeaderClockShowsPosition(t *testing.T) {
 }
 
 func TestEngineRunCollapse(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	for i := 0; i < 3; i++ {
 		m = m.logEngine("> play")
 	}
@@ -428,7 +428,7 @@ func TestEngineRunCollapse(t *testing.T) {
 }
 
 func TestNudgeFilter(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	before := len(m.log)
 	m = m.logEngine("[1.050]")
 	m = m.logEngine("[0.970]")
@@ -462,7 +462,7 @@ func TestWrapIndented(t *testing.T) {
 }
 
 func TestPickerFlow(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.mode = modePick
 	m = upd(t, m, filesMsg{files: []string{"a.mkv", "b.mkv", "c.mkv"}})
 	if len(m.pickItems) != 3 || m.pickCursor != 0 {
@@ -489,7 +489,7 @@ func TestPickerFlow(t *testing.T) {
 }
 
 func TestCtrlPOpensPicker(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlP})
 	if m.mode != modePick {
 		t.Fatal("ctrl+p did not open the picker")
@@ -501,7 +501,7 @@ func TestCtrlPOpensPicker(t *testing.T) {
 }
 
 func TestListOpensPicker(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m.input.SetValue("/list")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.mode != modePick {
@@ -510,7 +510,7 @@ func TestListOpensPicker(t *testing.T) {
 }
 
 func TestOwnLoadUpdatesNow(t *testing.T) {
-	m := New("t", nil, nil, false)
+	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, loadedMsg{name: "movie.mkv"})
 	if m.now != "movie.mkv" {
 		t.Fatalf("own load did not set now: %q", m.now)

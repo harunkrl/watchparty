@@ -61,6 +61,7 @@ func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine,
 				fmt.Fprintln(out, "> err:", err)
 				continue
 			}
+			engine.OwnLoad(c.Arg) // our own load never echoes back; the engine must know (F3)
 			report(out, api.Post(room.Event{Type: "load", Name: c.Arg}))
 		case cmd.Queue:
 			report(out, api.Post(room.Event{Type: "enqueue", Name: c.Arg}))

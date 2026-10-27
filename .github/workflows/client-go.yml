@@ -2,7 +2,7 @@ name: client-go
 
 on:
   push:
-    paths: [client-go/**, .github/workflows/client-go.yml]
+    paths: [client-go/**, server.js, tests/**, .github/workflows/client-go.yml]
   pull_request:
 
 permissions:
@@ -37,7 +37,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
-      - run: go vet ./... && go test ./...
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
       - run: >-
           go build -trimpath -ldflags="-s -w"
           -o watchparty${{ matrix.ext }} .
@@ -49,3 +51,24 @@ jobs:
         with:
           name: watchparty-${{ matrix.goos }}-${{ matrix.goarch }}
           path: client-go/watchparty${{ matrix.ext }}
+
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node tests/smoke.mjs
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
+      - run: go build -o watchparty .
+        working-directory: client-go
+      - run: |
+          node tests/integration.mjs
+          node tests/pause_sync.mjs
+          node tests/master_restart.mjs
+          node tests/soak.mjs

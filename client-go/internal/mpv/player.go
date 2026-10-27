@@ -35,10 +35,11 @@ const (
 
 // State is one poll sample of the player, consumed by the sync engine.
 type State struct {
-	Pos    *float64 // nil: no time-pos (nothing loaded or idle)
-	Pause  bool
-	Idle   bool
-	Exited bool // mpv window was closed; client should shut down
+	Pos       *float64 // nil: no time-pos (nothing loaded or idle)
+	Pause     bool
+	Idle      bool
+	Buffering bool // cache underrun: mpv stalled playback to refill (paused-for-cache)
+	Exited    bool // mpv window was closed; client should shut down
 }
 
 // Event is one pushed mpv notification (Name is the mpv event id, e.g.
@@ -328,6 +329,9 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		}
 		if v, err := p.Get("idle-active"); err == nil && v != nil {
 			st.Idle, _ = v.(bool)
+		}
+		if v, err := p.Get("paused-for-cache"); err == nil && v != nil {
+			st.Buffering, _ = v.(bool)
 		}
 		if v, err := p.Get("time-pos"); err == nil && v != nil {
 			if f, ok := v.(float64); ok {

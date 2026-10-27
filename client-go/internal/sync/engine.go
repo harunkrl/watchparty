@@ -38,6 +38,15 @@ const (
 	seekSettle    = 150 * time.Millisecond // let time-pos reach the seek target
 )
 
+// Stall detection (R1): a follower persistently behind the live position
+// is starving — typically a WAN link below the file's bitrate. A healthy
+// player converges one tick after a catch-up seek; one that lands behind
+// again on the very next tick is not playing at all. Two consecutive
+// behind-live ticks trigger; mpv's paused-for-cache flag counts instantly
+// but rarely fires while the seek loop keeps churning the cache (live
+// measurement: .pi-state/wan-baseline.md).
+const stallTicks = 2 // consecutive behind-live polls before a stall
+
 // Clock is the engine's time source; fake it in tests.
 type Clock interface {
 	Now() time.Time
@@ -79,6 +88,10 @@ type Engine struct {
 	lastPause bool
 	wasActive bool
 	snap      *snapshot // follower: latest master position heartbeat
+
+	loaded     string // file our mpv is playing ("" = none; set on successful load)
+	behind     int    // follower: consecutive polls behind live (starvation signal)
+	autoPaused bool   // follower: WE paused the room over a stall
 
 	lastActuate  time.Time // last programmatic SetPause/Seek (echo gate)
 	actuatePause *bool     // pause state that actuation set (nil = seek); an
@@ -159,7 +172,9 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// — bounded, self-consistent (the master is the authority), and far
 		// better than starting empty while the room still carries state.
 		// End-to-end: tests/master_restart.mjs.
-		if ev.Now != "" {
+		// only (re)load when the file actually differs from what our mpv is
+		// already playing: an SSE blip must not restart a mid-film download (F3)
+		if ev.Now != "" && ev.Now != e.loaded {
 			e.load(ev.Now)
 		}
 		// Server may carry an age-adjusted media position + paused flag
@@ -168,13 +183,19 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// before the first heartbeat would even arrive.
 		if ev.Pos != nil {
 			e.snap = &snapshot{t: *ev.Pos, paused: ev.P, at: e.Clock.Now()}
-			e.seekTo(*ev.Pos)
+			// skip the seek when already there: on an SSE blip this is a
+			// sub-second rewind that would flash the same frame (F3)
+			if t, ok := e.Player.Pos(); !ok || abs(t-*ev.Pos) > Tolerance {
+				e.seekTo(*ev.Pos)
+			}
 			if ev.P {
 				e.setPause(true)
 			}
 		}
 	case "load":
-		e.load(ev.Name)
+		if ev.Name != e.loaded {
+			e.load(ev.Name)
+		}
 	case "pause":
 		e.setPause(true)
 		e.lastPause = true // master dedup stays consistent with reality
@@ -182,6 +203,8 @@ func (e *Engine) OnRoom(ev room.Event) {
 			e.snap.paused = true // discrete events are room truth; don't wait for the next heartbeat
 		}
 	case "play":
+		e.autoPaused = false // the room resumed: our stall-pause (if any) is spent
+		e.behind = 0         // fresh stall window: resume-into-dry-cache must not re-pause instantly
 		e.setPause(false)
 		e.lastPause = false
 		if e.snap != nil {
@@ -196,11 +219,24 @@ func (e *Engine) OnRoom(ev room.Event) {
 }
 
 func (e *Engine) load(name string) {
-	e.setSpeed(1)                // new file: clear any tempo nudge from the previous one
+	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
+	e.behind, e.autoPaused = 0, false
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
 	if err := e.Player.Load(name); err != nil {
 		e.logf("mpv: %s", err)
+		return
 	}
+	e.loaded = name // claim it only once mpv actually took the file
+}
+
+// OwnLoad records a file the local user started outside the room-event
+// path (TUI/headless /play drive mpv directly): without it, a later hello
+// would reload the very file mpv is already playing (F3, master half).
+func (e *Engine) OwnLoad(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.loaded = name
+	e.behind, e.autoPaused = 0, false
 }
 
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
@@ -349,19 +385,57 @@ func (e *Engine) followerTick(s mpv.State) {
 		// both paused: hold position
 		return
 	}
+	if s.Buffering {
+		e.stallBlock(s)
+		return
+	}
 	// age must not grow while the master stands still
 	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
 	drift := *s.Pos - expected
 	e.emitUi(s, drift)
 	switch {
+	case drift < -Tolerance:
+		// behind live. A healthy player converges one tick after the seek
+		// below; one that lands behind again is starving (WAN link below the
+		// file's bitrate) — chasing it with seeks would flush the filling
+		// cache every 2s (seek-storm, F2), so stall after stallTicks.
+		e.behind++
+		if e.behind >= stallTicks {
+			e.stallBlock(s)
+			return
+		}
+		e.seekTo(expected) // probe seek: one chance to converge before stalling
 	case abs(drift) > Tolerance:
-		e.seekTo(expected) // hard seek; drift resets, next tick restores speed 1
+		e.behind = 0
+		e.seekTo(expected) // ahead of live: clock jump or a lagging master
 	case abs(drift) > speedBand:
+		e.behind = 0
 		// smooth converge: a small tempo nudge instead of a visible seek
 		e.setSpeed(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
 	default:
+		e.behind = 0
 		e.setSpeed(1) // inside the dead zone: plain 1x
 	}
+}
+
+// stallBlock: the follower is starving while the room plays — typically a
+// WAN link below the file's bitrate. Never hard-seek: the seek would
+// flush the cache that is filling, re-stall and repeat every tick
+// (seek-storm, F2). The true backlog shows as drift; the room is paused
+// once so the cache can refill. No auto-resume: a wire pause carries no
+// owner, auto-resuming could fight a deliberate pause — humans press play.
+func (e *Engine) stallBlock(s mpv.State) {
+	e.setSpeed(1)
+	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
+	e.emitUi(s, *s.Pos-expected)
+	if e.autoPaused {
+		return // we already paused the room for this stall episode
+	}
+	e.autoPaused = true
+	e.snap.paused = true // mirror our post: heartbeats carry the pre-post state briefly
+	e.lastPost = e.Clock.Now()
+	e.postDiscrete(room.Event{Type: "pause"})
+	_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
 }
 
 func (e *Engine) emitUi(s mpv.State, drift float64) {

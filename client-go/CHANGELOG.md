@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+WAN livability (P0):
+
+- follower: starvation-aware sync (F2 fix, live-measured) — a follower
+  that stays behind the live position across two heartbeats (2 s apart)
+  is starving: after one catch-up seek it stops seeking (a seek would
+  flush the filling cache and re-stall every tick — the old seek-storm),
+  the backlog shows in the drift chip, and the room is paused once so the
+  cache can refill ("buffering - room paused" OSD; press play when ready —
+  no auto-resume, a deliberate pause must never be fought). mpv's
+  paused-for-cache counts as an instant stall signal
+- client: an SSE blip no longer reloads the file on either side — hello only
+  (re)loads when the room's file differs from what mpv already plays, and
+  the hello seek is skipped when already within 1 s of the live position
+  (mid-film download restarts and sub-second rewind flashes are gone)
+- README: new "Watching over a WAN" section — uplink budget table,
+  direct-vs-DERP check, faststart/MKV note
+- CI: node test job (smoke + real-mpv integration/pause_sync/soak),
+  `go test -race`, gofmt check; push paths now cover server.js and tests/
+
 ## v1.2.0 — slash commands, split panes
 
 - commands now require the slash prefix (`/play`, `/queue`, `/pick`,
