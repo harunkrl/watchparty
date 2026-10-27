@@ -299,8 +299,11 @@ func (e *Engine) OnMpvEvent(name string) {
 		}
 	}
 	if !e.lastActuate.IsZero() && e.Clock.Since(e.lastActuate) < actuateQuiet {
-		if name == "seek" || (e.actuatePause != nil && *e.actuatePause == (name == "pause")) {
-			return // our own SetPause/Seek echoing back as mpv events
+		// seeks are echo-gated one-shot by seekEcho above; a time window
+		// here would also eat a user scrub landing soon after a remote apply
+		// (the residual soak flake). Only pause echoes are direction-matched.
+		if e.actuatePause != nil && *e.actuatePause == (name == "pause") {
+			return // our own SetPause echoing back as an mpv event
 		}
 		// opposite-direction event inside the window: the user acted — post it
 	}
