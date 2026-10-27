@@ -17,6 +17,7 @@ const VIDEO_RE = /\.(mkv|mp4|webm|avi|mov|m4v|ts|flv|wmv|mpg|mpeg)$/i;
 fs.mkdirSync(VIDEOS, { recursive: true });
 
 const listeners = new Map(); // sse response -> client id
+const nickById = new Map(); // client id -> nick (notices name people, not ids)
 // pos/paused/posAt: last master heartbeat, so late joiners can seek
 // straight to the live room position instead of converging over seconds.
 // posAt is hrtime-based (monotonic): an NTP wall-clock jump between
@@ -33,18 +34,42 @@ const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort()
 // monotonic and resets between boots, so the age travels as wall-clock ms.
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
 let persistOK = true;
-function saveState() {
-  if (!persistOK) return;
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({
-      now: state.now, queue: state.queue, pos: state.pos, paused: state.paused,
-      wall: Date.now(),
-    }));
-  } catch (e) { // read-only dir etc: persistence off, the room still works
-    persistOK = false;
-    console.error(`watchparty: state persistence disabled (${e.message})`);
-  }
+let stateDirty = false;
+let stateTimer = null;
+function stateSnapshot() {
+  return JSON.stringify({
+    now: state.now, queue: state.queue, pos: state.pos, paused: state.paused,
+    wall: Date.now(),
+  });
 }
+function persistFail(e) {
+  persistOK = false;
+  console.error(`watchparty: state persistence disabled (${e.message})`);
+}
+function saveState() {
+  // debounced write-behind: heartbeats fire ~0.5/s and a synchronous
+  // write per event leaked event-loop latency that destabilized the
+  // clients' seek-echo gates (soak bisect, .pi-state/test-ci-audit-raw.md)
+  if (!persistOK) return;
+  stateDirty = true;
+  if (!stateTimer) stateTimer = setTimeout(flushState, 2000);
+}
+function flushState() {
+  stateTimer = null;
+  if (!stateDirty || !persistOK) return;
+  stateDirty = false;
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFile(tmp, stateSnapshot(), (e) => {
+    if (e) return persistFail(e);
+    fs.rename(tmp, STATE_FILE, (e) => { if (e) persistFail(e); }); // atomic: no torn state.json
+  });
+}
+process.on('SIGTERM', () => {
+  if (persistOK && stateDirty) {
+    try { fs.writeFileSync(STATE_FILE, stateSnapshot()); } catch { /* best effort */ }
+  }
+  process.exit(0);
+});
 (function restoreState() {
   let saved;
   try {
@@ -77,6 +102,44 @@ function clean(s, max) {
   return String(s).replace(/[\x00-\x1f\x7f]/g, '').slice(0, max);
 }
 
+// R7: exactly one clock. The first client to post a position heartbeat
+// owns the room clock (a master announces itself exactly that way); a
+// second master's heartbeats are dropped with a one-time room notice.
+// Only position/ended are master-exclusive — pause/seek/load/skip stay
+// dual-control. The claim dies with the owner's SSE connection, so a
+// restarted or failed master is succeeded cleanly.
+let clockOwner = null; // client id of the current master
+const impostorSeen = new Set();
+function isClockOwner(from) {
+  if (from === clockOwner) return true;
+  if (clockOwner === null) {
+    clockOwner = from; // first heartbeat wins: followers never post positions
+    impostorSeen.delete(from);
+    return true;
+  }
+  if (!impostorSeen.has(from)) {
+    impostorSeen.add(from);
+    broadcast({
+      type: 'notice',
+      from, // the impostor's id: named clients demote themselves to follower
+      text: `two masters: ${nickById.get(clockOwner) || clockOwner} owns the clock; ignoring ${nickById.get(from) || from}`,
+    });
+  }
+  return false;
+}
+
+// advanceQueue is the shared body of ended/skip: promote the next queued
+// file for everyone.
+function advanceQueue() {
+  if (state.queue.length && state.now) {
+    state.now = state.queue.shift();
+    state.pos = null; // positions belong to the previous file
+    broadcast({ type: 'load', name: state.now, from: null });
+    broadcast({ type: 'queue', queue: state.queue });
+    saveState();
+  }
+}
+
 function handleCmd(cmd) {
   if (cmd.type === 'chat') {
     cmd.nick = clean(cmd.nick || '', 32);
@@ -94,6 +157,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'position':
+      if (!isClockOwner(cmd.from)) break;
       state.pos = cmd.t;
       state.paused = !!cmd.p;
       state.posAt = mono();
@@ -115,15 +179,11 @@ function handleCmd(cmd) {
         saveState();
       }
       break;
-    case 'ended': // master hit EOF: auto-advance the queue for everyone
-    case 'skip': // same, on demand
-      if (state.queue.length && state.now) {
-        state.now = state.queue.shift();
-        state.pos = null; // positions belong to the previous file
-        broadcast({ type: 'load', name: state.now, from: null });
-        broadcast({ type: 'queue', queue: state.queue });
-        saveState();
-      }
+    case 'ended': // master hit EOF; a follower cannot end the file
+      if (isClockOwner(cmd.from)) advanceQueue();
+      break;
+    case 'skip': // same advance, on demand — anyone (dual control)
+      advanceQueue();
       break;
   }
 }
@@ -194,6 +254,7 @@ const server = http.createServer((req, res) => {
     const id = u.searchParams.get('id') || '';
     const nick = clean(u.searchParams.get('nick') || id, 32);
     listeners.set(res, id);
+    nickById.set(id, nick);
     const hello = { type: 'hello', now: state.now, queue: state.queue };
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
@@ -206,6 +267,9 @@ const server = http.createServer((req, res) => {
     req.on('close', () => {
       clearInterval(ping);
       listeners.delete(res);
+      if (id === clockOwner) clockOwner = null; // succeeded by the next heartbeat poster
+      impostorSeen.delete(id);
+      nickById.delete(id);
       broadcast({ type: 'bye', nick }, id);
     });
     return;

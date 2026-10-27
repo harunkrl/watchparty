@@ -32,7 +32,18 @@ WAN livability (P0):
   (spurious 1–3 s catch-up seek right after resuming)
 - follower: paused-for-cache feeds the same stall runway as behind-live,
   ending the rare 2 s duplicate stall pause right after a resume
-
+- server: single-master election — the first client to post a heartbeat
+  owns the clock; a second --master's heartbeats (and EOF auto-advance)
+  are dropped with a one-time room notice rendered in the TUI and on the
+  video OSD. The claim dies with the master's connection, so restarts and
+  failures succeed cleanly — the two-master seek duel is gone
+- client: a notice naming our id demotes a running second --master to a
+  follower (log + OSD); notices pass the client's own-echo filter so the
+  named client actually receives them
+- client: mpv's head-of-file seek event after a load is never posted to
+  the room (5 s post-load quiet window) — closes the late-join rewind
+  race and a demoted impostor's spurious rewind; real scrubs inside the
+  window self-heal via the master heartbeat
 ## v1.2.0 — slash commands, split panes
 
 - commands now require the slash prefix (`/play`, `/queue`, `/pick`,

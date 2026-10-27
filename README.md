@@ -167,6 +167,9 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
 
 - One flat folder; filenames must be identical everywhere (they are, there is one source).
 - One master; if the master's player dies, restart the client and `play` again.
+  A second `--master` cannot duel for the clock: the server keeps the first
+  heartbeat sender, drops the other's heartbeats and warns the room; the
+  claim dies with the master's connection, so restarts succeed cleanly.
 - Chat is fire-and-forget; there is no history.
 - Windows client (named-pipe IPC) is untested; treat it as best-effort.
 - Browsers are unsupported by design: generic Content-Type, no CORS — use mpv.

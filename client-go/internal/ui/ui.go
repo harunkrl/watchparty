@@ -547,6 +547,8 @@ func RenderEvent(ev room.Event) string {
 		return fmt.Sprintf("> load %s", ev.Name)
 	case "play", "pause":
 		return "> " + ev.Type
+	case "notice":
+		return "> " + ev.Text
 	case "seek":
 		return fmt.Sprintf("> seek @%.1fs", ev.T)
 	}

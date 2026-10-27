@@ -218,6 +218,43 @@ try {
   assert.equal(er.events[0].pos, undefined);
   er.close();
 
+  // R7 single-master election: bob owns the clock (his heartbeats above);
+  // a second position poster is dropped with exactly one notice, and the
+  // claim dies with the owner's SSE connection.
+  await post({ type: 'position', from: 'bob', t: 50, p: false });
+  await waitUntil(() => a.events.some((e) => e.type === 'position' && e.t === 50));
+
+  const noticesBefore = a.events.filter((e) => e.type === 'notice').length;
+  const posBefore = a.events.filter((e) => e.type === 'position').length;
+  await post({ type: 'position', from: 'impostor', t: 99, p: false });
+  await waitUntil(() => a.events.some((e) => e.type === 'notice' && e.text.includes('ignoring impostor')));
+  assert.equal(a.events.filter((e) => e.type === 'notice').length, noticesBefore + 1, 'notice not one-time');
+  assert.equal(a.events.filter((e) => e.type === 'position').length, posBefore, 'impostor heartbeat relayed');
+  await post({ type: 'position', from: 'impostor', t: 99, p: false }); // repeat: still one notice, no relay
+  await sleep(300);
+  assert.equal(a.events.filter((e) => e.type === 'notice').length, noticesBefore + 1);
+  assert.equal(a.events.filter((e) => e.type === 'position').length, posBefore);
+
+  // the claim dies with the owner's connection: the next poster takes over
+  b.close();
+  await waitUntil(() => a.events.some((e) => e.type === 'bye' && e.nick === 'Bob'));
+  await post({ type: 'position', from: 'impostor', t: 60, p: false });
+  await waitUntil(() => a.events.filter((e) => e.type === 'position').length > posBefore, 3000, 'successor relay');
+
+  // ended is master-exclusive; skip stays dual-control
+  await post({ type: 'enqueue', from: 'carl', name: 'movie two.mkv' });
+  await waitUntil(() => a.events.some((e) => e.type === 'queue' && e.queue.includes('movie two.mkv')));
+  const loadsBefore = a.events.filter((e) => e.type === 'load').length;
+  await post({ type: 'ended', from: 'carl' }); // non-owner: dropped
+  await sleep(400);
+  assert.equal(a.events.filter((e) => e.type === 'load').length, loadsBefore, 'non-owner ended advanced the queue');
+  await post({ type: 'ended', from: 'impostor' }); // owner: advances
+  await waitUntil(() => a.events.filter((e) => e.type === 'load').length > loadsBefore);
+  await post({ type: 'enqueue', from: 'carl', name: 'movie one.mkv' });
+  await waitUntil(() => a.events.some((e) => e.type === 'queue' && e.queue.includes('movie one.mkv')));
+  await post({ type: 'skip', from: 'carl' }); // anyone may skip
+  await waitUntil(() => a.events.some((e) => e.type === 'load' && e.name === 'movie one.mkv'));
+
   b.close();
   await waitUntil(() => a.events.some((e) => e.type === 'bye' && e.nick === 'Bob'));
   a.close();

@@ -53,9 +53,10 @@ type Player struct {
 	proc   *exec.Cmd
 	conn   net.Conn
 	dir    string        // temp dir holding the socket (removed on Close)
+	drops  int           // logged event drops (bounded; a silent drop hid user seeks for a day)
 	exited chan struct{} // closed when the mpv process is reaped
 	events chan Event
-	mu     sync.Mutex // guards pend, seq and writes
+	mu     sync.Mutex // guards pend, seq, drops and writes
 	pend   map[int]chan ipcMsg
 	seq    int
 }
@@ -93,7 +94,7 @@ func Start(base string, extra []string) (*Player, error) {
 	exited := make(chan struct{})
 	p := &Player{
 		base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited,
-		events: make(chan Event, 32),
+		events: make(chan Event, 64),
 		pend:   map[int]chan ipcMsg{},
 	}
 	go func() {
@@ -163,7 +164,17 @@ func (p *Player) readLoop() {
 		if m.Event != "" {
 			select {
 			case p.events <- Event{Name: eventName(m)}:
-			default: // slow consumer: drop rather than block playback control
+			default:
+				// a full buffer means the engine is stalled (e.g. a slow seek
+				// settle under load); dropping keeps playback control alive —
+				// but never silently again: silent drops hid user seeks for a
+				// whole day of soak flake
+				p.mu.Lock()
+				if p.drops < 3 {
+					p.drops++
+					fmt.Fprintln(os.Stderr, "mpv: event dropped (engine stalled?)")
+				}
+				p.mu.Unlock()
 			}
 		}
 	}
@@ -221,6 +232,9 @@ func (p *Player) writeLocked(v any) error {
 	if err != nil {
 		return err
 	}
+	// a hung write (busy mpv, full socket buffer) must not stall the
+	// engine's mutex: bound every IPC write
+	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = p.conn.Write(append(b, '\n'))
 	return err
 }

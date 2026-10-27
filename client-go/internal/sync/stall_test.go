@@ -202,3 +202,74 @@ func TestStallPauseResetsOnPlay(t *testing.T) {
 		t.Fatalf("expected exactly the two probe seeks: %v", pl.seeks)
 	}
 }
+
+// TestNoticeDemotesImpostor (R7b): a notice naming OUR id demotes a
+// second --master to follower; a notice naming someone else must not.
+func TestNoticeDemotesImpostor(t *testing.T) {
+	e, _, _ := newEngine(true)
+	e.ID = "bo-1234"
+
+	e.OnRoom(room.Event{Type: "notice", From: "bo-1234", Text: "two masters: ada owns the clock; ignoring bo"})
+	if e.Master {
+		t.Fatal("impostor was not demoted by its own notice")
+	}
+
+	e2, _, _ := newEngine(true)
+	e2.ID = "bo-1234"
+	e2.OnRoom(room.Event{Type: "notice", From: "someone-else", Text: "two masters: ada owns the clock; ignoring someone"})
+	if !e2.Master {
+		t.Fatal("demoted by a notice naming another client")
+	}
+}
+
+// TestLoadQuietSuppressesSeekPost: mpv fires a seek event at the head of a
+// freshly loaded file; posting it would rewind the room. Within loadQuiet
+// the post is suppressed — a real scrub after the window still posts.
+func TestLoadQuietSuppressesSeekPost(t *testing.T) {
+	e, pl, po := newEngine(true)
+	e.ID = "m-1"
+	e.OwnLoad("x.mkv")
+	pl.pos = ptr(1.4)
+	e.OnMpvEvent("seek") // load echo: suppressed
+	if len(po.events) != 0 {
+		t.Fatalf("post-load head seek reached the room: %v", evType(t, po.events))
+	}
+	e.Clock = fakeClock{since: 6 * time.Second}
+	e.OnMpvEvent("seek") // genuine scrub past the window: posted
+	if n := countType(t, po.events, "seek"); n != 1 {
+		t.Fatalf("scrub after the window must post: %v", evType(t, po.events))
+	}
+}
+
+// TestSeekEchoConsumedOnce: a programmatic seek owns exactly ONE mpv echo
+// event; a user scrub right after it — even to a stale time-pos — must
+// still post (soak regression: target matching read stale positions).
+func TestSeekEchoConsumedOnce(t *testing.T) {
+	e, pl, po := newEngine(false)
+	t0 := time.Unix(3000, 0)
+	e.Clock = stepClock{now: t0} // real elapsed time: expiry must see a FRESH seek
+	e.OnRoom(masterAt(12, false))
+
+	e.OnRoom(room.Event{Type: "seek", T: 40}) // remote seek applied: echo pending
+	pl.pos = ptr(40)
+	e.OnMpvEvent("seek") // the echo itself: swallowed, never posted
+	if len(po.events) != 0 {
+		t.Fatalf("echo reached the room: %v", evType(t, po.events))
+	}
+
+	pl.pos = ptr(20)                                  // user scrub
+	e.Clock = stepClock{now: t0.Add(4 * time.Second)} // soak timing: past actuateQuiet, inside the echo window
+	e.OnMpvEvent("seek")
+	if n := countType(t, po.events, "seek"); n != 1 {
+		t.Fatalf("user scrub eaten by the echo gate: %v", evType(t, po.events))
+	}
+
+	// expiry: a pending echo that never arrives must not eat a later scrub
+	e.OnRoom(room.Event{Type: "seek", T: 40})
+	e.Clock = stepClock{now: t0.Add(10 * time.Second)} // 6s past the fresh pending echo
+	pl.pos = ptr(25)
+	e.OnMpvEvent("seek")
+	if n := countType(t, po.events, "seek"); n != 2 {
+		t.Fatalf("expired pending echo ate a scrub: %v", evType(t, po.events))
+	}
+}

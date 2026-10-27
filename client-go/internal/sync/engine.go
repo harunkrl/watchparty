@@ -36,6 +36,7 @@ const (
 	// master heartbeats land within one POLL_SECS tick; +1s network slack
 	followerGrace = time.Duration(PollSecs+1.0) * time.Second
 	seekSettle    = 150 * time.Millisecond // let time-pos reach the seek target
+	loadQuiet     = 5 * time.Second        // no seek posts right after a load: mpv's head-of-file event is machinery, not a scrub
 )
 
 // Stall detection (R1): a follower persistently behind the live position
@@ -78,6 +79,7 @@ type UiState struct {
 
 type Engine struct {
 	Master bool
+	ID     string // our client id: a notice naming it demotes a second master
 	Player Player
 	Post   func(room.Event) error
 	Clock  Clock
@@ -89,9 +91,10 @@ type Engine struct {
 	wasActive bool
 	snap      *snapshot // follower: latest master position heartbeat
 
-	loaded     string // file our mpv is playing ("" = none; set on successful load)
-	behind     int    // follower: consecutive polls behind live (starvation signal)
-	autoPaused bool   // follower: WE paused the room over a stall
+	loaded     string    // file our mpv is playing ("" = none; set on successful load)
+	loadedAt   time.Time // when mpv took the file: post-load seek posts are noise
+	behind     int       // follower: consecutive polls behind live (starvation signal)
+	autoPaused bool      // follower: WE paused the room over a stall
 
 	lastActuate  time.Time // last programmatic SetPause/Seek (echo gate)
 	actuatePause *bool     // pause state that actuation set (nil = seek); an
@@ -102,8 +105,8 @@ type Engine struct {
 	speedSet  bool    // a Speed value has been sent (0.0 is a valid speed)
 	lastSpeed float64 // current tempo nudge; cache avoids IPC spam per tick
 
-	lastSeekT  float64   // target of the last programmatic seek (echo match)
-	lastSeekAt time.Time // when issued; slow echoes (file load) arrive late
+	seekEcho   bool      // one mpv seek event per programmatic seek is ours (echo)
+	lastSeekAt time.Time // when the programmatic seek was issued (echo expiry)
 
 	mu sync.Mutex // guards engine state: poll + mpv-event + SSE goroutines
 }
@@ -141,8 +144,8 @@ func (e *Engine) setPause(paused bool) {
 func (e *Engine) seekTo(t float64) {
 	e.lastActuate = e.Clock.Now()
 	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
-	e.lastSeekT = t
 	e.lastSeekAt = e.lastActuate
+	e.seekEcho = true // swallow exactly one echo (see OnMpvEvent)
 	_ = e.Player.Seek(t)
 }
 
@@ -218,6 +221,16 @@ func (e *Engine) OnRoom(ev room.Event) {
 	case "chat":
 		// chat OSD over the video (client.py parity: 3s show-text)
 		_ = e.Player.ShowText(fmt.Sprintf("%s: %s", ev.Nick, ev.Text), 3000)
+	case "notice":
+		// room-level warning (server election, R7). If it names US, a second
+		// --master is running: demote to follower instead of dueling — the
+		// owner's heartbeats are already arriving, sync resumes within a tick.
+		if ev.From != "" && ev.From == e.ID && e.Master {
+			e.Master = false
+			e.logf("> demoted to follower: another master owns the clock")
+		}
+		// OSD so both users see it even with the TUI window hidden
+		_ = e.Player.ShowText(ev.Text, 4000)
 	}
 }
 
@@ -230,6 +243,7 @@ func (e *Engine) load(name string) {
 		return
 	}
 	e.loaded = name // claim it only once mpv actually took the file
+	e.loadedAt = e.Clock.Now()
 }
 
 // OwnLoad records a file the local user started outside the room-event
@@ -239,6 +253,7 @@ func (e *Engine) OwnLoad(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.loaded = name
+	e.loadedAt = e.Clock.Now()
 	e.behind, e.autoPaused = 0, false
 }
 
@@ -261,22 +276,25 @@ func (e *Engine) OnMpvp(s mpv.State) {
 // and its heartbeat re-asserts a consistent room state. Events that merely
 // echo the engine's own programmatic actuation are gated so applying
 // remote state never re-posts it (loop prevention). The seek settle sleep
-// happens outside the lock so the engine keeps serving during it.
+// sits on the POST path only: echoes return above it, so a stalled
+// consumer can no longer back the event queue up and drop user seeks
+// (soak flake, 2026-10-27).
 func (e *Engine) OnMpvEvent(name string) {
 	if e.Player == nil {
 		return
 	}
-	if name == "seek" {
-		time.Sleep(seekSettle)
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if name == "seek" && !e.lastSeekAt.IsZero() && e.Clock.Since(e.lastSeekAt) < 5*time.Second {
-		// match by target: during file loads mpv can deliver the seek echo
-		// seconds later, past the actuateQuiet window; a user scrubbing to
-		// within 1s of our own recent target is indistinguishable — the
-		// heartbeat self-heals that rare case
-		if t, ok := e.Player.Pos(); ok && abs(t-e.lastSeekT) < 1.0 {
+	if name == "seek" {
+		if !e.lastSeekAt.IsZero() && e.Clock.Since(e.lastSeekAt) > 5*time.Second {
+			e.seekEcho = false // the echo never came (or is ancient): never eat a user scrub
+		}
+		if e.seekEcho {
+			// exactly one echo per programmatic seek; the NEXT seek inside the
+			// window is a user scrub and must post. Target matching read a
+			// stale time-pos on a loaded machine and ate real scrubs (soak
+			// regression, 2026-10-27)
+			e.seekEcho = false
 			return
 		}
 	}
@@ -312,6 +330,14 @@ func (e *Engine) OnMpvEvent(name string) {
 		e.snap.paused = wantPause
 		e.postDiscrete(room.Event{Type: typ})
 	case "seek":
+		if !e.loadedAt.IsZero() && e.Clock.Since(e.loadedAt) < loadQuiet {
+			// a fresh loadfile makes mpv emit a seek at the file head;
+			// posting it would rewind the room to ~0 (late-join race, a
+			// demoted impostor's own /play). shortcut: user scrubs inside
+			// the window self-heal via the master heartbeat
+			return
+		}
+		time.Sleep(seekSettle) // posts only: let time-pos reach the scrub target
 		t, ok := e.Player.Pos()
 		if !ok {
 			return

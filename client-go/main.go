@@ -63,7 +63,8 @@ func main() {
 	}
 
 	// id format is client.py parity: name-1234
-	api := room.New(base, fmt.Sprintf("%s-%d", *name, 1000+rand.Intn(9000)))
+	id := fmt.Sprintf("%s-%d", *name, 1000+rand.Intn(9000))
+	api := room.New(base, id)
 	player, err := mpv.Start(base, strings.Fields(os.Getenv("WATCHPARTY_MPV")))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -75,9 +76,17 @@ func main() {
 	chUi := make(chan sync.UiState, 8)  // sync -> ui status bar
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() { // SIGTERM while headless blocks in the stdin scanner:
+		// without this the client dies and leaves its mpv orphaned (153 of
+		// them piled up on the test box in one day)
+		<-ctx.Done()
+		player.Close()
+		os.Exit(1)
+	}()
 
 	engine := &sync.Engine{
 		Master: *master,
+		ID:     id,
 		Player: player,
 		Post:   func(ev room.Event) error { return api.Post(ev) },
 		Clock:  sync.RealClock{},

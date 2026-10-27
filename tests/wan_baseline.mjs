@@ -32,6 +32,7 @@ const OPT = {
   seconds: Number(arg('--seconds', 60)),
   videoMbit: Number(arg('--video-mbit', 15)),
   phase: arg('--phase', 'both'),
+  r7Order: arg('--r7-order', 'seek-first'),
   out: arg('--out', ''),
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -162,7 +163,6 @@ async function phaseF2(ctx) {
   await fIpc.observe('paused-for-cache'); // mpv's real name (the fix reads pause-for-cache)
 
   const samples = [];
-  const t0 = Date.now();
   let playPostedAt = null;
   const windowEnd = t0 + ctx.seconds * 1000;
   while (Date.now() < windowEnd) {
@@ -450,6 +450,271 @@ async function phasePause(ctx) {
   return res;
 }
 
+// ---------------------------------------------------------------- R7: single-master election
+async function phaseR7(ctx) {
+  const server = startServer(ctx.port, ctx.dir, ctx.stateFile);
+  await waitServer(ctx.port);
+  const t0 = Date.now();
+  // raw SSE probe: see exactly which position events the room relays
+  const sseEvents = [];
+  try {
+    const r = await fetch(`http://127.0.0.1:${ctx.port}/events?id=probe&nick=probe`);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+          const m = chunk.match(/^data: (.*)$/m);
+          if (!m) continue;
+          try { sseEvents.push({ t: +((Date.now() - t0) / 1000).toFixed(2), ev: JSON.parse(m[1]) }); } catch {}
+        }
+      }
+    })();
+  } catch (e) { sseEvents.push({ t: -1, ev: { type: 'probe-error', msg: String(e) } }); }
+
+  const proxyF = new Proxy(ctx.proxyFPort, ctx.port, 0, 'F');
+  const proxyM = new Proxy(ctx.proxyMPort, ctx.port, 0, 'M');
+  await proxyF.listen(); await proxyM.listen();
+  const baseM = `http://127.0.0.1:${ctx.proxyMPort}`;
+  const baseF = `http://127.0.0.1:${ctx.proxyFPort}`;
+  const m1 = startClient('ada', true, baseM);   // master candidate 1
+  const m2 = startClient('bo', true, baseM);    // master candidate 2
+  const follower = startClient('cy', false, baseF);
+  await sleep(2500);
+  // both masters play the same file within a second: the election is the
+  // first position heartbeat, so it is a ~100ms coin flip (measured)
+  m1.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(600);
+  m2.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(12000); // election + notice are done
+  const i1 = await new MpvIpc(await mpvSocketPath(m1)).connect();
+  const i2 = await new MpvIpc(await mpvSocketPath(m2)).connect();
+  const iF = await new MpvIpc(await mpvSocketPath(follower)).connect();
+  const pos = async () => ({
+    p1: await i1.get('time-pos'), p2: await i2.get('time-pos'), pf: await iF.get('time-pos'),
+  });
+  const samples = [];
+  const sample = async (label) => {
+    const p = await pos();
+    samples.push({ label, t: +((Date.now() - t0) / 1000).toFixed(2), ...p });
+    return p;
+  };
+  // continuous position timeline (1 Hz)
+  const track = [];
+  const trackUntil = Date.now() + 120000;
+  (async () => {
+    while (Date.now() < trackUntil) {
+      const p = await pos();
+      track.push({ t: +((Date.now() - t0) / 1000).toFixed(2), p1: p.p1, p2: p.p2, pf: p.pf });
+      await sleep(1000);
+    }
+  })();
+
+  // who won the election, who was demoted?
+  const notice = (c) => linesMatching(c, /two masters/).map((l) => l.line);
+  const noticeLine = (notice(m1).concat(notice(m2), notice(follower))[0]) || '';
+  const ownerName = (noticeLine.match(/two masters: (\S+) owns/) || [])[1] || null;
+  const impostorName = (noticeLine.match(/ignoring (\S+)/) || [])[1] || null;
+  const ownerClient = ownerName === 'bo' ? m2 : m1;
+  const impostorClient = impostorName === 'bo' ? m2 : m1;
+  const ownerIpc = ownerName === 'bo' ? i2 : i1;
+  const impostorIpc = impostorName === 'bo' ? i2 : i1;
+  const demoteLog = linesMatching(impostorClient, /demoted/).map((l) => l.line);
+  const ownerPosBeforeLoad = await ownerIpc.get('time-pos');
+
+  // (b) the IMPOSTOR loads the file again (a late load, mpv head-of-file seek):
+  // the room must NOT rewind, the owner's position must stay monotonic
+  const tLoad = Date.now();
+  impostorClient.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(9000);
+  await sample('after-impostor-load+9s');
+  const ownerPosAfterLoad = await ownerIpc.get('time-pos');
+  const seeksDuringLoad = sseEvents.filter((e) => e.ev.type === 'seek'
+    && e.t >= (tLoad - t0) / 1000 - 1 && e.t <= (Date.now() - t0) / 1000).length;
+
+  // (e) a USER seek on the impostor, >5s after that load: still dual-control
+  let userSeek = null;
+  if (OPT.r7Order !== 'death-first') {
+    const pi = await impostorIpc.get('time-pos');
+    const oBefore = await ownerIpc.get('time-pos');
+    const target = (pi || 0) + 30;
+    await impostorIpc.cmd('seek', target, 'absolute');
+    await sleep(2500);
+    const oAfter = await ownerIpc.get('time-pos');
+    userSeek = {
+      impostor: impostorName, target: +target.toFixed(2),
+      ownerBefore: oBefore != null ? +oBefore.toFixed(2) : null,
+      ownerAfter: oAfter != null ? +oAfter.toFixed(2) : null,
+      ownerFollowed: oAfter != null && Math.abs(oAfter - target) < 3,
+    };
+    await sample('after-impostor-user-seek+2.5s');
+    await sleep(6000);
+    await sample('after-impostor-user-seek+8.5s');
+  }
+  const afterSeek = samples[samples.length - 1];
+
+  // (c) the owner dies: the election resets, the survivor claims the clock
+  const survivorIpc = ownerName === 'bo' ? i1 : i2;
+  const tKill = Date.now();
+  ownerClient.kill('SIGKILL');
+  let convergedAt = null, final = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const p2 = await survivorIpc.get('time-pos');
+    const pf = await iF.get('time-pos');
+    final = { p2, pf };
+    if (p2 != null && pf != null && Math.abs(p2 - pf) < 2) {
+      convergedAt = +((Date.now() - tKill) / 1000).toFixed(2);
+      break;
+    }
+  }
+  await sample('after-owner-death');
+
+  // rewind check: the owner's own position must never step backwards
+  const ownerKey = ownerName === 'bo' ? 'p2' : 'p1';
+  const tr = track.filter((x) => x[ownerKey] != null);
+  let minDelta = null, dipAt = null;
+  for (let i = 1; i < tr.length; i++) {
+    const d = +(tr[i][ownerKey] - tr[i - 1][ownerKey]).toFixed(2);
+    if (minDelta === null || d < minDelta) { minDelta = d; dipAt = tr[i].t; }
+  }
+  const res = {
+    userSeek,
+    impostorName,
+    clockOwner: ownerName,
+    demote: {
+      impostor: demoteLog,
+      master1: linesMatching(m1, /demoted/).map((l) => l.line),
+      master2: linesMatching(m2, /demoted/).map((l) => l.line),
+      follower: linesMatching(follower, /demoted/).map((l) => l.line),
+    },
+    impostorLoad: {
+      atSec: +((tLoad - t0) / 1000).toFixed(2),
+      ownerPosBefore: ownerPosBeforeLoad != null ? +ownerPosBeforeLoad.toFixed(2) : null,
+      ownerPosAfter: ownerPosAfterLoad != null ? +ownerPosAfterLoad.toFixed(2) : null,
+      ownerMovedForward: ownerPosAfterLoad != null && ownerPosBeforeLoad != null
+        && ownerPosAfterLoad >= ownerPosBeforeLoad,
+      roomSeeksDuringLoad: seeksDuringLoad,
+    },
+    ownerRewind: { minDeltaSec: minDelta, atSec: dipAt, samples: tr.length },
+    roomSeeks: sseEvents.filter((e) => e.ev.type === 'seek')
+      .map((e) => ({ t: e.t, from: (e.ev.from || '').slice(0, 6), to: +(e.ev.t || 0).toFixed(2) })),
+    notice: { master1: notice(m1), master2: notice(m2), follower: notice(follower) },
+    samples,
+    track,
+    sseEvents,
+    convergedAfterOwnerDeathSec: convergedAt,
+    finalDiffM2Follower: final && final.p2 != null && final.pf != null ? +Math.abs(final.p2 - final.pf).toFixed(2) : null,
+    finalSurvivorPos: final ? final.p2 : null,
+    finalFollowerPos: final ? final.pf : null,
+    master1Out: m1.out, master2Out: m2.out, followerOut: follower.out,
+    timeline: {
+      master1: m1.lines.map((l) => ({ t: l.t, line: l.line })),
+      master2: m2.lines.map((l) => ({ t: l.t, line: l.line })),
+      follower: follower.lines.map((l) => ({ t: l.t, line: l.line })),
+    },
+    serverLog: server.out,
+  };
+  for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
+  proxyF.close(); proxyM.close(); i1.close(); i2.close(); iF.close();
+  return res;
+}
+
+// ---------------------------------------------------------------- late-join rewind (R7b follow-up)
+async function phaseLatejoin(ctx) {
+  const server = startServer(ctx.port, ctx.dir, ctx.stateFile);
+  await waitServer(ctx.port);
+  const t0 = Date.now();
+  // raw SSE probe: who posts the seek?
+  const sseEvents = [];
+  try {
+    const r = await fetch(`http://127.0.0.1:${ctx.port}/events?id=probe&nick=probe`);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+          const m = chunk.match(/^data: (.*)$/m);
+          if (!m) continue;
+          try { sseEvents.push({ t: +((Date.now() - t0) / 1000).toFixed(2), ev: JSON.parse(m[1]) }); } catch {}
+        }
+      }
+    })();
+  } catch {}
+
+  const master = startClient('M', true, `http://127.0.0.1:${ctx.port}`);
+  await sleep(2500);
+  master.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(9000);
+  const mIpc = await new MpvIpc(await mpvSocketPath(master)).connect();
+  // jump the room to 60s so the late joiner meets a live position
+  await mIpc.cmd('seek', 60, 'absolute');
+  await sleep(3000);
+  const posBeforeJoin = await mIpc.get('time-pos');
+
+  // fresh follower joins the live room
+  const tJoin = Date.now();
+  const follower = startClient('F', false, `http://127.0.0.1:${ctx.port}`);
+  // attach the follower's mpv IPC right away: we want its load-time seek events
+  let fIpc = null;
+  const fIpcP = (async () => {
+    for (let i = 0; i < 100; i++) {
+      const sock = mpvSocketPath(follower);
+      if (sock) { try { fIpc = await new MpvIpc(sock).connect(); break; } catch {} }
+      await sleep(100);
+    }
+    return fIpc;
+  })();
+  const track = [];
+  while (Date.now() - tJoin < 14000) {
+    const p = await mIpc.get('time-pos');
+    track.push({ t: +((Date.now() - tJoin) / 1000).toFixed(2), mp: p });
+    await sleep(250);
+  }
+  await fIpcP;
+  const fPos = await fIpc.get('time-pos');
+  const fIdle = await fIpc.get('idle-active');
+  const seekEvents = sseEvents.filter((e) => e.ev.type === 'seek')
+    .map((e) => ({ t: e.t, from: (e.ev.from || '').slice(0, 8), to: +(e.ev.t || 0).toFixed(2) }));
+  const window = track.filter((x) => x.t >= -2 && x.t <= 12 && x.mp != null);
+  const dip = window.reduce((m, x) => (x.mp < m.mp ? x : m), window[0] || { t: null, mp: null });
+  const res = {
+    posBeforeJoin: posBeforeJoin != null ? +posBeforeJoin.toFixed(2) : null,
+    masterTrack: track,
+    dip: { t: dip.t, mp: dip.mp != null ? +dip.mp.toFixed(2) : null },
+    dipDepthSec: dip.mp != null && posBeforeJoin != null ? +(posBeforeJoin - dip.mp).toFixed(2) : null,
+    recoveredAt: (() => {
+      if (dip.t == null || posBeforeJoin == null) return null;
+      const back = window.find((x) => x.t >= dip.t && x.mp != null && x.mp >= posBeforeJoin - 1);
+      return back ? back.t : null;
+    })(),
+    roomSeeks: seekEvents,
+    followerPos: fPos != null ? +fPos.toFixed(2) : null,
+    followerIdle: fIdle,
+    followerSeeks: fIpc.count('seek'),
+    followerMpvSeekEvents: fIpc.events.filter((e) => e.event === 'seek').map((e) => ({ at: +((e.at - tJoin) / 1000).toFixed(2), t: e.name ? e.name : undefined })),
+    masterSeeks: mIpc.count('seek'),
+    followerOut: follower.out,
+    masterOut: master.out,
+    sseEvents,
+  };
+  for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
+  mIpc.close(); fIpc.close();
+  return res;
+}
+
 // ---------------------------------------------------------------- main
 (async () => {
   if (!existsSync(OPT.bin)) { console.error(`missing client binary ${OPT.bin}`); process.exit(2); }
@@ -486,6 +751,14 @@ async function phasePause(ctx) {
   if (OPT.phase === 'both' || OPT.phase === 'pause') {
     console.error('# pause/resume on a throttled link');
     out.pause = await phasePause(ctx);
+  }
+  if (OPT.phase === 'both' || OPT.phase === 'latejoin') {
+    console.error('# late-join rewind');
+    out.latejoin = await phaseLatejoin(ctx);
+  }
+  if (OPT.phase === 'both' || OPT.phase === 'r7') {
+    console.error('# R7: single-master election');
+    out.r7 = await phaseR7(ctx);
   }
   const slim = JSON.parse(JSON.stringify(out));
   if (slim.f2) { delete slim.f2.followerOut; delete slim.f2.masterOut; }

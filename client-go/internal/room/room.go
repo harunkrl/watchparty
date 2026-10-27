@@ -135,7 +135,9 @@ func (c *Client) Stream(ctx context.Context, nick string, out chan<- Event, onCo
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(payload, " ")), &ev); err != nil {
 			continue
 		}
-		if ev.From == c.ID && ev.Type != "hello" {
+		// hello carries no from; a notice deliberately names its subject
+		// with from (the impostor's id) — both must pass the own-echo filter
+		if ev.From == c.ID && ev.Type != "hello" && ev.Type != "notice" {
 			continue
 		}
 		select {
