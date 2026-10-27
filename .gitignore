@@ -2,3 +2,9 @@
 videos/*
 !videos/.gitkeep
 __pycache__/
+
+# room state persistence (dev runs default to the repo dir)
+state.json
+
+# agent/team working state (analysis, plans, decisions, baselines)
+.pi-state/

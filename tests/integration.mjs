@@ -42,7 +42,7 @@ execSync(
 );
 
 const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
-  env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir },
+  env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir, STATE_FILE: join(dir, 'state.json') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const client = spawn(GO_BIN, ['--headless', '--master', '--name', 'tester', BASE], {

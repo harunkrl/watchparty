@@ -82,6 +82,7 @@ everyone.
 | `VIDEOS_DIR` | `./videos` | folder the server exposes (flat, no subdirs) |
 | `PORT` | `8090` | server port |
 | `WATCHPARTY_MPV` | — | extra mpv flags for the client, e.g. `"--vo=null"` |
+| `STATE_FILE` | `state.json` next to `server.js` | where the room state persists across restarts |
 
 ## Test
 
@@ -109,6 +110,8 @@ After=network.target
 ExecStart=/usr/bin/node /opt/watchparty/server.js
 Environment=VIDEOS_DIR=/opt/watchparty/videos
 Environment=PORT=8090
+Environment=STATE_FILE=/var/lib/watchparty/state.json
+StateDirectory=watchparty
 Restart=always
 RestartSec=2
 DynamicUser=yes
@@ -127,7 +130,9 @@ WantedBy=multi-user.target
 
 Add a video: `scp file.mp4 root@<host>:/opt/watchparty/videos/` — visible in
 `list` immediately, no restart. Update code: `scp server.js` into
-`/opt/watchparty`, then `systemctl restart watchparty`.
+`/opt/watchparty`, then `systemctl restart watchparty`. The room (current
+file, queue, position) survives that restart: state persists to `STATE_FILE`
+(`/var/lib/watchparty/state.json` in the unit above).
 
 Guests get the client from the GitHub releases page (tag a version and CI
 builds the zips, Windows one with mpv bundled).

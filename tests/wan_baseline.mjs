@@ -16,7 +16,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,8 +108,10 @@ function startClient(name, master, base) {
   return p;
 }
 
-function startServer(port, videos) {
-  const s = spawn(process.execPath, [OPT.server], { env: { ...process.env, PORT: String(port), VIDEOS_DIR: videos }, stdio: ['ignore', 'pipe', 'pipe'] });
+function startServer(port, videos, stateFile) {
+  const env = { ...process.env, PORT: String(port), VIDEOS_DIR: videos };
+  if (stateFile) env.STATE_FILE = stateFile; // R4: unique state file per run (tmp)
+  const s = spawn(process.execPath, [OPT.server], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   children.push(s);
   s.out = '';
   s.stdout.on('data', (d) => { s.out += d; });
@@ -143,7 +145,7 @@ const linesMatching = (client, re) => client.lines.filter((l) => re.test(l.line)
 
 // ---------------------------------------------------------------- F2
 async function phaseF2(ctx) {
-  const server = startServer(ctx.port, ctx.dir);
+  const server = startServer(ctx.port, ctx.dir, ctx.stateFile);
   await waitServer(ctx.port);
   const proxyF = new Proxy(ctx.proxyFPort, ctx.port, ctx.cap, 'F');   // throttled follower link
   const proxyM = new Proxy(ctx.proxyMPort, ctx.port, 0, 'M');         // master: local link
@@ -183,7 +185,7 @@ async function phaseF2(ctx) {
   // let the room settle after the play test
   await sleep(6000);
 
-  const res = analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0 });
+  const res = analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0, ctx });
   res.proxyLog = proxyF.log;
   res.serverLog = server.out;
   res.serverExited = server.exited;
@@ -192,7 +194,7 @@ async function phaseF2(ctx) {
   return res;
 }
 
-function analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0 }) {
+function analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0, ctx }) {
   let jumps = 0, stallSeconds = 0, maxDrift = 0, endDrift = null, maxJump = 0;
   for (let i = 1; i < samples.length; i++) {
     const a = samples[i - 1], b = samples[i];
@@ -205,9 +207,13 @@ function analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0 }) 
   }
   let cacheStallSeconds = 0;
   let masterPausedSamples = 0, followerPausedSamples = 0, firstMasterPauseAt = null;
+  let followerIdleAt = null, masterIdleAt = null, bothIdleAt = null;
   for (const s2 of samples) {
     if (s2.mpaused === true) { masterPausedSamples++; if (firstMasterPauseAt === null) firstMasterPauseAt = s2.t; }
     if (s2.fpaused === true) followerPausedSamples++;
+    if (s2.fp == null && followerIdleAt === null) followerIdleAt = s2.t;
+    if (s2.mp == null && masterIdleAt === null) masterIdleAt = s2.t;
+    if (s2.fp == null && s2.mp == null && bothIdleAt === null) bothIdleAt = s2.t;
   }
   for (let i = 1; i < samples.length; i++) {
     if (samples[i].fcache === true) cacheStallSeconds += samples[i].t - samples[i - 1].t;
@@ -230,6 +236,10 @@ function analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0 }) 
     endDriftSec: endDrift == null ? null : +endDrift.toFixed(2),
     masterPausedSamples,
     followerPausedSamples,
+    followerIdleAtSec: followerIdleAt,
+    masterIdleAtSec: masterIdleAt,
+    bothIdleAtSec: bothIdleAt,
+    serverAbortedLines: (ctx.serverLog || '').split('\n').filter((l) => /aborted|stream error/.test(l)),
     firstMasterPauseAtSec: firstMasterPauseAt === null ? null : +firstMasterPauseAt.toFixed(1),
     roomPauseEvents: pauseLines.length,
     roomPlayEvents: playLines.length,
@@ -248,7 +258,7 @@ function analyzeF2({ samples, mIpc, fIpc, master, follower, playPostedAt, t0 }) 
 
 // ---------------------------------------------------------------- F3
 async function phaseF3(ctx) {
-  const server = startServer(ctx.port, ctx.dir);
+  const server = startServer(ctx.port, ctx.dir, ctx.stateFile);
   await waitServer(ctx.port);
   const proxyF = new Proxy(ctx.proxyFPort, ctx.port, 0, 'F');
   const proxyM = new Proxy(ctx.proxyMPort, ctx.port, 0, 'M');
@@ -276,9 +286,15 @@ async function phaseF3(ctx) {
     followerPlaying: linesMatching(follower, /^> playing/).length,
     masterSeeks: mIpc.count('seek'), followerSeeks: fIpc.count('seek'),
   };
+  // reconnect delay: first "> room:" line after the blip
+  const helloAfter = (client) => {
+    const l = client.lines.find((x) => x.t > tKill && /^> room:/.test(x.line));
+    return l ? +((l.t - tKill) / 1000).toFixed(1) : null;
+  };
   const res = {
     killedSse: killed,
     blipAtSec: 0,
+    reconnectDelaySec: { master: helloAfter(master), follower: helloAfter(follower) },
     before, after,
     masterReloaded: after.masterPlaying > before.masterPlaying,
     followerReloaded: after.followerPlaying > before.followerPlaying,
@@ -294,6 +310,86 @@ async function phaseF3(ctx) {
   return res;
 }
 
+// ---------------------------------------------------------------- R4 (server crash + state restore)
+async function phaseR4(ctx) {
+  let server = startServer(ctx.port, ctx.dir, ctx.stateFile);
+  await waitServer(ctx.port);
+  const proxyF = new Proxy(ctx.proxyFPort, ctx.port, 0, 'F');
+  const proxyM = new Proxy(ctx.proxyMPort, ctx.port, 0, 'M');
+  await proxyF.listen(); await proxyM.listen();
+  const master = startClient('M', true, `http://127.0.0.1:${ctx.proxyMPort}`);
+  const follower = startClient('F', false, `http://127.0.0.1:${ctx.proxyFPort}`);
+  await sleep(2500);
+  master.stdin.write(`play ${ctx.videoName}\n`);
+  await sleep(12000);
+  const mIpc = await new MpvIpc(await mpvSocketPath(master)).connect();
+  const fIpc = await new MpvIpc(await mpvSocketPath(follower)).connect();
+  const snap = async () => ({
+    mp: await mIpc.get('time-pos'), fp: await fIpc.get('time-pos'),
+    midle: await mIpc.get('idle-active'), fidle: await fIpc.get('idle-active'),
+    masterPlaying: linesMatching(master, /^> playing/).length,
+    followerPlaying: linesMatching(follower, /^> playing/).length,
+    masterSeeks: mIpc.count('seek'), followerSeeks: fIpc.count('seek'),
+  });
+  const before = await snap();
+
+  // queue survival: put a second file in the queue before the crash
+  const second = 'queued.mp4';
+  try { copyFileSync(join(ctx.dir, ctx.videoName), join(ctx.dir, second)); } catch {}
+  await fetch(`http://127.0.0.1:${ctx.port}/cmd`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'enqueue', name: second, from: 'harness' }),
+  });
+  await sleep(1500);
+  const queueBefore = linesMatching(master, /^> queue:/).map((l) => l.line).slice(-1)[0] || null;
+
+  // crash the server (SIGKILL = no clean shutdown, no flush)
+  const tKill = Date.now();
+  server.kill('SIGKILL');
+  await sleep(2000);
+  const duringOutage = await snap();
+  // restart with the SAME state file
+  server = startServer(ctx.port, ctx.dir, ctx.stateFile);
+  const up = await waitServer(ctx.port);
+  await sleep(20000); // clients reconnect with backoff
+  const after = await snap();
+
+  // a third, fresh client joins after the restart
+  const third = startClient('C', false, `http://127.0.0.1:${ctx.proxyFPort}`);
+  await sleep(12000);
+  const cIpc = await new MpvIpc(await mpvSocketPath(third)).connect();
+  const cPos = await cIpc.get('time-pos');
+  const cIdle = await cIpc.get('idle-active');
+  const helloAfter = (client) => {
+    const l = client.lines.find((x) => x.t > tKill && /^> room:/.test(x.line));
+    return l ? { atSec: +((l.t - tKill) / 1000).toFixed(1), line: l.line } : null;
+  };
+  const res = {
+    serverRestarted: up,
+    stateFile: ctx.stateFile,
+    restoredLog: /restored room state/.test(server.out),
+    serverLog: server.out,
+    before, duringOutage, after,
+    reconnectDelaySec: { master: helloAfter(master), follower: helloAfter(follower) },
+    queueBefore,
+    queueAfter: helloAfter(master) ? helloAfter(master).line : null,
+    masterReloaded: after.masterPlaying > before.masterPlaying,
+    followerReloaded: after.followerPlaying > before.followerPlaying,
+    thirdClient: {
+      hello: linesMatching(third, /^> room:/).map((l) => l.line),
+      pos: cPos, idle: cIdle,
+      playing: linesMatching(third, /^> playing/).length,
+      reloads: linesMatching(third, /^> playing/).length - 1,
+      out: third.out,
+    },
+    masterOut: master.out,
+    followerOut: follower.out,
+  };
+  for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
+  proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close(); cIpc.close();
+  return res;
+}
+
 // ---------------------------------------------------------------- main
 (async () => {
   if (!existsSync(OPT.bin)) { console.error(`missing client binary ${OPT.bin}`); process.exit(2); }
@@ -306,6 +402,7 @@ async function phaseF3(ctx) {
   const ctx = {
     dir, port, proxyFPort: port + 1000, proxyMPort: port + 2000, videoName,
     cap: Math.round((OPT.mbit * 1e6) / 8), seconds: OPT.seconds,
+    stateFile: join(dir, 'state.json'), // R4: unique state file for this run
   };
   const out = {
     meta: {
@@ -321,6 +418,10 @@ async function phaseF3(ctx) {
   if (OPT.phase === 'both' || OPT.phase === 'f3') {
     console.error('# F3: SSE blip');
     out.f3 = await phaseF3(ctx);
+  }
+  if (OPT.phase === 'both' || OPT.phase === 'r4') {
+    console.error('# R4: server crash + state restore');
+    out.r4 = await phaseR4(ctx);
   }
   const slim = JSON.parse(JSON.stringify(out));
   if (slim.f2) { delete slim.f2.followerOut; delete slim.f2.masterOut; }

@@ -26,6 +26,46 @@ const state = { now: null, queue: [], pos: null, paused: false, posAt: 0 };
 
 const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort();
 
+// R4: persist the room across restarts — a mid-film server restart used to
+// wipe now/queue, leaving fresh joiners an empty room. state.json next to
+// the server by default; STATE_FILE overrides (the systemd unit points it
+// at /var/lib/watchparty — the deploy dir is read-only). posAt is
+// monotonic and resets between boots, so the age travels as wall-clock ms.
+const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
+let persistOK = true;
+function saveState() {
+  if (!persistOK) return;
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      now: state.now, queue: state.queue, pos: state.pos, paused: state.paused,
+      wall: Date.now(),
+    }));
+  } catch (e) { // read-only dir etc: persistence off, the room still works
+    persistOK = false;
+    console.error(`watchparty: state persistence disabled (${e.message})`);
+  }
+}
+(function restoreState() {
+  let saved;
+  try {
+    saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(`watchparty: state restore failed (${e.message})`);
+    return;
+  }
+  const files = list();
+  state.queue = Array.isArray(saved.queue) ? saved.queue.filter((n) => files.includes(n)) : [];
+  if (saved.now && files.includes(saved.now)) {
+    state.now = saved.now;
+    if (typeof saved.pos === 'number') {
+      state.pos = saved.pos;
+      state.paused = !!saved.paused;
+      state.posAt = mono() - Math.max(0, Date.now() - (saved.wall || Date.now()));
+    }
+  }
+  console.log(`watchparty: restored room state from ${STATE_FILE}`);
+})();
+
 function broadcast(ev, exceptId) {
   const line = `data: ${JSON.stringify(ev)}\n\n`;
   for (const [res, id] of listeners) if (id !== exceptId) res.write(line);
@@ -51,12 +91,14 @@ function handleCmd(cmd) {
     case 'pause':
       state.paused = cmd.type === 'pause';
       broadcast(cmd, cmd.from);
+      saveState();
       break;
     case 'position':
       state.pos = cmd.t;
       state.paused = !!cmd.p;
       state.posAt = mono();
       broadcast(cmd, cmd.from);
+      saveState();
       break;
     case 'load':
       if (!list().includes(cmd.name)) break;
@@ -64,11 +106,13 @@ function handleCmd(cmd) {
       state.pos = null; // old file's position is meaningless now
       state.queue = state.queue.filter((n) => n !== cmd.name);
       broadcast(cmd, cmd.from);
+      saveState();
       break;
     case 'enqueue':
       if (list().includes(cmd.name) && !state.queue.includes(cmd.name) && cmd.name !== state.now) {
         state.queue.push(cmd.name);
         broadcast({ type: 'queue', queue: state.queue });
+        saveState();
       }
       break;
     case 'ended': // master hit EOF: auto-advance the queue for everyone
@@ -78,6 +122,7 @@ function handleCmd(cmd) {
         state.pos = null; // positions belong to the previous file
         broadcast({ type: 'load', name: state.now, from: null });
         broadcast({ type: 'queue', queue: state.queue });
+        saveState();
       }
       break;
   }
@@ -122,6 +167,12 @@ function serveFile(req, res, file, ctype) {
     // a dead read (EIO/EPERM) would otherwise hang the response mid-body
     console.error(`stream error ${file}: ${e.message}`);
     res.destroy();
+  });
+  // R-out2: mid-body client hangups land in the log — seek aborts are
+  // normal and rare, but a burst without seeks is the outlier signature
+  // seen once in live WAN runs (both streams ended early, no error)
+  res.on('close', () => {
+    if (!res.writableEnded) console.log(`aborted ${path.basename(file)} bytes ${start}-${end}`);
   });
   stream.pipe(res);
 }

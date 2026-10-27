@@ -21,7 +21,7 @@ writeFileSync(join(dir, 'movie one.srt'), '1\n00:00:00,000 --> 00:00:05,000\nhi\
 writeFileSync(join(dir, 'movie two.mkv'), Buffer.alloc(8000, 9));
 
 const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
-  env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir },
+  env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir, STATE_FILE: join(dir, 'state.json') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 

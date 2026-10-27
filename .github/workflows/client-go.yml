@@ -61,6 +61,7 @@ jobs:
         with:
           node-version: 20
       - run: node tests/smoke.mjs
+      - run: node tests/persist.mjs
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod

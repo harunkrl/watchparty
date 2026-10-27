@@ -20,6 +20,13 @@ WAN livability (P0):
   direct-vs-DERP check, faststart/MKV note
 - CI: node test job (smoke + real-mpv integration/pause_sync/soak),
   `go test -race`, gofmt check; push paths now cover server.js and tests/
+- server: room state persists across restarts (STATE_FILE, default
+  state.json next to server.js; the systemd unit uses /var/lib/watchparty)
+  — a mid-film server restart no longer empties the room; queue entries
+  and now are dropped if the file vanished from disk meanwhile
+- server: mid-body stream aborts are logged (`aborted <file> bytes ...`)
+  — the first diagnostic for the rare both-streams-ended-early outlier
+  seen once in live WAN runs
 
 ## v1.2.0 — slash commands, split panes
 
