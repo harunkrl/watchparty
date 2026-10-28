@@ -4,6 +4,15 @@
 
 Room quality (P2):
 
+- TUI overhaul: chat lines carry a timestamp gutter and group under one
+  nickname while consecutive; the system pane sits behind a thin left
+  gutter so conversation pops; join/left/notice lines are color-coded;
+  the seek bar gains a position head plus elapsed/total labels; the
+  connecting screen got a spinner and an empty room shows the invite
+  address to send. New keys: Tab completes commands and file names,
+  ctrl+z is movie mode (one status line + chat + input), ctrl+g toggles
+  the system pane, and a mouse click on the seek bar seeks the room
+  (mouse is now enabled — hold shift to select terminal text)
 - releases: the bundled mpv is pinned to a dated shinchiro build
   (MPV_TAG in the release workflow) and the download is verified against
   the GitHub asset digest — a repackaged/tampered archive fails the

@@ -100,7 +100,8 @@ func main() {
 		// engine logs must go through the program: writing to stderr while
 		// the bubbletea renderer owns the screen corrupts the frame
 		engine.Logf = func(f string, a ...any) { p.Send(ui.EngineLogMsg{Line: fmt.Sprintf(f, a...)}) }
-		p = tea.NewProgram(ui.New(*name, api, player, *master, engine)) // set before goroutines: they Send on it
+		p = tea.NewProgram(ui.New(*name, api, player, *master, engine), // set before goroutines: they Send on it
+			tea.WithMouseCellMotion()) // wheel scrolls chat; clicks on the bar seek
 	}
 
 	go player.Poll(ctx, sync.PollSecs*time.Second, chMpv)

@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -50,6 +51,7 @@ type entry struct {
 	kind entryKind
 	nick string // chat only
 	text string
+	at   time.Time // chat only: timestamp gutter + same-nick grouping
 }
 
 var (
@@ -70,8 +72,13 @@ var (
 	playingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	pausedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	joinStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	leftStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	nickColors   = []lipgloss.Color{"205", "45", "214", "84", "117", "212"}
 	pickCur      = lipgloss.NewStyle().Bold(true).Reverse(true)
+	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	gutStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 )
 
 // nudgeRe matches speed-nudge log lines ("[1.050]"): pure chatter whose
@@ -80,7 +87,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat"
+const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -97,6 +104,7 @@ type Model struct {
 	player     *mpv.Player
 	engine     *sync.Engine
 	input      textinput.Model
+	spin       spinner.Model  // connecting screen (pre-WindowSizeMsg)
 	vp         viewport.Model // chat pane
 	sysVp      viewport.Model // system tail: events + engine lines
 	lastErr    string         // input-row feedback until the next keystroke
@@ -117,6 +125,8 @@ type Model struct {
 	hist       []string // input history, newest last
 	histIdx    int      // -1 = live editing
 	draft      string   // saved while browsing history
+	zen        bool     // movie-night mode: one status line + input only
+	sysOff     bool     // ctrl+g: system pane hidden
 	width      int
 	height     int
 }
@@ -130,6 +140,7 @@ func New(nick string, api *room.Client, player *mpv.Player, master bool, engine 
 	m := Model{
 		nick: nick, master: master, api: api, player: player, engine: engine,
 		input: in, peers: map[string]bool{}, conn: "connecting",
+		spin:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(dim)),
 		histIdx: -1, width: 80, height: 24,
 		vp: viewport.New(76, 14), sysVp: viewport.New(76, 2),
 	}
@@ -137,7 +148,7 @@ func New(nick string, api *room.Client, player *mpv.Player, master bool, engine 
 }
 
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, m.spin.Tick)
 }
 
 type StreamClosedMsg struct{}
@@ -220,7 +231,7 @@ func (m Model) addEntry(e entry) Model {
 }
 
 func (m Model) logChat(nick, text string) Model {
-	return m.addEntry(entry{kind: entChat, nick: nick, text: text})
+	return m.addEntry(entry{kind: entChat, nick: nick, text: text, at: time.Now()})
 }
 
 func (m Model) logEvent(text string) Model {
@@ -248,7 +259,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m.syncLayout(), nil
-	case tea.MouseMsg: // wheel scrolling in the chat viewport
+	case tea.MouseMsg: // wheel scrolls chat; a click on the bar seeks
+		if c := m.barClick(msg); c != nil {
+			return m, c
+		}
 		var c tea.Cmd
 		m.vp, c = m.vp.Update(msg)
 		return m, c
@@ -257,6 +271,10 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			return m.pickKeys(msg)
 		}
 		return m.inputKeys(msg)
+	case spinner.TickMsg:
+		var sc tea.Cmd
+		m.spin, sc = m.spin.Update(msg)
+		return m, sc
 	case room.Event:
 		return m.onEvent(msg)
 	case sync.UiState:
@@ -317,6 +335,15 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.vp.GotoBottom()
 	case "ctrl+c":
 		return m, tea.Quit
+	case "tab":
+		return m.complete()
+	case "ctrl+z": // movie-night mode: one status line + chat + input.
+		// ctrl+m is unreachable: terminals send CR for it (== enter)
+		m.zen = !m.zen
+		return m.syncLayout(), nil
+	case "ctrl+g": // system pane toggle: hide the machine chatter
+		m.sysOff = !m.sysOff
+		return m.syncLayout(), nil
 	case "up":
 		if len(m.hist) > 0 {
 			if m.histIdx == -1 {
@@ -383,6 +410,81 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.mode = modeInput
 	}
 	return m, nil
+}
+
+// verbs is the tab-completion candidate set (cmd.Parse accepts these).
+var verbs = []string{"pick", "play", "queue", "skip", "chat", "list", "help", "quit"}
+
+// complete implements Tab completion: slash verbs while typing the first
+// word, server file names for /play and /queue arguments. Ambiguous
+// matches extend to the longest common prefix and list in the system pane.
+func (m Model) complete() (Model, tea.Cmd) {
+	v := m.input.Value()
+	if v == "" || !strings.HasPrefix(v, "/") {
+		return m, nil
+	}
+	verb, rest, hasArg := strings.Cut(strings.TrimPrefix(v, "/"), " ")
+	var pool []string
+	word := strings.TrimLeft(rest, " ")
+	if !hasArg {
+		pool, word = verbs, verb // completing the verb itself
+	} else if verb == "play" || verb == "queue" {
+		pool = m.files
+	} else {
+		return m, nil
+	}
+	var matches []string
+	for _, c := range pool {
+		if strings.HasPrefix(c, word) {
+			matches = append(matches, c)
+		}
+	}
+	if len(matches) == 0 {
+		return m, nil
+	}
+	com := matches[0]
+	for _, c := range matches[1:] {
+		for !strings.HasPrefix(c, com) {
+			com = com[:len(com)-1]
+		}
+	}
+	join := com
+	if len(matches) == 1 {
+		join += " "
+	} else {
+		m = m.logEngine("> " + strings.Join(matches, "   "))
+	}
+	if !hasArg {
+		m.input.SetValue("/" + join)
+	} else {
+		lead := rest[:len(rest)-len(word)] // keep any argument padding intact
+		m.input.SetValue("/" + verb + " " + lead + join)
+	}
+	m.input.CursorEnd()
+	return m, nil
+}
+
+// barClick turns a left click on the progress bar into a room seek.
+// The bar renders on screen row 3 (border + two header lines) and starts
+// at column frame-left + 1; the click's column maps linearly to time.
+func (m Model) barClick(msg tea.MouseMsg) tea.Cmd {
+	_, _, showBar, _, _ := m.layout()
+	if !showBar || m.zen || m.mode == modePick ||
+		msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress ||
+		m.duration <= 0 || m.st == nil || m.st.Pos == nil {
+		return nil
+	}
+	if msg.Y != frame.GetVerticalFrameSize()/2+2 { // top border (1) + two header rows = row 3
+		return nil
+	}
+	cw := m.contentWidth()
+	left := frame.GetHorizontalFrameSize() - 1 // border + padding, bar starts after
+	if msg.X < left || msg.X > left+cw {
+		return nil
+	}
+	frac := float64(msg.X-left) / float64(cw)
+	t := frac * m.duration
+	return postEvent(m.api, room.Event{Type: "seek", T: t})
 }
 
 // enqueue mirrors the server's enqueue conditions for instant feedback;
@@ -578,7 +680,13 @@ func (m Model) syncViewport() Model {
 		}
 	} else {
 		atBottom := m.vp.AtBottom()
-		m.vp.SetContent(strings.Join(m.renderChatLines(), "\n"))
+		content := ""
+		if !m.hasChat() {
+			content = m.inviteLines() // empty room: show what to send the other side
+		} else {
+			content = strings.Join(m.renderChatLines(), "\n")
+		}
+		m.vp.SetContent(content)
 		if atBottom {
 			m.vp.GotoBottom()
 		}
@@ -600,12 +708,15 @@ func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
 	if inner < 3 {
 		inner = 3
 	}
+	if m.zen { // movie-night mode: one header row + chat + input, nothing else
+		return cw, max(1, inner-2), false, false, false
+	}
 	fixed := 3 // two header lines + input
 	showBar = m.duration > 0 && m.st != nil && m.st.Pos != nil && inner-fixed >= 6
 	if showBar {
 		fixed++
 	}
-	showSys = inner-fixed >= 6 // divider + 2 tail rows must leave real chat room
+	showSys = inner-fixed >= 6 && !m.sysOff // ctrl+g hides the system strip
 	if showSys {
 		fixed += 3
 	}
@@ -630,9 +741,30 @@ func (m Model) prompt() string {
 	return nickStyle(m.nick).Render(m.nick) + " › "
 }
 
+func (m Model) hasChat() bool {
+	for _, e := range m.log {
+		if e.kind == entChat {
+			return true
+		}
+	}
+	return false
+}
+
+// inviteLines is the empty-chat placeholder: the one thing a first-time
+// host needs is the address to send the other side.
+func (m Model) inviteLines() string {
+	base := "http://<server>"
+	if m.api != nil && m.api.Base != "" {
+		base = m.api.Base
+	}
+	return dim.Render("no messages yet — invite them:") + "\n" +
+		title.Render("  "+base) + "\n" +
+		dim.Render("(everything you type here goes to the room as chat)")
+}
+
 func (m Model) View() string {
 	if m.height == 0 {
-		return "connecting…\n"
+		return m.spin.View() + " connecting…\n"
 	}
 	cw, vh, showBar, showSys, showFooter := m.layout()
 	vp := m.vp // sized copies: View must not depend on Update having run first
@@ -642,17 +774,22 @@ func (m Model) View() string {
 
 	var b strings.Builder
 	l1, l2 := m.headerLines(cw)
-	b.WriteString(l1 + "\n" + l2 + "\n")
-	if showBar {
-		b.WriteString(m.progressBar(cw) + "\n")
+	b.WriteString(l1 + "\n")
+	if !m.zen {
+		b.WriteString(l2 + "\n")
+		if showBar {
+			b.WriteString(m.progressBar(cw) + "\n")
+		}
 	}
 	b.WriteString(vp.View() + "\n")
-	if showSys {
-		b.WriteString(m.sysDivider(cw) + "\n")
-		b.WriteString(sysVp.View() + "\n")
-	}
-	if showFooter {
-		b.WriteString(m.footerLine(cw) + "\n")
+	if !m.zen {
+		if showSys {
+			b.WriteString(m.sysDivider(cw) + "\n")
+			b.WriteString(sysVp.View() + "\n")
+		}
+		if showFooter {
+			b.WriteString(m.footerLine(cw) + "\n")
+		}
 	}
 	// textinput pads its view to the full input width; the padding would
 	// eat the whole gap in joinLR, so measure and render without it
@@ -699,14 +836,20 @@ func (m Model) inputSideHint(vp viewport.Model) string {
 }
 
 // renderChatLines renders the human conversation: bright, word-wrapped,
-// never mixed with machine output.
+// never mixed with machine output. Consecutive messages from the same
+// nick within five minutes group under one timestamp + nickname.
 func (m Model) renderChatLines() []string {
 	cw := m.contentWidth()
 	var out []string
-	for _, e := range m.log {
-		if e.kind == entChat {
-			out = append(out, m.renderEntry(e, cw)...)
+	prevIdx := -1
+	for i, e := range m.log {
+		if e.kind != entChat {
+			continue
 		}
+		cont := prevIdx >= 0 && m.log[prevIdx].nick == e.nick &&
+			e.at.Sub(m.log[prevIdx].at) < 5*time.Minute
+		out = append(out, m.renderEntry(e, cw, cont)...)
+		prevIdx = i
 	}
 	return out
 }
@@ -723,7 +866,7 @@ func (m Model) renderSysLines() []string {
 			continue // not system noise, but still breaks an engine run
 		}
 		if e.kind != entEngine {
-			out = append(out, m.renderEntry(e, cw)...)
+			out = append(out, m.renderEntry(e, cw, false)...)
 			continue
 		}
 		j := i
@@ -731,28 +874,47 @@ func (m Model) renderSysLines() []string {
 			engineKind(m.log[j+1].text) == engineKind(e.text) {
 			j++
 		}
-		lines := m.renderEntry(m.log[j], cw)
+		lines := m.renderEntry(m.log[j], cw, false)
 		if j > i {
 			lines[len(lines)-1] += dim.Render(fmt.Sprintf("  (%d)", j-i))
 		}
 		out = append(out, lines...)
 		i = j
 	}
+	for k, l := range out { // thin gutter: system reads as a sidebar, chat pops
+		out[k] = gutStyle.Render("▏") + l
+	}
 	return out
 }
 
-func (m Model) renderEntry(e entry, cw int) []string {
+func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 	switch e.kind {
 	case entChat:
-		prefix := nickStyle(e.nick).Render(e.nick)
-		return wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix+" ")
+		var who string
+		if cont {
+			who = gutStyle.Render(strings.Repeat(" ", lipgloss.Width(e.nick))) // grouped: blank nick gutter
+		} else {
+			who = nickStyle(e.nick).Render(e.nick)
+		}
+		prefix := timeStyle.Render(e.at.Format("15:04")) + " " + who + " "
+		return wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix)
 	case entEngine:
 		return wrapIndented(e.text, cw, 0, "")
-	default: // entEvent: dim, "·"-prefixed — visibly not a human speaking
-		lines := wrapIndented(strings.TrimPrefix(e.text, "> "), cw, 2, "")
+	default: // entEvent: "·"-prefixed — visibly not a human speaking
+		body := strings.TrimPrefix(e.text, "> ")
+		style := dim
+		switch {
+		case strings.HasSuffix(body, " joined"):
+			style = joinStyle
+		case strings.HasSuffix(body, " left"):
+			style = leftStyle
+		case strings.HasPrefix(body, "two masters"):
+			style = noticeStyle
+		}
+		lines := wrapIndented(body, cw, 2, "")
 		lines[0] = "· " + lines[0]
 		for i, l := range lines {
-			lines[i] = dim.Render(l)
+			lines[i] = style.Render(l)
 		}
 		return lines
 	}
@@ -848,11 +1010,14 @@ func (m Model) knownFile(name string) bool {
 }
 
 // headerLines renders the two header rows: identity + connection, then
-// now-playing + clock.
+// now-playing + clock. Movie-night mode collapses them into one row.
 func (m Model) headerLines(cw int) (string, string) {
 	role := "follower"
 	if m.master {
 		role = "master"
+	}
+	if m.zen {
+		return joinLR(m.nowChip(), m.clockChip(), cw), ""
 	}
 	l1 := joinLR(roleStyle[role].Render("watchparty "+role), m.connChip(), cw)
 	l2 := joinLR(m.nowChip(), m.clockChip(), cw)
@@ -901,21 +1066,30 @@ func (m Model) clockChip() string {
 	return dim.Render(clock)
 }
 
-// progressBar renders the full-width elapsed bar; green while playing,
-// amber while paused so the state reads even in the corner of an eye.
+// progressBar renders the seek bar with a position head and time labels
+// at both ends; green while playing, amber while paused so the state reads
+// even in the corner of an eye.
 func (m Model) progressBar(cw int) string {
 	if m.duration <= 0 || m.st == nil || m.st.Pos == nil {
 		return ""
 	}
 	frac := *m.st.Pos / m.duration
 	frac = min(max(frac, 0), 1)
-	fill := int(frac * float64(cw))
+	elapsed, total := clockStr(*m.st.Pos), clockStr(m.duration)
+	bw := cw - lipgloss.Width(elapsed) - lipgloss.Width(total) - 4
+	bw = max(bw, 8)
+	fill := int(frac * float64(bw))
 	col := lipgloss.Color("2")
 	if m.st.Paused {
 		col = lipgloss.Color("3")
 	}
-	return lipgloss.NewStyle().Foreground(col).Render(strings.Repeat("█", fill)) +
-		lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("░", cw-fill))
+	head := lipgloss.NewStyle().Foreground(col)
+	rest := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	bar := head.Render(strings.Repeat("█", fill))
+	if fill < bw {
+		bar += head.Render("●") + rest.Render(strings.Repeat("░", bw-fill-1))
+	}
+	return timeStyle.Render(elapsed) + " " + bar + " " + timeStyle.Render(total)
 }
 
 // footerLine: queue preview on the left, the live sync gauge on the right.

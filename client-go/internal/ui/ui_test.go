@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/muesli/termenv"
 	"watchparty/client-go/internal/cmd"
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
@@ -522,5 +523,154 @@ func TestOwnLoadUpdatesNow(t *testing.T) {
 	m = upd(t, m, durationMsg{name: "other.mkv", dur: 99})
 	if m.duration != 3800 {
 		t.Fatalf("stale duration accepted: %v", m.duration)
+	}
+}
+
+// --- UI overhaul (A/U batch) -----------------------------------------------
+
+func TestTabCompletionVerb(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m.input.SetValue("/pl")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if got := m.input.Value(); got != "/play " {
+		t.Fatalf("single verb match: got %q, want /play ", got)
+	}
+	m.input.SetValue("/p")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab}) // ambiguous: pick/play
+	if got := m.input.Value(); got != "/p" {
+		t.Fatalf("ambiguous keeps common prefix: got %q", got)
+	}
+	found := false
+	for _, e := range m.log {
+		if e.kind == entEngine && strings.Contains(e.text, "pick") && strings.Contains(e.text, "play") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("ambiguous matches not listed in the system pane")
+	}
+}
+
+func TestTabCompletionFile(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, filesMsg{files: []string{"movie one.mkv", "movie two.mkv", "song.flac"}})
+	m.input.SetValue("/play movie t")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if got := m.input.Value(); got != "/play movie two.mkv " {
+		t.Fatalf("file completion: got %q", got)
+	}
+}
+
+func TestZenModeCollapses(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	_, vh, showBar, showSys, showFooter := m.layout()
+	if !showSys || !showFooter {
+		t.Fatalf("precondition: optional rows visible at h=30 (%v %v %v)", showBar, showSys, showFooter)
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlZ})
+	_, vhZen, showBar2, showSys2, showFooter2 := m.layout()
+	if showBar2 || showSys2 || showFooter2 {
+		t.Fatalf("zen hides optional rows: %v %v %v", showBar2, showSys2, showFooter2)
+	}
+	if vhZen <= vh {
+		t.Fatalf("zen chat height grew: %d -> %d", vh, vhZen)
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlZ})
+	if _, _, _, showSys3, _ := m.layout(); !showSys3 {
+		t.Fatal("ctrl+z toggles back")
+	}
+}
+
+func TestSysToggle(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlG})
+	if _, _, _, showSys, _ := m.layout(); showSys {
+		t.Fatal("ctrl+g hides the system pane")
+	}
+}
+
+func TestChatTimestampsGroupSameNick(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = m.logChat("ada", "one")
+	m = m.logChat("ada", "two")
+	m = m.logChat("bo", "three")
+	lines := m.renderChatLines()
+	if len(lines) != 3 {
+		t.Fatalf("lines: %q", lines)
+	}
+	if strings.Contains(lines[1], "ada") {
+		t.Fatalf("grouped continuation must hide the nick: %q", lines[1])
+	}
+	if !strings.Contains(lines[0], "ada") || !strings.Contains(lines[2], "bo") {
+		t.Fatalf("timestamps/nicks missing: %q", lines)
+	}
+	for _, l := range lines {
+		if !strings.Contains(l, ":") { // HH:MM gutter on every line
+			t.Fatalf("no timestamp gutter: %q", l)
+		}
+	}
+}
+
+func TestSystemGutter(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = m.logEvent("> bo joined")
+	m = m.logEngine("> seek @1.0s")
+	for _, l := range m.renderSysLines() {
+		if !strings.HasPrefix(l, gutStyle.Render("▏")) {
+			t.Fatalf("system line lacks gutter: %q", l)
+		}
+	}
+}
+
+func TestJoinLeftColored(t *testing.T) {
+	// tests run without a TTY: force ANSI so lipgloss actually emits codes
+	orig := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(orig)
+	m := New("ada", nil, nil, false, nil)
+	if got := m.renderEntry(entry{kind: entEvent, text: "> bo joined"}, 60, false)[0]; got == dim.Render("· bo joined") {
+		t.Fatalf("join line still renders dim: %q", got)
+	}
+	if got := m.renderEntry(entry{kind: entEvent, text: "> bo left"}, 60, false)[0]; got == dim.Render("· bo left") {
+		t.Fatalf("left line still renders dim: %q", got)
+	}
+}
+
+func TestInviteHint(t *testing.T) {
+	api := room.New("http://100.101.102.103:8090", "ada-1")
+	m := New("ada", api, nil, false, nil)
+	m = m.syncViewport()
+	if !strings.Contains(m.vp.View(), "100.101.102.103:8090") {
+		t.Fatalf("invite hint missing: %q", m.vp.View())
+	}
+	m = m.logChat("ada", "hi")
+	m = m.syncViewport()
+	if strings.Contains(m.vp.View(), "invite") {
+		t.Fatalf("hint should vanish once chat exists: %q", m.vp.View())
+	}
+}
+
+func TestClickBarSeeks(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: false, Drift: 0})
+	m.now = "f"
+	m = upd(t, m, durationMsg{name: "f", dur: 100})
+	_, _, showBar, _, _ := m.layout()
+	if !showBar {
+		t.Fatal("precondition: bar visible")
+	}
+	click := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 3})
+	mm, cmd := m.Update(click)
+	if cmd == nil {
+		t.Fatal("bar click produced no seek command")
+	}
+	_ = mm
+	miss := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 8})
+	if _, cmd2 := m.Update(miss); cmd2 != nil {
+		t.Fatal("click off the bar row must not seek")
 	}
 }
