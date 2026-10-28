@@ -92,15 +92,16 @@ var (
 	gutStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	keyStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	// per-box border colors: each panel reads at a glance
-	bordPlay  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	bordPause = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	bordIdle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	bordWatch = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-	bordQueue = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	bordSys   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	bordChat  = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	bordMsg   = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	bordVibe  = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
+	bordPlay      = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	bordPause     = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	bordIdle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	bordWatch     = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	bordQueue     = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	bordQueueIdle = lipgloss.NewStyle().Foreground(lipgloss.Color("168")) // muted orchid: same family, quieter
+	bordSys       = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	bordChat      = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	bordMsg       = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	bordVibe      = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
 )
 
 // nudgeRe matches speed-nudge log lines ("[1.050]"): pure chatter whose
@@ -1163,9 +1164,9 @@ func (m Model) dashView() string {
 	if watH > 2 {
 		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), m.watcherLines(), bordWatch)...)
 	}
-	qBord := bordQueue // color means content: an empty queue never shouts pink
+	qBord := bordQueue // vivid pink: content
 	if len(m.queue) == 0 {
-		qBord = bordIdle
+		qBord = bordQueueIdle // muted orchid: same family, quieter than grey
 	}
 	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), qBord)...)
 	if sysH > 0 {
@@ -1197,11 +1198,16 @@ func (m Model) dashView() string {
 		role = "master"
 	}
 	header := joinLR(title.Render("▷ WATCHPARTY ")+roleStyle[role].Render(strings.ToUpper(role)), m.connChip(), m.width)
-	hotbar := dim.Render(" ") + keyStyle.Render("[ctrl+space]") + dim.Render(" play/pause · ") +
-		keyStyle.Render("[ctrl+←/→]") + dim.Render(" ±"+fmt.Sprintf("%.0f", seekStep)+"s · ") +
-		keyStyle.Render("[tab]") + dim.Render(" commands · ") +
-		keyStyle.Render("[ctrl+z]") + dim.Render(" movie · ") +
-		keyStyle.Render("[ctrl+g]") + dim.Render(" system")
+	// the hotbar echoes the panel hues: each shortcut wears the color of
+	// what it controls (green=playback, cyan=seek, purple=menu, amber=movie,
+	// orange=system pane)
+	hue := func(c string) lipgloss.Style { return lipgloss.NewStyle().Foreground(lipgloss.Color(c)) }
+	hotbar := dim.Render(" ") +
+		keyStyle.Render("[ctrl+space]") + hue("2").Render(" play/pause · ") +
+		keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
+		keyStyle.Render("[tab]") + hue("141").Render(" commands · ") +
+		keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
+		keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
 
 	var b strings.Builder
 	b.WriteString(header + "\n\n") // gap row: the header reads calmer off the band
