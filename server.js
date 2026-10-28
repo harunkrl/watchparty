@@ -143,10 +143,11 @@ function isClockOwner(from) {
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
 function advanceQueue() {
+  if (!state.now) return; // nothing playing: the queue keeps waiting (idle skip is a no-op)
   // enqueue checked the disk, but a file may have vanished since; never
   // auto-advance into a 404 that would hijack state.now
-  state.queue = state.now ? state.queue.filter((n) => list().includes(n)) : [];
-  if (state.queue.length && state.now) {
+  state.queue = state.queue.filter((n) => list().includes(n));
+  if (state.queue.length) {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
     broadcast({ type: 'load', name: state.now, from: null });
