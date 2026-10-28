@@ -60,24 +60,37 @@ client.stderr.on('data', (c) => {
 
 const events = [];
 const ctrl = new AbortController();
+// retry: the server may not be listening when the tap starts
 (async () => {
-  const res = await fetch(`${BASE}/events?id=test-run`, { signal: ctrl.signal });
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
+  const t0 = Date.now();
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    while (true) {
-      const i = buf.indexOf('\n\n');
-      if (i < 0) break;
-      const chunk = buf.slice(0, i);
-      buf = buf.slice(i + 2);
-      if (chunk.startsWith('data: ')) events.push(JSON.parse(chunk.slice(6)));
+    try {
+      const res = await fetch(`${BASE}/events?id=test-run`, { signal: ctrl.signal });
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buf += dec.decode(value, { stream: true });
+        while (true) {
+          const i = buf.indexOf('\n\n');
+          if (i < 0) break;
+          const chunk = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          if (chunk.startsWith('data: ')) events.push(JSON.parse(chunk.slice(6)));
+        }
+      }
+    } catch (e) {
+      if (ctrl.signal.aborted) return; // test cleanup, not an error
+      if (Date.now() - t0 > 5000) {
+        console.error(`sse tap gave up: ${e.message}`); // never die silently again
+        return;
+      }
+      await sleep(50);
     }
   }
-})().catch(() => {});
+})();
 
 function waitUntil(fn, ms = 20000) {
   return new Promise((resolve, reject) => {
