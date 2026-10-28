@@ -104,6 +104,16 @@ try {
   assert.equal(a.events[0].type, 'hello');
   await waitUntil(() => a.events.some((e) => e.type === 'join' && e.nick === 'Bob'));
 
+  // S5: health endpoint for watchdog/manual liveness checks
+  const health = await (await fetch(`${BASE}/health`)).json();
+  assert.equal(health.now, null);
+  assert.equal(health.queueLen, 0);
+  assert.ok(health.listeners >= 2, `listeners: ${health.listeners}`);
+
+  // S2: idle skip/ended is still a no-op but explains itself
+  await post({ type: 'skip', from: 'bob' });
+  await waitUntil(() => a.events.some((e) => e.type === 'notice' && e.text.includes('nothing playing')));
+
   // listing + subtitle sidecar
   const files = await (await fetch(`${BASE}/files`)).json();
   assert.deepEqual(files, ['movie one.mkv', 'movie two.mkv']);
@@ -115,6 +125,27 @@ try {
   writeFileSync(join(dir, 'movie one.es.srt'), '1\n00:00:00,000 --> 00:00:05,000\nhola\n');
   const subs = await (await fetch(`${BASE}/subs`)).json();
   assert.deepEqual(subs, ['movie one.es.srt', 'movie one.srt', 'movie one.tr.srt']);
+
+  // S1: natural sort — "movie2" before "movie10" (numeric collation)
+  writeFileSync(join(dir, 'movie2.mkv'), Buffer.alloc(1000, 1));
+  writeFileSync(join(dir, 'movie10.mkv'), Buffer.alloc(1000, 1));
+  writeFileSync(join(dir, 'movie2.tr.srt'), '1\n00:00:00,000 --> 00:00:05,000\nmerhaba\n');
+  writeFileSync(join(dir, 'sub2.srt'), '1\n00:00:00,000 --> 00:00:05,000\na\n');
+  writeFileSync(join(dir, 'sub10.srt'), '1\n00:00:00,000 --> 00:00:05,000\nb\n');
+  const naturalFiles = await (await fetch(`${BASE}/files`)).json();
+  assert.ok(naturalFiles.indexOf('movie2.mkv') < naturalFiles.indexOf('movie10.mkv'), `natural /files order: ${naturalFiles}`);
+  const naturalSubs = await (await fetch(`${BASE}/subs`)).json();
+  assert.ok(naturalSubs.indexOf('sub2.srt') < naturalSubs.indexOf('sub10.srt'), `natural /subs order: ${naturalSubs}`);
+
+  // S4: /library pairs each video with its subtitle siblings (client parity:
+  // a sub belongs to a video when its name starts with <video stem + ".">)
+  const library = await (await fetch(`${BASE}/library`)).json();
+  assert.ok(Array.isArray(library) && library.length >= 4, `library: ${JSON.stringify(library)}`);
+  assert.deepEqual(library.find((e) => e.name === 'movie one.mkv').subs,
+    ['movie one.es.srt', 'movie one.srt', 'movie one.tr.srt']);
+  assert.deepEqual(library.find((e) => e.name === 'movie2.mkv').subs, ['movie2.tr.srt']);
+  assert.deepEqual(library.find((e) => e.name === 'movie10.mkv').subs, []);
+  assert.deepEqual(library.find((e) => e.name === 'movie two.mkv').subs, []);
 
   // full + range video serving, original byte count
   const name = encodeURIComponent('movie one.mkv');
@@ -183,6 +214,7 @@ try {
   // load + queue + auto-advance (empty queue => no second load)
   await post({ type: 'enqueue', from: 'bob', name: 'movie one.mkv' });
   await waitUntil(() => a.events.some((e) => e.type === 'queue'));
+  assert.equal((await (await fetch(`${BASE}/health`)).json()).queueLen, 1, 'health queueLen tracks the queue');
   await post({ type: 'load', from: 'bob', name: 'movie one.mkv' });
   await waitUntil(() => a.events.some((e) => e.type === 'load'));
 
@@ -213,6 +245,22 @@ try {
     assert.ok(a.events.some((ev) => ev.type === t), `missing ${t}`);
   }
 
+  // S6 pin: the server relays zero/false wire values verbatim (the C7
+  // client fix relies on this) and the gates type-check junk away
+  await post({ type: 'seek', from: 'bob', t: 0 });
+  await post({ type: 'position', from: 'bob', t: 0, p: false });
+  await post({ type: 'seek', from: 'bob' }); // no t: gate must drop
+  await post({ type: 'position', from: 'bob', t: 'x' }); // string t: gate must drop
+  await waitUntil(() => a.events.some((e) => e.type === 'position' && e.t === 0));
+  await sleep(300);
+  const zeroSeek = a.events.filter((e) => e.type === 'seek' && e.t === 0);
+  assert.equal(zeroSeek.length, 1, 'seek t=0 relayed exactly once');
+  assert.ok('t' in zeroSeek[0], 'seek t=0 must carry t on the wire');
+  const falsePos = a.events.find((e) => e.type === 'position' && e.t === 0);
+  assert.ok('p' in falsePos && falsePos.p === false, 'position p=false must carry p on the wire');
+  assert.ok(!a.events.some((e) => e.type === 'seek' && !('t' in e)), 't-less seek must not relay');
+  assert.ok(!a.events.some((e) => e.type === 'position' && typeof e.t === 'string'), 'string-t position must not relay');
+
   // hello carries the live room position (age-adjusted) for late joiners
   await post({ type: 'position', from: 'bob', t: 43.5, p: true }); // paused master
   const c = sse('carol', 'Carol');
@@ -236,6 +284,23 @@ try {
   await waitUntil(() => er.events[0]);
   assert.equal(er.events[0].pos, undefined);
   er.close();
+
+  // S3: an optional dur on the heartbeat lets hello clamp long-downtime
+  // joins before EOF (pos 100 in a 50s file lands at dur-1)
+  await post({ type: 'position', from: 'bob', t: 100, p: true, dur: 50 });
+  const fred = sse('fred', 'Fred');
+  await waitUntil(() => fred.events[0]);
+  assert.equal(fred.events[0].pos, 49, `dur clamp: ${fred.events[0].pos}`);
+  fred.close();
+  // a fresh load clears the stale duration: the next position is unclamped
+  const loadsAt = a.events.filter((ev) => ev.type === 'load').length;
+  await post({ type: 'load', from: 'bob', name: 'movie one.mkv' });
+  await waitUntil(() => a.events.filter((ev) => ev.type === 'load').length === loadsAt + 1);
+  await post({ type: 'position', from: 'bob', t: 60, p: true });
+  const gina = sse('gina', 'Gina');
+  await waitUntil(() => gina.events[0]);
+  assert.equal(gina.events[0].pos, 60, `stale dur must not clamp: ${gina.events[0].pos}`);
+  gina.close();
 
   // R7 single-master election: bob owns the clock (his heartbeats above);
   // a second position poster is dropped with exactly one notice, and the

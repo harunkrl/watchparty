@@ -22,15 +22,20 @@ const nickById = new Map(); // client id -> nick (notices name people, not ids)
 // straight to the live room position instead of converging over seconds.
 // posAt is hrtime-based (monotonic): an NTP wall-clock jump between
 // heartbeats can no longer skew the age adjustment.
+// dur: optional duration the master reports with its heartbeats (S3) —
+// lets hello clamp long-downtime joins before EOF.
 const mono = () => Number(process.hrtime.bigint() / 1000000n);
-const state = { now: null, queue: [], pos: null, paused: false, posAt: 0 };
+const state = { now: null, queue: [], pos: null, paused: false, posAt: 0, dur: null };
 
-const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort();
+// S1: natural sort — "movie2" lists before "movie10" (numeric collation,
+// locale pinned to 'en' so a host locale change cannot reorder listings)
+const natural = new Intl.Collator('en', { numeric: true }).compare;
+const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort(natural);
 // R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) live next to the
 // videos; the client lists them per load and lets each user pick a track
 // locally — subtitle choice never enters the sync layer
 const SUB_RE = /\.(srt|ass|ssa|vtt)$/i;
-const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort();
+const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort(natural);
 
 // R9: recent chat replayed once to each NEW connection id — a joiner sees
 // what they missed; an SSE blip reconnect (same id) does not re-receive it.
@@ -51,7 +56,7 @@ let stateTimer = null;
 function stateSnapshot() {
   return JSON.stringify({
     now: state.now, queue: state.queue, pos: state.pos, paused: state.paused,
-    wall: Date.now(),
+    dur: state.dur, wall: Date.now(),
   });
 }
 function persistFail(e) {
@@ -98,6 +103,7 @@ process.on('SIGTERM', () => {
       state.pos = saved.pos;
       state.paused = !!saved.paused;
       state.posAt = mono() - Math.max(0, Date.now() - (saved.wall || Date.now()));
+      state.dur = typeof saved.dur === 'number' && saved.dur > 0 ? saved.dur : null;
     }
   }
   console.log(`watchparty: restored room state from ${STATE_FILE}`);
@@ -143,13 +149,19 @@ function isClockOwner(from) {
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
 function advanceQueue() {
-  if (!state.now) return; // nothing playing: the queue keeps waiting (idle skip is a no-op)
+  if (!state.now) {
+    // S2: idle skip/ended stays a no-op, but explains itself (every client
+    // renders notices; the queue keeps waiting)
+    broadcast({ type: 'notice', from: null, text: 'nothing playing; queue keeps waiting' });
+    return;
+  }
   // enqueue checked the disk, but a file may have vanished since; never
   // auto-advance into a 404 that would hijack state.now
   state.queue = state.queue.filter((n) => list().includes(n));
   if (state.queue.length) {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
+    state.dur = null; // so does its duration
     broadcast({ type: 'load', name: state.now, from: null });
     broadcast({ type: 'queue', queue: state.queue });
     saveState();
@@ -185,6 +197,9 @@ function handleCmd(cmd) {
       state.pos = cmd.t;
       state.paused = !!cmd.p;
       state.posAt = mono();
+      // S3: optional duration, same trust boundary as t; a heartbeat may
+      // omit it (the known value stays valid until the file changes)
+      if (typeof cmd.dur === 'number' && Number.isFinite(cmd.dur) && cmd.dur > 0) state.dur = cmd.dur;
       broadcast(cmd, cmd.from);
       saveState();
       break;
@@ -192,6 +207,7 @@ function handleCmd(cmd) {
       if (!list().includes(cmd.name)) break;
       state.now = cmd.name;
       state.pos = null; // old file's position is meaningless now
+      state.dur = null; // so is its duration
       state.queue = state.queue.filter((n) => n !== cmd.name);
       broadcast(cmd, cmd.from);
       saveState();
@@ -282,6 +298,24 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify(listSubs()));
   }
 
+  // S4: videos paired with their subtitle siblings — client parity: a sub
+  // belongs to a video when its name starts with <video stem + ".">
+  if (req.method === 'GET' && u.pathname === '/library') {
+    const subs = listSubs();
+    const library = list().map((f) => {
+      const stem = f.slice(0, f.length - path.extname(f).length);
+      return { name: f, subs: subs.filter((s) => s.startsWith(`${stem}.`)) };
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify(library));
+  }
+
+  // S5: watchdog / manual liveness probe
+  if (req.method === 'GET' && u.pathname === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ now: state.now, queueLen: state.queue.length, listeners: listeners.size }));
+  }
+
   if (req.method === 'GET' && u.pathname === '/events') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
@@ -298,6 +332,8 @@ const server = http.createServer((req, res) => {
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
       hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
+      // S3: a known duration keeps long-downtime joins before EOF
+      if (state.dur != null) hello.pos = Math.max(0, Math.min(hello.pos, state.dur - 1));
       hello.p = state.paused;
     }
     res.write(`data: ${JSON.stringify(hello)}\n\n`);
@@ -342,11 +378,13 @@ const server = http.createServer((req, res) => {
       try {
         const cmd = JSON.parse(body);
         // discrete cmd trace: who drove the room (position spam excluded).
-        // This is the log that pins echo/duplicate bugs (R-out1b)
+        // This is the log that pins echo/duplicate bugs (R-out1b).
+        // t is logged for seek only: C7 clients tag every cmd with t/p, and
+        // echoing it on chat/pause lines would bury the trace in noise
         if (cmd.type !== 'position') {
           // trace fields are client-supplied: clean() keeps ANSI escapes
           // out of the server log
-          console.log(`cmd: ${clean(cmd.type || '', 24)} from=${clean(String(cmd.from || ''), 32).slice(0, 8)}${cmd.t != null ? ` t=${Number(cmd.t).toFixed(1)}` : ''}${cmd.name ? ` name=${clean(cmd.name, 64)}` : ''}`);
+          console.log(`cmd: ${clean(cmd.type || '', 24)} from=${clean(String(cmd.from || ''), 32).slice(0, 8)}${cmd.type === 'seek' && cmd.t != null ? ` t=${Number(cmd.t).toFixed(1)}` : ''}${cmd.name ? ` name=${clean(cmd.name, 64)}` : ''}`);
         }
         handleCmd(cmd);
         res.writeHead(204);
