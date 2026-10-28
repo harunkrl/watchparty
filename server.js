@@ -143,6 +143,9 @@ function isClockOwner(from) {
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
 function advanceQueue() {
+  // enqueue checked the disk, but a file may have vanished since; never
+  // auto-advance into a 404 that would hijack state.now
+  state.queue = state.now ? state.queue.filter((n) => list().includes(n)) : [];
   if (state.queue.length && state.now) {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
@@ -164,6 +167,9 @@ function handleCmd(cmd) {
       broadcast(cmd, cmd.from);
       break;
     case 'seek':
+      // trust boundary: t must be a plain finite number, or state.pos (and
+      // every late joiner's hello.pos) gets poisoned with strings/objects
+      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t)) break;
       broadcast(cmd, cmd.from);
       break;
     case 'play':
@@ -173,6 +179,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'position':
+      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t)) break; // same trust boundary as seek
       if (!isClockOwner(cmd.from)) break;
       state.pos = cmd.t;
       state.paused = !!cmd.p;
@@ -207,7 +214,15 @@ function handleCmd(cmd) {
 // Serve the original file byte-for-byte. Only container-level HTTP Range
 // support, so players can seek; never any transcoding.
 function serveFile(req, res, file, ctype) {
-  const size = fs.statSync(file).size;
+  // the file can vanish between realpath and stat (TOCTOU); an unguarded
+  // throw here would take the whole server down
+  let size;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    res.writeHead(404);
+    return res.end();
+  }
   const headers = { 'content-type': ctype, 'accept-ranges': 'bytes', 'content-length': size };
   if (size === 0) { // 0-byte file: createReadStream would throw on end=-1
     res.writeHead(200, headers);
@@ -276,7 +291,9 @@ const server = http.createServer((req, res) => {
     const nick = clean(u.searchParams.get('nick') || id, 32);
     listeners.set(res, id);
     nickById.set(id, nick);
-    const hello = { type: 'hello', now: state.now, queue: state.queue };
+    // roster rides hello: late joiners must see everyone already in the
+    // room, not only the joins that happen after them
+    const hello = { type: 'hello', now: state.now, queue: state.queue, roster: [...new Set(nickById.values())] };
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
       hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
@@ -297,6 +314,10 @@ const server = http.createServer((req, res) => {
     req.on('close', () => {
       clearInterval(ping);
       listeners.delete(res);
+      // a same-id reconnect can register before the dead socket's close
+      // fires; only tear down presence when no live connection still
+      // carries this id
+      if ([...listeners.values()].includes(id)) return;
       if (id === clockOwner) clockOwner = null; // succeeded by the next heartbeat poster
       impostorSeen.delete(id);
       nickById.delete(id);
@@ -322,7 +343,9 @@ const server = http.createServer((req, res) => {
         // discrete cmd trace: who drove the room (position spam excluded).
         // This is the log that pins echo/duplicate bugs (R-out1b)
         if (cmd.type !== 'position') {
-          console.log(`cmd: ${cmd.type} from=${(cmd.from || '').slice(0, 8)}${cmd.t != null ? ` t=${+cmd.t.toFixed(1)}` : ''}${cmd.name ? ` name=${cmd.name}` : ''}`);
+          // trace fields are client-supplied: clean() keeps ANSI escapes
+          // out of the server log
+          console.log(`cmd: ${clean(cmd.type || '', 24)} from=${clean(String(cmd.from || ''), 32).slice(0, 8)}${cmd.t != null ? ` t=${Number(cmd.t).toFixed(1)}` : ''}${cmd.name ? ` name=${clean(cmd.name, 64)}` : ''}`);
         }
         handleCmd(cmd);
         res.writeHead(204);
