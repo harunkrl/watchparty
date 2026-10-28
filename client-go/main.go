@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -41,7 +42,12 @@ func main() {
 	name := flag.String("name", defaultNick(), "nickname shown to the room")
 	master := flag.Bool("master", false, "run on the host side; this player is the clock authority")
 	headless := flag.Bool("headless", false, "stdin/stdout mode (test harness)")
+	ver := flag.Bool("version", false, "print build version (git commit) and exit")
 	flag.Parse()
+	if *ver {
+		fmt.Println("watchparty", buildVersion())
+		return
+	}
 	args := flag.Args()
 	var base string
 	if len(args) == 0 && flag.NFlag() == 0 && !*headless {
@@ -230,4 +236,28 @@ func askURL() string {
 	}
 	os.Exit(2)
 	return ""
+}
+
+// buildVersion reports the git commit this binary was built from
+// (stamped by go build's VCS info) — the "am I on the new build?" check.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "(unknown: no build info)"
+	}
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return "(unknown: not built from a git checkout)"
+	}
+	return rev[:8] + dirty
 }
