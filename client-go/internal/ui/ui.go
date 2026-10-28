@@ -534,7 +534,8 @@ func (m Model) candidatesFor(v string) (items []compItem, isFile bool, verb, wor
 }
 
 // openMenu shows the completion menu (multiple matches); typing refilters,
-// enter accepts, esc closes.
+// enter accepts, esc closes. On terminals too short to spare a single row
+// it stays closed (Tab still inline-completes unique matches).
 func (m Model) openMenu() Model {
 	items, isFile, verb, word := m.candidatesFor(m.input.Value())
 	if len(items) == 0 {
@@ -543,6 +544,9 @@ func (m Model) openMenu() Model {
 	}
 	m.compOpen, m.compItems, m.compCursor = true, items, 0
 	m.compFile, m.compVerb, m.compWord = isFile, verb, word
+	if m.menuBudget() <= 0 {
+		m.compOpen = false
+	}
 	return m
 }
 
@@ -1082,10 +1086,10 @@ func padLines(lines []string, n int) []string {
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
 func (m Model) chatBoxH() int {
-	// header, hotbar, now band (7 with the bar's breathing rows), equalizer,
-	// message box, chat borders, minus the rows the open completion menu
-	// borrows from chat
-	return max(4, m.height-2-7-6-3-2-m.menuRows())
+	// header, hotbar, now band (7 with the bar's breathing rows), equalizer
+	// (short screens drop it), message box, chat borders; the open menu
+	// borrows from chat but never below the 4-row floor (menuBudget)
+	return max(4, m.height-2-7-m.vibeH()-3-2-m.menuBudget())
 }
 
 func (m Model) dashView() string {
@@ -1095,23 +1099,29 @@ func (m Model) dashView() string {
 	vp := m.vp
 	vp.Width, vp.Height = rightW-2, chatH
 
+	budget := avail - 7 // left-column rows under the band
 	watH := 2 + len(m.watcherLines())
 	sysH := 0
 	if !m.sysOff {
 		sysH = sysRows + 2
 	}
-	queueH := avail - 7 - sysH - watH               // minus the 7-row now-playing band
-	for n := sysRows; queueH < 4 && n > 2; n -= 3 { // cramped: shrink system first
-		sysH, queueH = n+2, queueH+3
+	queueH := budget - watH - sysH
+	for step := 0; queueH < 4 && step < 4; step++ { // cramped: shrink system, then watchers
+		switch step {
+		case 0:
+			sysH = min(sysH, 7) // 5 tail lines
+		case 1:
+			sysH = 0
+		case 2:
+			watH = 2
+		case 3:
+			queueH = 4
+		}
+		if step < 3 {
+			queueH = budget - watH - sysH
+		}
 	}
-	if queueH < 4 && sysH > 0 {
-		sysH, queueH = 0, queueH+sysH // then drop system entirely
-	}
-	if queueH < 4 && watH > 2 { // then hide watchers
-		queueH += watH - 2
-		watH = 2
-	}
-	queueH = max(queueH, 4)
+	queueH = max(4, queueH)
 
 	// the band's border breathes with playback: green, amber, idle grey
 	bord := bordIdle
@@ -1146,9 +1156,10 @@ func (m Model) dashView() string {
 	}
 	msg := []string{joinLR(in, hint, rightW-4)}
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
-	vibe := box(rightW, "EQUALIZER", m.vibePanel(rightW-6), bordVibe)
-	right := vibe
-	right = append(right, box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)...)
+	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)
+	if m.vibeH() > 0 {
+		right = append(box(rightW, "EQUALIZER", m.vibePanel(rightW-6), bordVibe), right...)
+	}
 	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
 
 	role := "follower"
@@ -1179,7 +1190,7 @@ func (m Model) dashView() string {
 		b.WriteString(l + " " + padCut(r, rightW) + "\n")
 	}
 	_ = avail
-	b.WriteString(hotbar + "\n")
+	b.WriteString(hotbar) // no trailing \n: it would render one row past the viewport and scroll the header off
 	return b.String()
 }
 
@@ -1189,12 +1200,13 @@ func (m Model) dashView() string {
 const menuMax = 6
 
 func (m Model) menuLines(w int) []string {
-	if !m.compOpen || len(m.compItems) == 0 {
+	budget := m.menuBudget()
+	if !m.compOpen || len(m.compItems) == 0 || budget <= 0 {
 		return nil
 	}
-	lo := max(0, min(m.compCursor-menuMax/2, len(m.compItems)-menuMax))
-	hi := min(len(m.compItems), lo+menuMax)
-	out := make([]string, 0, hi-lo)
+	lo := max(0, min(m.compCursor-(budget-1)/2, len(m.compItems)-budget))
+	hi := min(len(m.compItems), lo+budget)
+	out := make([]string, 0, budget)
 	for i := lo; i < hi; i++ {
 		it := m.compItems[i]
 		row := "   " + it.text
@@ -1206,18 +1218,33 @@ func (m Model) menuLines(w int) []string {
 		}
 		out = append(out, padCut(row, w))
 	}
-	if hi < len(m.compItems) { // more below the window
-		out = append(out, dim.Render(padCut(fmt.Sprintf("   … +%d more", len(m.compItems)-hi), w)))
+	if hi < len(m.compItems) && len(out) > 0 { // indicator stays inside the budget
+		out[len(out)-1] = dim.Render(padCut(fmt.Sprintf("   … +%d more (↓)", len(m.compItems)-hi+1), w))
 	}
 	return out
 }
 
-// menuRows is the layout budget the open menu consumes.
+// vibeH: the equalizer drops out on short screens — chat survives first.
+func (m Model) vibeH() int {
+	if m.height < 26 || m.zen {
+		return 0
+	}
+	return 6
+}
+
+// menuRows is the raw height the open menu wants (the more-indicator
+// replaces the last window row when truncated, so it needs no extra row).
 func (m Model) menuRows() int {
 	if !m.compOpen {
 		return 0
 	}
-	return min(len(m.compItems), menuMax) + 1 // +1 for the "more" row when windowed
+	return min(len(m.compItems), menuMax)
+}
+
+// menuBudget caps what the menu may borrow: chat never drops below 4 rows.
+func (m Model) menuBudget() int {
+	chat := m.height - 2 - 7 - m.vibeH() - 3 - 2
+	return min(m.menuRows(), max(0, chat-4))
 }
 
 func (m Model) View() string {
