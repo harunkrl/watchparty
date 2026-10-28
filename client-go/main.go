@@ -107,6 +107,7 @@ func main() {
 		// the bubbletea renderer owns the screen corrupts the frame
 		engine.Logf = func(f string, a ...any) { p.Send(ui.EngineLogMsg{Line: fmt.Sprintf(f, a...)}) }
 		p = tea.NewProgram(ui.New(*name, api, player, *master, engine), // set before goroutines: they Send on it
+			tea.WithAltScreen(),       // the dashboard owns the full viewport: the header can never scroll off
 			tea.WithMouseCellMotion()) // wheel scrolls chat; clicks on the bar seek
 	}
 
