@@ -110,6 +110,12 @@ try {
   const sub = await fetch(`${BASE}/sub/${encodeURIComponent('movie one.srt')}`);
   assert.equal(sub.status, 200);
 
+  // R8: subtitle siblings are listed for the client's track picker
+  writeFileSync(join(dir, 'movie one.tr.srt'), '1\n00:00:00,000 --> 00:00:05,000\nmerhaba\n');
+  writeFileSync(join(dir, 'movie one.es.srt'), '1\n00:00:00,000 --> 00:00:05,000\nhola\n');
+  const subs = await (await fetch(`${BASE}/subs`)).json();
+  assert.deepEqual(subs, ['movie one.es.srt', 'movie one.srt', 'movie one.tr.srt']);
+
   // full + range video serving, original byte count
   const name = encodeURIComponent('movie one.mkv');
   const full = await fetch(`${BASE}/v/${name}`);
@@ -160,6 +166,19 @@ try {
   const gotChat = a.events.find((e) => e.type === 'chat' && e.nick === 'x[2Jy');
   assert.equal(gotChat.text, 'tu]0;evil');
   evilSse.close();
+
+  // R9: chat history replays once to a NEW connection id (a late joiner
+  // sees what they missed); a same-id reconnect must not see it again
+  const lateHist = sse('latehist', 'LateHist');
+  await waitUntil(() => lateHist.events.some((e) => e.type === 'chat'));
+  const seen = lateHist.events.filter((e) => e.type === 'chat').map((e) => e.text);
+  assert.deepEqual(seen, ['selam', 'tu]0;evil']);
+  lateHist.close();
+  await sleep(200);
+  const lateHist2 = sse('latehist', 'LateHist');
+  await sleep(300);
+  assert.equal(lateHist2.events.filter((e) => e.type === 'chat').length, 0, 'no re-replay for the same id');
+  lateHist2.close();
 
   // load + queue + auto-advance (empty queue => no second load)
   await post({ type: 'enqueue', from: 'bob', name: 'movie one.mkv' });

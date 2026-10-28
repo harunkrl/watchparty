@@ -26,6 +26,18 @@ const mono = () => Number(process.hrtime.bigint() / 1000000n);
 const state = { now: null, queue: [], pos: null, paused: false, posAt: 0 };
 
 const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort();
+// R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) live next to the
+// videos; the client lists them per load and lets each user pick a track
+// locally — subtitle choice never enters the sync layer
+const SUB_RE = /\.(srt|ass|ssa|vtt)$/i;
+const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort();
+
+// R9: recent chat replayed once to each NEW connection id — a joiner sees
+// what they missed; an SSE blip reconnect (same id) does not re-receive it.
+// In-memory only: a server restart clears history.
+const CHAT_HISTORY = 50;
+const chatLog = [];
+const chatHistorySent = new Set();
 
 // R4: persist the room across restarts — a mid-film server restart used to
 // wipe now/queue, leaving fresh joiners an empty room. state.json next to
@@ -147,6 +159,10 @@ function handleCmd(cmd) {
   }
   switch (cmd.type) {
     case 'chat':
+      chatLog.push({ type: 'chat', nick: cmd.nick, text: cmd.text, from: cmd.from });
+      if (chatLog.length > CHAT_HISTORY) chatLog.shift();
+      broadcast(cmd, cmd.from);
+      break;
     case 'seek':
       broadcast(cmd, cmd.from);
       break;
@@ -245,6 +261,11 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify(list()));
   }
 
+  if (req.method === 'GET' && u.pathname === '/subs') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify(listSubs()));
+  }
+
   if (req.method === 'GET' && u.pathname === '/events') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
@@ -262,6 +283,15 @@ const server = http.createServer((req, res) => {
       hello.p = state.paused;
     }
     res.write(`data: ${JSON.stringify(hello)}\n\n`);
+    // R9: replay chat history to first-time connections only (same-id
+    // reconnects already have these lines in their TUI)
+    if (id && !chatHistorySent.has(id)) {
+      chatHistorySent.add(id); // per-process random ids: never re-replay one id
+      if (chatHistorySent.size > 1024) { // bound: drop the oldest insertion
+        for (const k of chatHistorySent) { chatHistorySent.delete(k); break; }
+      }
+      for (const ev of chatLog) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    }
     broadcast({ type: 'join', nick }, id);
     const ping = setInterval(() => res.write(': ping\n\n'), 15000);
     req.on('close', () => {

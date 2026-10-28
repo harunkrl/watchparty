@@ -71,9 +71,19 @@ Voice: keep a Discord/WhatsApp call open alongside.
 
 ## Subtitles
 
-Drop a `.srt` or `.ass` next to the video with the same basename
+Drop `.srt`/`.ass` files next to the video with the same basename
 (`Movie.mkv` + `Movie.srt`). The client attaches it automatically for
 everyone.
+
+Language siblings (`Movie.tr.srt`, `Movie.es.srt`, ...) all load as
+selectable tracks: each person presses `j` (cycle) or `J` (reverse) **in
+the mpv window** to pick their own language — subtitle choice is local,
+it never touches the sync layer. The plain `Movie.srt` (if present) is
+the default selected track.
+
+Chat is kept for late joiners too: the last 50 messages replay once to
+new connections (an SSE blip reconnect does not re-print them; a server
+restart clears history).
 
 ## Config
 

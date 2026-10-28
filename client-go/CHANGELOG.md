@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Room quality (P2):
+
+- subtitles: all language siblings (`Movie.tr.srt`, `Movie.es.srt`, ...)
+  load as selectable mpv tracks (new server `/subs` listing); each person
+  switches with `j`/`J` in the player window — the plain `Movie.srt`
+  stays the default selection, and subtitle choice never enters the sync
+  layer
+- chat history: the last 50 messages replay once to each NEW connection
+  (late joiners see what they missed; same-id SSE reconnects do not
+  re-receive them; in-memory only — a server restart clears it)
+
 WAN livability (P0):
 
 - follower: starvation-aware sync (F2 fix, live-measured) — a follower

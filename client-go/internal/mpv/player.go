@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -305,18 +306,55 @@ func (p *Player) Load(name string) error {
 		}
 	}
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
-	for _, ext := range []string{".srt", ".ass"} {
-		sub := fmt.Sprintf("%s/sub/%s", p.base, url.PathEscape(stem+ext))
-		resp, err := subClient.Get(sub)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			return p.tell("sub-add", sub, "auto")
+	// R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) ride along as
+	// selectable tracks — each user switches locally with mpv's j/J keys in
+	// the player window; subtitle choice never enters the sync layer. The
+	// plain <stem>.srt goes first and is selected, matching the old
+	// single-subtitle behaviour; the rest are added unselected.
+	subs, stemPrefix := p.subList(), stem+"."
+	ordered := make([]string, 0, len(subs))
+	for _, exact := range []string{stem + ".srt", stem + ".ass"} {
+		if slices.Contains(subs, exact) {
+			ordered = append(ordered, exact)
 		}
 	}
+	for _, s := range subs { // server list is sorted: en < es < tr ...
+		if strings.HasPrefix(s, stemPrefix) && !slices.Contains(ordered, s) {
+			ordered = append(ordered, s)
+		}
+	}
+	added := 0
+	for _, s := range ordered {
+		flag := "auto"
+		if added == 0 {
+			flag = "select" // show the default track immediately
+		}
+		if err := p.tell("sub-add", fmt.Sprintf("%s/sub/%s", p.base, url.PathEscape(s)), flag); err == nil {
+			added++
+		}
+	}
+	if added > 1 {
+		_ = p.ShowText(fmt.Sprintf("%d subtitles: press j in the player window to switch", added), 4000)
+	}
 	return nil
+}
+
+// subList fetches the server's subtitle listing; subtitles are best-effort
+// (python parity: a missing subtitle is not an error worth logging).
+func (p *Player) subList() []string {
+	resp, err := subClient.Get(p.base + "/subs")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var subs []string
+	if err := json.NewDecoder(resp.Body).Decode(&subs); err != nil {
+		return nil
+	}
+	return subs
 }
 
 // Poll samples player state every period into out until ctx is cancelled
