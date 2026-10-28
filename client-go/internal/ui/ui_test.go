@@ -218,6 +218,15 @@ func TestUpdateDiscreteEvents(t *testing.T) {
 	}
 }
 
+func TestHelloRosterSeedsWatchers(t *testing.T) {
+	m := New("late", nil, nil, false, nil)
+	m = upd(t, m, room.Event{Type: "join", Nick: "early"}) // stale join from before hello
+	m = upd(t, m, room.Event{Type: "hello", Queue: []string{}, Roster: []string{"ada", "late", "bo"}})
+	if len(m.peers) != 2 || !m.peers["ada"] || !m.peers["bo"] || m.peers["late"] || m.peers["early"] {
+		t.Fatalf("peers = %v, want exactly ada+bo from the roster", m.peers)
+	}
+}
+
 func TestFooterShowsDriftAndListeners(t *testing.T) {
 	p := 10.0
 	f := New("t", nil, nil, false, nil)
@@ -619,10 +628,11 @@ func TestChatTimestampsGroupSameNick(t *testing.T) {
 	if !strings.Contains(lines[0], "ada") || !strings.Contains(lines[2], "bo") {
 		t.Fatalf("timestamps/nicks missing: %q", lines)
 	}
-	for _, l := range lines {
-		if !strings.Contains(l, ":") { // HH:MM gutter on every line
-			t.Fatalf("no timestamp gutter: %q", l)
-		}
+	if !strings.Contains(lines[0], ":") || !strings.Contains(lines[2], ":") {
+		t.Fatalf("first lines lack the HH:MM gutter: %q", lines)
+	}
+	if !strings.Contains(lines[1], "▏") { // grouped line: speaker anchor, no repeated time
+		t.Fatalf("grouped continuation lacks the anchor: %q", lines[1])
 	}
 }
 

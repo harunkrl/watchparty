@@ -19,16 +19,17 @@ import (
 // (plan section 1, fixed wire name). `pos` is the hello-time media
 // position the server sends only when it has a live snapshot.
 type Event struct {
-	Type  string   `json:"type"`
-	Nick  string   `json:"nick,omitempty"`
-	Text  string   `json:"text,omitempty"`
-	Name  string   `json:"name,omitempty"`
-	Now   string   `json:"now,omitempty"`
-	Queue []string `json:"queue,omitempty"`
-	T     float64  `json:"t,omitempty"`
-	P     bool     `json:"p,omitempty"`
-	From  string   `json:"from,omitempty"`
-	Pos   *float64 `json:"pos,omitempty"`
+	Type   string   `json:"type"`
+	Nick   string   `json:"nick,omitempty"`
+	Text   string   `json:"text,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Now    string   `json:"now,omitempty"`
+	Queue  []string `json:"queue,omitempty"`
+	Roster []string `json:"roster,omitempty"`
+	T      float64  `json:"t,omitempty"`
+	P      bool     `json:"p,omitempty"`
+	From   string   `json:"from,omitempty"`
+	Pos    *float64 `json:"pos,omitempty"`
 }
 
 // readIdle bounds the SSE read silence before we declare the connection

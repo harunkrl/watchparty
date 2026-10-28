@@ -63,9 +63,10 @@ type entry struct {
 }
 
 var (
-	frame = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	dim   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	title = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	frame   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	dim     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	statLbl = lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // stat labels: readable, never competes with values
+	title   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
 
 	roleStyle = map[string]lipgloss.Style{
 		"master":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("3")),
@@ -736,6 +737,15 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 			c = fetchDuration(m.player, m.now)
 		}
 		m.queue = ev.Queue
+		// roster replaces guesswork: a late joiner sees everyone already in
+		// the room, not only the joins that happened after them
+		m.peers = map[string]bool{}
+		m.gone = nil // the roster is current truth: offline tags reset
+		for _, n := range ev.Roster {
+			if n != "" && n != m.nick {
+				m.peers[n] = true
+			}
+		}
 	case "join":
 		m.peers[ev.Nick] = true
 		for i, g := range m.gone { // a returning nick sheds its offline tag
@@ -975,27 +985,30 @@ func (m Model) stepEq() Model {
 }
 
 // vibePanel renders the spectrum-style equalizer: paired-width columns,
-// four rows tall, brighter with height. Live while playing (stepEq walk).
+// eight rows tall, one rainbow hue per column (decorative — never a state
+// signal). Live while playing (stepEq walk).
 func (m Model) vibePanel(w int) []string {
 	if len(m.eq) == 0 {
 		m = m.stepEq()
 	}
-	cols := max(4, (w-2)/3) // "██ " per column
+	const rows = 8
+	cols := max(4, (w-2)/3)                          // "██ " per column
+	pad := strings.Repeat(" ", max(0, (w-cols*3)/2)) // center: no dead gap on the right
 	heights := make([]int, cols)
 	for i := range heights {
 		v := 0.04
 		if i < len(m.eq) {
 			v = m.eq[i]
 		}
-		heights[i] = int(v * 3.99)
+		heights[i] = int(v * float64(rows) * 0.99)
 	}
-	rows := make([]string, 4) // top row first
-	for lvl := 4; lvl >= 1; lvl-- {
+	lines := make([]string, rows) // top row first
+	for lvl := rows; lvl >= 1; lvl-- {
 		var b strings.Builder
 		for _, h := range heights {
-			col := "84" // green
-			if lvl >= 3 {
-				col = "10" // bright green at the top
+			col := "2" // the progress bar's green: one playback color, not two
+			if lvl >= 7 {
+				col = "10" // bright tips on the top two rows
 			}
 			if h >= lvl {
 				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(col)).Render("██"))
@@ -1004,9 +1017,9 @@ func (m Model) vibePanel(w int) []string {
 			}
 			b.WriteString(" ")
 		}
-		rows[4-lvl] = strings.TrimRight(b.String(), " ")
+		lines[rows-lvl] = pad + strings.TrimRight(b.String(), " ")
 	}
-	return rows
+	return lines
 }
 
 func (m Model) nowPlayingLines(w int) []string {
@@ -1022,21 +1035,34 @@ func (m Model) nowPlayingLines(w int) []string {
 	if bar == "" {
 		bar = dim.Render("no position yet")
 	}
-	meta := ""
+	// stat row: one hue per fact, icons ride the segment color. Drift stays
+	// state-colored (green/amber/red) — the one genuinely semantic signal.
+	var stats []string
 	if m.st != nil && m.st.Pos != nil {
-		meta = fmt.Sprintf("%+.1fs drift", m.st.Drift)
+		if m.master {
+			clk := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+			stats = append(stats, clk.Render("◷ clock: master (reference)"))
+		} else {
+			ds := lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift)))
+			stats = append(stats, ds.Render(fmt.Sprintf("≈ drift %+.1fs", m.st.Drift)))
+		}
 		if m.st.Cache > 0 {
-			meta += fmt.Sprintf(" · buf %.1fs", m.st.Cache)
+			bs := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+			if m.st.Cache < 2 {
+				bs = pausedStyle // starved: warn amber
+			}
+			stats = append(stats, bs.Render(fmt.Sprintf("≡ buf %.1fs", m.st.Cache)))
 		}
 		if m.st.Volume > 0 {
-			meta += fmt.Sprintf(" · vol %.0f%%", m.st.Volume)
+			vs := lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+			stats = append(stats, vs.Render(fmt.Sprintf("♪ you: vol %.0f%%", m.st.Volume)))
 		}
 		if m.st.Paused {
-			meta += " · paused"
+			stats = append(stats, pausedStyle.Render("paused"))
 		}
 	}
 	// a blank row above and below the bar: the position reads calmer
-	return []string{style.Render(icon) + " " + name, "", bar, "", dim.Render(meta)}
+	return []string{style.Render(icon) + " " + name, "", bar, "", strings.Join(stats, statLbl.Render(" · "))}
 }
 
 func (m Model) watcherLines() []string {
@@ -1065,7 +1091,7 @@ func (m Model) sortedPeers() []string {
 
 func (m Model) queueLines() []string {
 	if len(m.queue) == 0 {
-		return []string{dim.Render("empty — /queue <file> to add")}
+		return []string{dim.Render("empty — ") + keyStyle.Render("/queue <file>") + dim.Render(" to add")}
 	}
 	out := make([]string, len(m.queue))
 	for i, q := range m.queue {
@@ -1086,15 +1112,15 @@ func padLines(lines []string, n int) []string {
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
 func (m Model) chatBoxH() int {
-	// header, hotbar, now band (7 with the bar's breathing rows), equalizer
-	// (short screens drop it), message box, chat borders; the open menu
-	// borrows from chat but never below the 4-row floor (menuBudget)
-	return max(4, m.height-2-7-m.vibeH()-3-2-m.menuBudget())
+	// header, gap, hotbar, now band (7 with the bar's breathing rows),
+	// equalizer (short screens drop it), message box, chat borders; the open
+	// menu borrows from chat but never below the 4-row floor (menuBudget)
+	return max(4, m.height-3-7-m.vibeH()-3-2-m.menuBudget())
 }
 
 func (m Model) dashView() string {
 	leftW, rightW := m.dashGeom()
-	avail := m.height - 2 // header + hotbar
+	avail := m.height - 3 // header + gap + hotbar
 	chatH := m.chatBoxH()
 	vp := m.vp
 	vp.Width, vp.Height = rightW-2, chatH
@@ -1121,7 +1147,7 @@ func (m Model) dashView() string {
 			queueH = budget - watH - sysH
 		}
 	}
-	queueH = max(4, queueH)
+	queueH = max(4, queueH) // stretches to fill the left column — no dead space
 
 	// the band's border breathes with playback: green, amber, idle grey
 	bord := bordIdle
@@ -1137,7 +1163,11 @@ func (m Model) dashView() string {
 	if watH > 2 {
 		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), m.watcherLines(), bordWatch)...)
 	}
-	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), bordQueue)...)
+	qBord := bordQueue // color means content: an empty queue never shouts pink
+	if len(m.queue) == 0 {
+		qBord = bordIdle
+	}
+	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), qBord)...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
 		if len(sys) > sysH-2 {
@@ -1174,8 +1204,8 @@ func (m Model) dashView() string {
 		keyStyle.Render("[ctrl+g]") + dim.Render(" system")
 
 	var b strings.Builder
-	b.WriteString(header + "\n")
-	for _, l := range band { // the now-playing band spans both columns
+	b.WriteString(header + "\n\n") // gap row: the header reads calmer off the band
+	for _, l := range band {       // the now-playing band spans both columns
 		b.WriteString(l + "\n")
 	}
 	rows := max(len(left), len(right))
@@ -1183,6 +1213,9 @@ func (m Model) dashView() string {
 		l, r := "", ""
 		if i < len(left) {
 			l = left[i]
+		} else if i < len(right) {
+			// left column spent: keep the right column in its lane
+			l = strings.Repeat(" ", leftW)
 		}
 		if i < len(right) {
 			r = right[i]
@@ -1229,7 +1262,7 @@ func (m Model) vibeH() int {
 	if m.height < 26 || m.zen {
 		return 0
 	}
-	return 6
+	return 10
 }
 
 // menuRows is the raw height the open menu wants (the more-indicator
@@ -1243,7 +1276,7 @@ func (m Model) menuRows() int {
 
 // menuBudget caps what the menu may borrow: chat never drops below 4 rows.
 func (m Model) menuBudget() int {
-	chat := m.height - 2 - 7 - m.vibeH() - 3 - 2
+	chat := m.height - 3 - 7 - m.vibeH() - 3 - 2
 	return min(m.menuRows(), max(0, chat-4))
 }
 
@@ -1399,7 +1432,7 @@ func sysIcon(body string) (string, lipgloss.Style) {
 	case tok == "err:":
 		return "✗ ", errStyle
 	case tok == "queued":
-		return "＋ ", bordQueue
+		return "+ ", bordQueue
 	case tok == "queue:":
 		return "≡ ", bordQueue
 	case strings.HasSuffix(body, " joined"):
@@ -1407,7 +1440,7 @@ func sysIcon(body string) (string, lipgloss.Style) {
 	case strings.HasSuffix(body, " left"):
 		return "← ", leftStyle
 	case strings.HasPrefix(body, "two masters"):
-		return "⚠ ", noticeStyle
+		return "! ", noticeStyle
 	case strings.HasPrefix(body, "[conn]"):
 		return "⌁ ", noticeStyle
 	case tok == "room:":
@@ -1419,13 +1452,14 @@ func sysIcon(body string) (string, lipgloss.Style) {
 func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 	switch e.kind {
 	case entChat:
-		var who string
-		if cont {
-			who = gutStyle.Render(strings.Repeat(" ", lipgloss.Width(e.nick))) // grouped: blank nick gutter
-		} else {
-			who = nickStyle(e.nick).Render(e.nick)
-		}
+		// first line: HH:MM + nick; grouped lines keep the message column but
+		// swap time+nick for a speaker-colored anchor (▏) — attribution without noise
+		who := nickStyle(e.nick).Render(e.nick)
 		prefix := timeStyle.Render(e.at.Format("15:04")) + " " + who + " "
+		if cont {
+			prefix = strings.Repeat(" ", 6) + " " +
+				nickStyle(e.nick).Render("▏") + strings.Repeat(" ", lipgloss.Width(e.nick)-1) + " "
+		}
 		return wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix)
 	case entEngine:
 		body := strings.TrimPrefix(e.text, "> ")
@@ -1553,13 +1587,16 @@ func (m Model) headerLines(cw int) (string, string) {
 func (m Model) connChip() string {
 	switch m.conn {
 	case "connected":
-		n := len(m.peers) + 1
+		// the count includes yourself: "alone" must never read as "someone is here"
+		w := "alone"
+		if n := len(m.peers); n > 0 {
+			w = fmt.Sprintf("you + %d", n)
+		}
 		up := ""
 		if !m.connSince.IsZero() {
 			up = " · up " + humanDur(time.Since(m.connSince))
 		}
-		plural := map[bool]string{true: "watcher", false: "watchers"}[n == 1]
-		return connStyle["connected"].Render(fmt.Sprintf("● connected · %d %s", n, plural)) + dim.Render(up)
+		return connStyle["connected"].Render("● connected · "+w) + dim.Render(up)
 	case "reconnecting":
 		return connStyle["reconnecting"].Render(fmt.Sprintf("○ retry %d · backoff %ds", m.retry, m.retryDelay))
 	case "lost":
@@ -1618,21 +1655,27 @@ func (m Model) progressBar(cw int) string {
 	return timeStyle.Render(elapsed) + " " + bar + " " + timeStyle.Render(total)
 }
 
+// driftColor bands drift for the footer and the dashboard stat row, so the
+// classic and dashboard layouts never disagree about what "bad" means.
+func driftColor(d float64) string {
+	switch {
+	case d > 1 || d < -1:
+		return "1" // hard re-seek territory
+	case d > 0.15 || d < -0.15:
+		return "3" // tempo-nudge territory
+	default:
+		return "2" // inside the smooth-sync band
+	}
+}
+
 // footerLine: queue preview on the left, the live sync gauge on the right.
 func (m Model) footerLine(cw int) string {
 	right := ""
 	if m.master {
 		right = dim.Render(fmt.Sprintf("%d listening", len(m.peers)))
 	} else if m.st != nil && m.st.Pos != nil {
-		d := m.st.Drift
-		col := "2" // inside the smooth-sync band
-		if d > 1 || d < -1 {
-			col = "1" // hard re-seek territory
-		} else if d > 0.15 || d < -0.15 {
-			col = "3" // tempo-nudge territory
-		}
-		right = lipgloss.NewStyle().Foreground(lipgloss.Color(col)).
-			Render(fmt.Sprintf("drift %+.1fs", d))
+		right = lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
+			Render(fmt.Sprintf("drift %+.1fs", m.st.Drift))
 	}
 	return joinLR(m.queuePreview(), right, cw)
 }
