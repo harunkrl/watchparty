@@ -376,6 +376,13 @@ func (e *Engine) masterTick(s mpv.State) {
 		return // nothing loaded yet
 	}
 	if s.Pause != e.lastPause && !s.Idle {
+		// a poll sampled while a remote pause was still landing can carry the
+		// pre-pause state; posting it flaps play->pause room-wide (R-out1b).
+		// Push events own transitions; the poll path is only a fallback for
+		// missed events, so samples contradicting a fresh actuation are stale.
+		if e.actuatePause != nil && *e.actuatePause != s.Pause && e.Clock.Since(e.lastActuate) < 3*time.Second {
+			return
+		}
 		typ := "play"
 		if s.Pause {
 			typ = "pause"

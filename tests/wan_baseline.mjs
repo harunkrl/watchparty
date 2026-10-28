@@ -164,6 +164,7 @@ async function phaseF2(ctx) {
 
   const samples = [];
   let playPostedAt = null;
+  const t0 = Date.now();
   const windowEnd = t0 + ctx.seconds * 1000;
   while (Date.now() < windowEnd) {
     const [mp, fp, fpaused, mpaused, fcache] = await Promise.all([

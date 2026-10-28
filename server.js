@@ -288,7 +288,13 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', () => {
       try {
-        handleCmd(JSON.parse(body));
+        const cmd = JSON.parse(body);
+        // discrete cmd trace: who drove the room (position spam excluded).
+        // This is the log that pins echo/duplicate bugs (R-out1b)
+        if (cmd.type !== 'position') {
+          console.log(`cmd: ${cmd.type} from=${(cmd.from || '').slice(0, 8)}${cmd.t != null ? ` t=${+cmd.t.toFixed(1)}` : ''}${cmd.name ? ` name=${cmd.name}` : ''}`);
+        }
+        handleCmd(cmd);
         res.writeHead(204);
       } catch {
         res.writeHead(400);

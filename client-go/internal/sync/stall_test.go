@@ -273,3 +273,32 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 		t.Fatalf("expired pending echo ate a scrub: %v", evType(t, po.events))
 	}
 }
+
+// TestStalePollNoPlayFlap (R-out1b): a poll sampled while a relayed pause was
+// still landing carries the pre-pause state; the master must not post play
+// off that stale sample — it flapped play->pause room-wide in ~1 of 5 WAN
+// runs right after a follower's stall-pause.
+func TestStalePollNoPlayFlap(t *testing.T) {
+	e, _, po := newEngine(true)
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // playing baseline
+	e.OnRoom(room.Event{Type: "pause"})             // relayed stall-pause applied
+
+	// the in-flight poll arrives after the apply, still saying "playing"
+	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false})
+	if n := countType(t, po.events, "play"); n != 0 {
+		t.Fatalf("stale poll posted play: %v", evType(t, po.events))
+	}
+	// the next poll agrees with the applied pause: heartbeats only, no play/pause flap
+	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: true})
+	if got := evType(t, po.events); len(got) != 2 || got[0] != "position" || got[1] != "position" {
+		t.Fatalf("expected two heartbeats, got %v", got)
+	}
+
+	// the poll fallback itself must survive: after the actuation window
+	// expires, a real user unpause (push event missed) still posts play
+	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 10 * time.Second}
+	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false})
+	if n := countType(t, po.events, "play"); n != 1 {
+		t.Fatalf("poll fallback for a real user unpause: %v", evType(t, po.events))
+	}
+}
