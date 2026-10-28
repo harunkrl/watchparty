@@ -536,18 +536,31 @@ func TestTabCompletionVerb(t *testing.T) {
 		t.Fatalf("single verb match: got %q, want /play ", got)
 	}
 	m.input.SetValue("/p")
-	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab}) // ambiguous: pick/play
-	if got := m.input.Value(); got != "/p" {
-		t.Fatalf("ambiguous keeps common prefix: got %q", got)
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab}) // ambiguous: pick/play -> menu
+	if !m.compOpen {
+		t.Fatal("ambiguous matches must open the menu")
 	}
-	found := false
-	for _, e := range m.log {
-		if e.kind == entEngine && strings.Contains(e.text, "pick") && strings.Contains(e.text, "play") {
-			found = true
+	var pick, play bool
+	for _, it := range m.compItems {
+		if it.text == "/pick" {
+			pick = true
+		}
+		if it.text == "/play" {
+			play = true
 		}
 	}
-	if !found {
-		t.Fatal("ambiguous matches not listed in the system pane")
+	if !pick || !play {
+		t.Fatalf("menu candidates: %+v", m.compItems)
+	}
+	// arrow to /play, enter accepts
+	for i, it := range m.compItems {
+		if it.text == "/play" {
+			m.compCursor = i
+		}
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if got := m.input.Value(); got != "/play " || m.compOpen {
+		t.Fatalf("menu accept: got %q open=%v", got, m.compOpen)
 	}
 }
 

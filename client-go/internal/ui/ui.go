@@ -7,6 +7,7 @@ package ui
 
 import (
 	"fmt"
+	"math/rand"
 	"regexp"
 	"sort"
 	"strings"
@@ -32,6 +33,9 @@ const (
 	dashMin   = 100 // two-column dashboard needs this many columns
 	dashMinH  = 20  // ... and this many rows; narrower falls back to the stacked layout
 	seekStep  = 5.0 // ctrl+arrow nudge, seconds
+	sysRows   = 13  // system tail lines in the dashboard
+	eqBars    = 28  // vibe equalizer bar count
+	eqPeriod  = 150 * time.Millisecond
 )
 
 type mode int
@@ -79,10 +83,23 @@ var (
 	joinStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	leftStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	seekStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	loadStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
 	nickColors   = []lipgloss.Color{"205", "45", "214", "84", "117", "212"}
 	pickCur      = lipgloss.NewStyle().Bold(true).Reverse(true)
 	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 	gutStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	keyStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	// per-box border colors: each panel reads at a glance
+	bordPlay  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	bordPause = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	bordIdle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	bordWatch = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	bordQueue = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	bordSys   = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
+	bordChat  = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
+	bordMsg   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	bordVibe  = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
 )
 
 // nudgeRe matches speed-nudge log lines ("[1.050]"): pure chatter whose
@@ -126,14 +143,27 @@ type Model struct {
 	mode       mode
 	pickItems  []string
 	pickCursor int
-	hist       []string // input history, newest last
-	histIdx    int      // -1 = live editing
-	draft      string   // saved while browsing history
-	zen        bool     // movie-night mode: one status line + input only
-	sysOff     bool     // ctrl+g: system pane hidden
-	gone       []string // departed nicks, shown offline (cap 5)
+	hist       []string  // input history, newest last
+	histIdx    int       // -1 = live editing
+	draft      string    // saved while browsing history
+	zen        bool      // movie-night mode: one status line + input only
+	sysOff     bool      // ctrl+g: system pane hidden
+	gone       []string  // departed nicks, shown offline (cap 5)
+	eq         []float64 // vibe equalizer bar heights 0..1
+	compOpen   bool      // Tab menu of command/file completions
+	compItems  []compItem
+	compCursor int
+	compFile   bool // completing a file argument (vs a verb)
+	compVerb   string
+	compWord   string
 	width      int
 	height     int
+}
+
+// compItem is one row of the Tab completion menu.
+type compItem struct {
+	text string
+	desc string
 }
 
 func New(nick string, api *room.Client, player *mpv.Player, master bool, engine *sync.Engine) Model {
@@ -153,8 +183,13 @@ func New(nick string, api *room.Client, player *mpv.Player, master bool, engine 
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.spin.Tick)
+	return tea.Batch(textinput.Blink, m.spin.Tick, tea.Tick(eqPeriod, eqTick))
 }
+
+// eqTick drives the vibe equalizer animation.
+func eqTick(time.Time) tea.Msg { return eqTickMsg{} }
+
+type eqTickMsg struct{}
 
 type StreamClosedMsg struct{}
 type MpvExitedMsg struct{}
@@ -280,6 +315,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		var sc tea.Cmd
 		m.spin, sc = m.spin.Update(msg)
 		return m, sc
+	case eqTickMsg:
+		return m.stepEq(), tea.Tick(eqPeriod, eqTick)
 	case room.Event:
 		return m.onEvent(msg)
 	case sync.UiState:
@@ -332,8 +369,27 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 
 // inputKeys handles typing plus history browsing and viewport scrolling.
 func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.compOpen { // the completion menu owns the keys while open
+		switch msg.String() {
+		case "enter":
+			m.acceptMenu()
+			return m, nil
+		case "up":
+			m.compCursor = max(0, m.compCursor-1)
+			return m, nil
+		case "down", "tab":
+			if m.compCursor < len(m.compItems)-1 {
+				m.compCursor++
+			}
+			return m, nil
+		case "esc":
+			m.compOpen = false
+			return m, nil
+		}
+	}
 	switch msg.String() {
 	case "enter":
+		m.compOpen = false
 		return m.submit()
 	case "esc":
 		m.input.SetValue("")
@@ -399,6 +455,9 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.lastErr = "" // fresh keystroke: the old feedback is obsolete
 		var c tea.Cmd
 		m.input, c = m.input.Update(msg)
+		if m.compOpen { // live refilter while the menu is up
+			m = m.openMenu()
+		}
 		return m, c
 	}
 	return m, nil
@@ -434,53 +493,90 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 // verbs is the tab-completion candidate set (cmd.Parse accepts these).
 var verbs = []string{"pick", "play", "queue", "skip", "chat", "list", "help", "quit"}
 
-// complete implements Tab completion: slash verbs while typing the first
-// word, server file names for /play and /queue arguments. Ambiguous
-// matches extend to the longest common prefix and list in the system pane.
-func (m Model) complete() (Model, tea.Cmd) {
-	v := m.input.Value()
+// verbDescs feeds the Tab menu.
+var verbDescs = map[string]string{
+	"pick":  "browse and play/queue",
+	"play":  "start a file for everyone",
+	"queue": "append to the shared queue",
+	"skip":  "jump to the next file",
+	"chat":  "send a message",
+	"list":  "list videos on the server",
+	"help":  "show commands",
+	"quit":  "exit",
+}
+
+// candidatesFor returns the completion matches for the current input:
+// slash verbs while typing the first word, file names for /play and
+// /queue arguments.
+func (m Model) candidatesFor(v string) (items []compItem, isFile bool, verb, word string) {
 	if v == "" || !strings.HasPrefix(v, "/") {
-		return m, nil
+		return nil, false, "", ""
 	}
-	verb, rest, hasArg := strings.Cut(strings.TrimPrefix(v, "/"), " ")
-	var pool []string
-	word := strings.TrimLeft(rest, " ")
+	verbPart, rest, hasArg := strings.Cut(strings.TrimPrefix(v, "/"), " ")
+	word = strings.TrimLeft(rest, " ")
 	if !hasArg {
-		pool, word = verbs, verb // completing the verb itself
-	} else if verb == "play" || verb == "queue" {
-		pool = m.files
-	} else {
-		return m, nil
-	}
-	var matches []string
-	for _, c := range pool {
-		if strings.HasPrefix(c, word) {
-			matches = append(matches, c)
+		for _, c := range verbs {
+			if strings.HasPrefix(c, verbPart) {
+				items = append(items, compItem{text: "/" + c, desc: verbDescs[c]})
+			}
 		}
+		return items, false, "", verbPart
 	}
-	if len(matches) == 0 {
-		return m, nil
-	}
-	com := matches[0]
-	for _, c := range matches[1:] {
-		for !strings.HasPrefix(c, com) {
-			com = com[:len(com)-1]
+	if verbPart == "play" || verbPart == "queue" {
+		for _, f := range m.files {
+			if strings.HasPrefix(f, word) {
+				items = append(items, compItem{text: f})
+			}
 		}
+		return items, true, verbPart, word
 	}
-	join := com
-	if len(matches) == 1 {
-		join += " "
-	} else {
-		m = m.logEngine("> " + strings.Join(matches, "   "))
+	return nil, false, verbPart, word
+}
+
+// openMenu shows the completion menu (multiple matches); typing refilters,
+// enter accepts, esc closes.
+func (m Model) openMenu() Model {
+	items, isFile, verb, word := m.candidatesFor(m.input.Value())
+	if len(items) == 0 {
+		m.compOpen = false
+		return m
 	}
-	if !hasArg {
-		m.input.SetValue("/" + join)
+	m.compOpen, m.compItems, m.compCursor = true, items, 0
+	m.compFile, m.compVerb, m.compWord = isFile, verb, word
+	return m
+}
+
+// acceptMenu fills the input from the selected row.
+func (m *Model) acceptMenu() {
+	if !m.compOpen || m.compCursor >= len(m.compItems) {
+		return
+	}
+	it := m.compItems[m.compCursor]
+	if m.compFile {
+		m.input.SetValue("/" + m.compVerb + " " + it.text + " ")
 	} else {
-		lead := rest[:len(rest)-len(word)] // keep any argument padding intact
-		m.input.SetValue("/" + verb + " " + lead + join)
+		m.input.SetValue(it.text + " ")
 	}
 	m.input.CursorEnd()
-	return m, nil
+	m.compOpen = false
+}
+
+// complete implements Tab: a single match fills inline; several open the
+// arrow-navigable menu.
+func (m Model) complete() (Model, tea.Cmd) {
+	items, _, _, _ := m.candidatesFor(m.input.Value())
+	if len(items) == 1 {
+		it := items[0]
+		if it.desc != "" { // verb
+			m.input.SetValue(it.text + " ")
+		} else { // file
+			v, _, _ := strings.Cut(strings.TrimPrefix(m.input.Value(), "/"), " ")
+			m.input.SetValue("/" + v + " " + it.text + " ")
+		}
+		m.input.CursorEnd()
+		return m, nil
+	}
+	return m.openMenu(), nil
 }
 
 // barClick turns a left click on the progress bar into a room seek.
@@ -839,15 +935,61 @@ func padCut(s string, w int) string {
 	return s + strings.Repeat(" ", max(0, w-lipgloss.Width(s)))
 }
 
-// box renders a mock-style titled panel: `╭─ TITLE ─╮` top, `│` sides.
-func box(w int, title string, lines []string) []string {
+// box renders a mock-style titled panel with a colored border:
+// `╭─ TITLE ─╮` top, `│` sides.
+func box(w int, title string, lines []string, border lipgloss.Style) []string {
 	t := "╭─ " + title + " "
-	top := t + strings.Repeat("─", max(1, w-lipgloss.Width(t)-1)) + "╮"
+	top := border.Render(t + strings.Repeat("─", max(1, w-lipgloss.Width(t)-1)) + "╮")
 	out := []string{top}
 	for _, l := range lines {
-		out = append(out, "│ "+padCut(l, w-4)+" │")
+		out = append(out, border.Render("│")+" "+padCut(l, w-4)+" "+border.Render("│"))
 	}
-	return append(out, "╰"+strings.Repeat("─", max(1, w-2))+"╯")
+	return append(out, border.Render("╰"+strings.Repeat("─", max(1, w-2))+"╯"))
+}
+
+// stepEq advances the vibe equalizer: a lively walk while the room plays,
+// a slow decay while paused, flat when nothing is loaded.
+func (m Model) stepEq() Model {
+	if len(m.eq) == 0 {
+		m.eq = make([]float64, eqBars)
+		for i := range m.eq {
+			m.eq[i] = 0.1
+		}
+	}
+	live := m.st != nil && m.st.Pos != nil && !m.st.Paused
+	for i := range m.eq {
+		switch {
+		case live:
+			m.eq[i] = min(1, max(0.08, m.eq[i]+(rand.Float64()-0.5)*0.55))
+		case m.st != nil && m.st.Pos != nil: // paused: settle low
+			m.eq[i] = max(0.06, m.eq[i]*0.85)
+		default: // nothing playing: flatline
+			m.eq[i] = 0.04
+		}
+	}
+	return m
+}
+
+// vibeLines renders the equalizer row: block runes by height, green that
+// brightens with amplitude.
+func (m Model) vibeLines(w int) string {
+	if len(m.eq) == 0 {
+		m = m.stepEq()
+	}
+	var b strings.Builder
+	for i, v := range m.eq {
+		if i >= w-6 {
+			break
+		}
+		lvl := int(v * 3.99)
+		runes := [4]string{"░", "▒", "▓", "█"}
+		col := "84" // green
+		if lvl >= 3 {
+			col = "10" // bright green at full amplitude
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(col)).Render(runes[lvl]))
+	}
+	return b.String()
 }
 
 func (m Model) nowPlayingLines(w int) []string {
@@ -880,7 +1022,7 @@ func (m Model) watcherLines() []string {
 	}
 	out := []string{"• " + nickStyle(m.nick).Render(m.nick) + dim.Render(" ("+role+")")}
 	for _, p := range m.sortedPeers() {
-		out = append(out, "• "+p)
+		out = append(out, "• "+nickStyle(p).Render(p))
 	}
 	for _, g := range m.gone {
 		out = append(out, dim.Render("• "+g+" (offline)"))
@@ -919,7 +1061,9 @@ func padLines(lines []string, n int) []string {
 // dashView assembles the two-column dashboard: a full-width NOW PLAYING
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
-func (m Model) chatBoxH() int { return max(4, m.height-2-5-3-2) } // header, hotbar, now band, message box, chat borders
+func (m Model) chatBoxH() int {
+	return max(4, m.height-2-5-3-3-2) // header, hotbar, now band, vibe, message box, chat borders
+}
 
 func (m Model) dashView() string {
 	leftW, rightW := m.dashGeom()
@@ -928,14 +1072,13 @@ func (m Model) dashView() string {
 	vp := m.vp
 	vp.Width, vp.Height = rightW-2, chatH
 
-	const sysLines = 7
 	watH := 2 + len(m.watcherLines())
 	sysH := 0
 	if !m.sysOff {
-		sysH = sysLines + 2
+		sysH = sysRows + 2
 	}
-	queueH := avail - 5 - sysH - watH                // minus the now-playing band
-	for n := sysLines; queueH < 4 && n > 2; n -= 3 { // cramped: shrink system first
+	queueH := avail - 5 - sysH - watH               // minus the now-playing band
+	for n := sysRows; queueH < 4 && n > 2; n -= 3 { // cramped: shrink system first
 		sysH, queueH = n+2, queueH+3
 	}
 	if queueH < 4 && sysH > 0 {
@@ -947,12 +1090,21 @@ func (m Model) dashView() string {
 	}
 	queueH = max(queueH, 4)
 
-	band := box(m.width, "NOW PLAYING", m.nowPlayingLines(m.width-4))
+	// the band's border breathes with playback: green, amber, idle grey
+	bord := bordIdle
+	if m.st != nil && m.st.Pos != nil {
+		if m.st.Paused {
+			bord = bordPause
+		} else {
+			bord = bordPlay
+		}
+	}
+	band := box(m.width, "NOW PLAYING", m.nowPlayingLines(m.width-4), bord)
 	var left []string
 	if watH > 2 {
-		left = append(left, box(leftW, "WATCHERS", m.watcherLines())...)
+		left = append(left, box(leftW, "WATCHERS", m.watcherLines(), bordWatch)...)
 	}
-	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2))...)
+	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), bordQueue)...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
 		if len(sys) > sysH-2 {
@@ -961,7 +1113,7 @@ func (m Model) dashView() string {
 		for len(sys) < sysH-2 {
 			sys = append(sys, "")
 		}
-		left = append(left, box(leftW, "SYSTEM", sys)...)
+		left = append(left, box(leftW, "SYSTEM", sys, bordSys)...)
 	}
 
 	in := strings.TrimRight(m.input.View(), " ")
@@ -969,15 +1121,23 @@ func (m Model) dashView() string {
 	if m.lastErr != "" {
 		hint = errStyle.Render(m.lastErr)
 	}
-	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"))
-	right = append(right, box(rightW, "MESSAGE", []string{joinLR(in, hint, rightW-4)})...)
+	msg := []string{joinLR(in, hint, rightW-4)}
+	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
+	vibe := box(rightW, "VIBE", []string{m.vibeLines(rightW - 6)}, bordVibe)
+	right := vibe
+	right = append(right, box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)...)
+	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
 
 	role := "follower"
 	if m.master {
 		role = "master"
 	}
 	header := joinLR(title.Render("▷ WATCHPARTY ")+roleStyle[role].Render(strings.ToUpper(role)), m.connChip(), m.width)
-	hotbar := dim.Render("[ctrl+space] play/pause · [ctrl+←/→] ±" + fmt.Sprintf("%.0f", seekStep) + "s · [tab] complete · [ctrl+z] movie · [ctrl+g] system")
+	hotbar := dim.Render(" ") + keyStyle.Render("[ctrl+space]") + dim.Render(" play/pause · ") +
+		keyStyle.Render("[ctrl+←/→]") + dim.Render(" ±"+fmt.Sprintf("%.0f", seekStep)+"s · ") +
+		keyStyle.Render("[tab]") + dim.Render(" commands · ") +
+		keyStyle.Render("[ctrl+z]") + dim.Render(" movie · ") +
+		keyStyle.Render("[ctrl+g]") + dim.Render(" system")
 
 	var b strings.Builder
 	b.WriteString(header + "\n")
@@ -997,6 +1157,28 @@ func (m Model) dashView() string {
 	}
 	b.WriteString(hotbar + "\n")
 	return b.String()
+}
+
+// menuLines renders the open completion menu: selected row reversed,
+// descriptions dim. Empty when closed.
+func (m Model) menuLines(w int) []string {
+	if !m.compOpen {
+		return nil
+	}
+	out := make([]string, 0, len(m.compItems))
+	for i, it := range m.compItems {
+		row := it.text
+		if i == m.compCursor {
+			row = pickCur.Render(" ▸ " + it.text + " ")
+		} else {
+			row = "   " + it.text
+		}
+		if it.desc != "" {
+			row += dim.Render("  " + it.desc)
+		}
+		out = append(out, padCut(row, w))
+	}
+	return out
 }
 
 func (m Model) View() string {
@@ -1022,6 +1204,9 @@ func (m Model) View() string {
 		}
 	}
 	b.WriteString(vp.View() + "\n")
+	for _, l := range m.menuLines(cw) { // stacked layout: the menu floats above the input
+		b.WriteString(l + "\n")
+	}
 	if !m.zen {
 		if showSys {
 			b.WriteString(m.sysDivider(cw) + "\n")
@@ -1146,6 +1331,14 @@ func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 		body := strings.TrimPrefix(e.text, "> ")
 		style := dim
 		switch {
+		case body == "play":
+			style = playingStyle
+		case body == "pause":
+			style = pausedStyle
+		case strings.HasPrefix(body, "seek @"):
+			style = seekStyle
+		case strings.HasPrefix(body, "load "), strings.HasPrefix(body, "playing "):
+			style = loadStyle
 		case strings.HasSuffix(body, " joined"):
 			style = joinStyle
 		case strings.HasSuffix(body, " left"):
