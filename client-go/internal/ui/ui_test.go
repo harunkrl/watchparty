@@ -563,7 +563,7 @@ func TestTabCompletionFile(t *testing.T) {
 
 func TestZenModeCollapses(t *testing.T) {
 	m := New("ada", nil, nil, false, nil)
-	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30}) // stacked zone: >=100 is the dashboard
 	_, vh, showBar, showSys, showFooter := m.layout()
 	if !showSys || !showFooter {
 		t.Fatalf("precondition: optional rows visible at h=30 (%v %v %v)", showBar, showSys, showFooter)
@@ -654,7 +654,7 @@ func TestInviteHint(t *testing.T) {
 
 func TestClickBarSeeks(t *testing.T) {
 	m := New("ada", nil, nil, false, nil)
-	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30}) // stacked layout: the dashboard owns >=100
 	pos := 10.0
 	m = upd(t, m, sync.UiState{Pos: &pos, Paused: false, Drift: 0})
 	m.now = "f"
@@ -672,5 +672,43 @@ func TestClickBarSeeks(t *testing.T) {
 	miss := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 8})
 	if _, cmd2 := m.Update(miss); cmd2 != nil {
 		t.Fatal("click off the bar row must not seek")
+	}
+}
+
+func TestDashboardRenders(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = m.logChat("bo", "selam")
+	m = m.syncViewport()
+	v := m.View()
+	for _, want := range []string{"NOW PLAYING", "WATCHERS", "QUEUE", "CHAT", "MESSAGE", "ctrl+space", "ada (you)"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("dashboard missing %q", want)
+		}
+	}
+	if strings.Contains(v, "invite them") {
+		t.Fatal("invite hint must not render once chat exists")
+	}
+}
+
+func TestDashboardFallbackBelow100Cols(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 99, Height: 30})
+	if strings.Contains(m.View(), "NOW PLAYING") {
+		t.Fatal("dashboard must not render below 100 columns")
+	}
+}
+
+func TestWatchersOfflineTag(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, room.Event{Type: "join", Nick: "bo"})
+	m = upd(t, m, room.Event{Type: "bye", Nick: "bo"})
+	lines := strings.Join(m.watcherLines(), "\n")
+	if !strings.Contains(lines, "bo (offline)") {
+		t.Fatalf("offline tag missing: %q", lines)
+	}
+	m = upd(t, m, room.Event{Type: "join", Nick: "bo"})
+	if strings.Contains(strings.Join(m.watcherLines(), "\n"), "offline") {
+		t.Fatal("returning nick keeps its offline tag")
 	}
 }

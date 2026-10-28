@@ -302,3 +302,42 @@ func TestStalePollNoPlayFlap(t *testing.T) {
 		t.Fatalf("poll fallback for a real user unpause: %v", evType(t, po.events))
 	}
 }
+
+// TestPauseToggleAndSeekBy: the TUI hotkeys apply locally AND post — the
+// server never echoes a poster's own events back (R12 dashboard hotkeys).
+func TestPauseToggleAndSeekBy(t *testing.T) {
+	// master: pause flips, posts pause; seek posts the clamped target
+	e, pl, po := newEngine(true)
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
+	pl.pos = ptr(10) // SeekBy reads the player, not the poll state
+	e.PauseToggle()
+	if len(pl.pauses) != 1 || !pl.pauses[0] {
+		t.Fatalf("master PauseToggle did not pause locally: %v", pl.pauses)
+	}
+	if countType(t, po.events, "pause") != 1 {
+		t.Fatalf("master PauseToggle did not post: %v", evType(t, po.events))
+	}
+	e.PauseToggle()
+	if countType(t, po.events, "play") != 1 {
+		t.Fatalf("resume post missing: %v", evType(t, po.events))
+	}
+	e.SeekBy(-30) // below zero: clamp to 0
+	last := po.events[len(po.events)-1]
+	if last.Type != "seek" || last.T != 0 {
+		t.Fatalf("seek clamp: %+v", last)
+	}
+	if len(pl.seeks) != 1 {
+		t.Fatalf("local seek missing: %v", pl.seeks)
+	}
+
+	// follower: needs a snapshot; toggle mirrors it and posts
+	f, fpl, fpo := newEngine(false)
+	f.OnRoom(masterAt(20, false))
+	f.PauseToggle()
+	if countType(t, fpo.events, "pause") != 1 {
+		t.Fatalf("follower PauseToggle post missing: %v", evType(t, fpo.events))
+	}
+	if len(fpl.pauses) != 1 || !fpl.pauses[0] {
+		t.Fatalf("follower local pause missing: %v", fpl.pauses)
+	}
+}

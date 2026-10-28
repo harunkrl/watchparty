@@ -4,6 +4,14 @@
 
 Room quality (P2):
 
+- TUI dashboard: terminals of 100+ columns get a two-column layout —
+  now-playing (bar, drift, pause state), watchers (join/leave list with
+  offline tags), queue and the system log on the left; the conversation
+  and a boxed input on the right; a hotkey hint bar at the bottom.
+  Narrower terminals keep the stacked layout. New room-wide hotkeys:
+  ctrl+space toggles play/pause, ctrl+arrows nudge ±5 s — both apply
+  locally and post, because the server never echoes a poster's own
+  events back
 - TUI overhaul: chat lines carry a timestamp gutter and group under one
   nickname while consecutive; the system pane sits behind a thin left
   gutter so conversation pops; join/left/notice lines are color-coded;

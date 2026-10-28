@@ -257,6 +257,51 @@ func (e *Engine) OwnLoad(name string) {
 	e.behind, e.autoPaused = 0, false
 }
 
+// PauseToggle is the TUI hotkey equivalent of a space-bar press in the
+// mpv window: apply locally AND post — the server never echoes a poster's
+// own event back, so posting alone would leave this player unsynced.
+func (e *Engine) PauseToggle() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var want bool
+	if e.Master {
+		want = !e.lastPause
+		e.lastPause = want
+	} else {
+		if e.snap == nil {
+			return
+		}
+		want = !e.snap.paused
+		e.snap.paused = want // mirror: the echo event must not re-post
+	}
+	e.setPause(want)
+	e.lastPost = e.Clock.Now()
+	typ := "play"
+	if want {
+		typ = "pause"
+	}
+	e.postDiscrete(room.Event{Type: typ})
+}
+
+// SeekBy is the TUI hotkey nudge (ctrl+arrow): seek locally and post the
+// target — seekTo marks the echo so the resulting mpv event is consumed,
+// never re-posted.
+func (e *Engine) SeekBy(dt float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t, ok := e.Player.Pos()
+	if !ok {
+		return
+	}
+	t = max(0, t+dt)
+	e.seekTo(t)
+	e.lastPost = e.Clock.Now()
+	e.postDiscrete(room.Event{Type: "seek", T: t})
+	if e.Master {
+		e.lastPos = nil // scrub-check restarts fresh (no double post)
+	}
+}
+
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()

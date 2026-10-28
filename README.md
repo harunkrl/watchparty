@@ -59,16 +59,20 @@ Everything you type goes to the room as chat. Commands start with `/`:
 | `/skip` | jump to the next file in the queue (same as the current file ending) |
 | `/quit` | exit |
 
-The TUI has a few shortcuts beyond the slash commands:
+The TUI has a few shortcuts beyond the slash commands (wide terminals
+get a two-column dashboard: now-playing, watchers, queue and system log
+on the left; chat and input on the right):
 
 | Key | Effect |
 |---|---|
 | `↑` / `↓` | recall what you typed before (input history) |
 | `Tab` | complete `/commands` and file names |
+| `ctrl+space` | play/pause for the whole room |
+| `ctrl+←` / `ctrl+→` | seek everyone ∓5 s / ±5 s |
 | `ctrl+z` | movie mode: collapse to one status line + chat + input |
 | `ctrl+g` | hide/show the system pane (join/leave/sync chatter) |
 | mouse wheel | scroll the chat |
-| click on the bar | seek everyone there |
+| click on the bar | seek everyone there (stacked layout) |
 
 Note: with mouse on, terminal text selection needs `shift` held.
 

@@ -8,6 +8,7 @@ package ui
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,7 +28,10 @@ import (
 const (
 	logCap    = 500
 	histCap   = 100
-	durProbes = 20 // duration fetch retries after a load (500ms apart)
+	durProbes = 20  // duration fetch retries after a load (500ms apart)
+	dashMin   = 100 // two-column dashboard needs this many columns
+	dashMinH  = 20  // ... and this many rows; narrower falls back to the stacked layout
+	seekStep  = 5.0 // ctrl+arrow nudge, seconds
 )
 
 type mode int
@@ -87,7 +91,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -127,6 +131,7 @@ type Model struct {
 	draft      string   // saved while browsing history
 	zen        bool     // movie-night mode: one status line + input only
 	sysOff     bool     // ctrl+g: system pane hidden
+	gone       []string // departed nicks, shown offline (cap 5)
 	width      int
 	height     int
 }
@@ -337,6 +342,20 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, tea.Quit
 	case "tab":
 		return m.complete()
+	case "ctrl+@": // ctrl+space sends NUL: play/pause without leaving the chat
+		if m.engine != nil {
+			m.engine.PauseToggle()
+		}
+		return m, nil
+	case "ctrl+left", "ctrl+right":
+		if m.engine != nil {
+			dt := -seekStep
+			if msg.String() == "ctrl+right" {
+				dt = seekStep
+			}
+			m.engine.SeekBy(dt)
+		}
+		return m, nil
 	case "ctrl+z": // movie-night mode: one status line + chat + input.
 		// ctrl+m is unreachable: terminals send CR for it (== enter)
 		m.zen = !m.zen
@@ -468,6 +487,9 @@ func (m Model) complete() (Model, tea.Cmd) {
 // The bar renders on screen row 3 (border + two header lines) and starts
 // at column frame-left + 1; the click's column maps linearly to time.
 func (m Model) barClick(msg tea.MouseMsg) tea.Cmd {
+	if m.dashOn() && !m.zen {
+		return nil // the dashboard bar lives inside its box; ctrl+←/→ nudges instead
+	}
 	_, _, showBar, _, _ := m.layout()
 	if !showBar || m.zen || m.mode == modePick ||
 		msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress ||
@@ -616,8 +638,18 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		m.queue = ev.Queue
 	case "join":
 		m.peers[ev.Nick] = true
+		for i, g := range m.gone { // a returning nick sheds its offline tag
+			if g == ev.Nick {
+				m.gone = append(m.gone[:i], m.gone[i+1:]...)
+				break
+			}
+		}
 	case "bye":
 		delete(m.peers, ev.Nick)
+		m.gone = append(m.gone, ev.Nick)
+		if len(m.gone) > 5 {
+			m.gone = m.gone[len(m.gone)-5:]
+		}
 	case "load": // auto-advance and other people's plays (own loads arrive as loadedMsg)
 		if ev.Name != m.now {
 			m.now = ev.Name
@@ -703,6 +735,10 @@ func (m Model) syncViewport() Model {
 // optional rows degrade first (bar, system strip, footer); chat survives
 // longest — the layout never splits horizontally.
 func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
+	if !m.zen && m.dashOn() { // dashboard: the chat box owns the right column
+		_, r := m.dashGeom()
+		return r - 2, m.chatBoxH(), false, false, false
+	}
 	cw = m.contentWidth()
 	inner := m.height - frame.GetVerticalFrameSize()
 	if inner < 3 {
@@ -762,9 +798,206 @@ func (m Model) inviteLines() string {
 		dim.Render("(everything you type here goes to the room as chat)")
 }
 
+// dashOn reports whether the two-column dashboard fits.
+func (m Model) dashOn() bool { return m.width >= dashMin && m.height >= dashMinH }
+
+// dashGeom returns the two column widths (left: fixed-ish panels, right:
+// chat + input) with a single space between them.
+func (m Model) dashGeom() (leftW, rightW int) {
+	leftW = min(40, m.width/3)
+	return leftW, m.width - leftW - 1
+}
+
+// chatWidth is where conversation wraps: the right column's inner width
+// in dashboard mode, the frame width otherwise.
+func (m Model) chatWidth() int {
+	if !m.zen && m.dashOn() {
+		_, r := m.dashGeom()
+		return r - 2
+	}
+	return m.contentWidth()
+}
+
+// sysWidth is where system lines wrap: the left column's box in dashboard
+// mode, the frame width otherwise.
+func (m Model) sysWidth() int {
+	if !m.zen && m.dashOn() {
+		l, _ := m.dashGeom()
+		return l - 4
+	}
+	return m.contentWidth()
+}
+
+// padCut pads a (possibly styled) string to exactly w visible columns,
+// hard-truncating from the right when over-wide (wrapped lines fit, so
+// the truncation path only hits pathological unbreakables).
+func padCut(s string, w int) string {
+	for lipgloss.Width(s) > w {
+		_, sz := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-sz]
+	}
+	return s + strings.Repeat(" ", max(0, w-lipgloss.Width(s)))
+}
+
+// box renders a mock-style titled panel: `╭─ TITLE ─╮` top, `│` sides.
+func box(w int, title string, lines []string) []string {
+	t := "╭─ " + title + " "
+	top := t + strings.Repeat("─", max(1, w-lipgloss.Width(t)-1)) + "╮"
+	out := []string{top}
+	for _, l := range lines {
+		out = append(out, "│ "+padCut(l, w-4)+" │")
+	}
+	return append(out, "╰"+strings.Repeat("─", max(1, w-2))+"╯")
+}
+
+func (m Model) nowPlayingLines(w int) []string {
+	name := m.now
+	if name == "" {
+		name = "— nothing playing"
+	}
+	icon, style := "▶", playingStyle
+	if m.st != nil && m.st.Paused {
+		icon, style = "⏸", pausedStyle
+	}
+	bar := m.progressBar(w)
+	if bar == "" {
+		bar = dim.Render("no position yet")
+	}
+	meta := ""
+	if m.st != nil && m.st.Pos != nil {
+		meta = fmt.Sprintf("%+.1fs drift", m.st.Drift)
+		if m.st.Paused {
+			meta += " · paused"
+		}
+	}
+	return []string{style.Render(icon) + " " + name, bar, dim.Render(meta)}
+}
+
+func (m Model) watcherLines() []string {
+	role := "you"
+	if m.master {
+		role = "you · master"
+	}
+	out := []string{"• " + nickStyle(m.nick).Render(m.nick) + dim.Render(" ("+role+")")}
+	for _, p := range m.sortedPeers() {
+		out = append(out, "• "+p)
+	}
+	for _, g := range m.gone {
+		out = append(out, dim.Render("• "+g+" (offline)"))
+	}
+	return out
+}
+
+func (m Model) sortedPeers() []string {
+	out := make([]string, 0, len(m.peers))
+	for p := range m.peers {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m Model) queueLines() []string {
+	if len(m.queue) == 0 {
+		return []string{dim.Render("empty — /queue <file> to add")}
+	}
+	out := make([]string, len(m.queue))
+	for i, q := range m.queue {
+		out[i] = fmt.Sprintf("%d. %s", i+1, q)
+	}
+	return out
+}
+
+// padLines grows a slice with empty rows so its box has a stable height.
+func padLines(lines []string, n int) []string {
+	for len(lines) < n {
+		lines = append(lines, "")
+	}
+	return lines
+}
+
+// dashView assembles the two-column dashboard: left carries playback
+// state, watchers, queue and the system log; the right column is the
+// conversation with the input box under it. A hotkey hint bar closes.
+func (m Model) chatBoxH() int { return max(4, m.height-2-3-2) } // rows minus header, hotbar, message box, chat borders
+
+func (m Model) dashView() string {
+	leftW, rightW := m.dashGeom()
+	avail := m.height - 2 // header + hotbar
+	chatH := m.chatBoxH()
+	vp := m.vp
+	vp.Width, vp.Height = rightW-2, chatH
+
+	nowH, sysH, watH := 5, 0, 2+len(m.watcherLines())
+	if !m.sysOff {
+		sysH = 4
+	}
+	queueH := avail - nowH - sysH - watH
+	if queueH < 4 { // cramped: drop the system box, then the watchers
+		if sysH > 0 {
+			sysH, queueH = 0, queueH+sysH
+		}
+		if queueH < 4 && watH > 2 {
+			queueH += watH - 2
+			watH = 2
+		}
+		queueH = max(queueH, 4)
+	}
+
+	left := box(leftW, "NOW PLAYING", m.nowPlayingLines(leftW-4))
+	if watH > 2 {
+		left = append(left, box(leftW, "WATCHERS", m.watcherLines())...)
+	}
+	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2))...)
+	if sysH > 0 {
+		sys := m.renderSysLinesAt(leftW - 4)
+		if len(sys) > 2 {
+			sys = sys[len(sys)-2:] // a glanceable tail, never a reading surface
+		}
+		for len(sys) < 2 {
+			sys = append(sys, "")
+		}
+		left = append(left, box(leftW, "SYSTEM", sys)...)
+	}
+
+	in := strings.TrimRight(m.input.View(), " ")
+	hint := ""
+	if m.lastErr != "" {
+		hint = errStyle.Render(m.lastErr)
+	}
+	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"))
+	right = append(right, box(rightW, "MESSAGE", []string{joinLR(in, hint, rightW-4)})...)
+
+	role := "follower"
+	if m.master {
+		role = "master"
+	}
+	header := joinLR(title.Render("▷ WATCHPARTY ")+roleStyle[role].Render(strings.ToUpper(role)), m.connChip(), m.width)
+	hotbar := dim.Render("[ctrl+space] play/pause · [ctrl+←/→] ±" + fmt.Sprintf("%.0f", seekStep) + "s · [tab] complete · [ctrl+z] movie · [ctrl+g] system")
+
+	var b strings.Builder
+	b.WriteString(header + "\n")
+	rows := max(len(left), len(right))
+	for i := 0; i < rows; i++ {
+		l, r := "", ""
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		b.WriteString(l + " " + padCut(r, rightW) + "\n")
+	}
+	b.WriteString(hotbar + "\n")
+	return b.String()
+}
+
 func (m Model) View() string {
 	if m.height == 0 {
 		return m.spin.View() + " connecting…\n"
+	}
+	if !m.zen && m.dashOn() {
+		return m.dashView()
 	}
 	cw, vh, showBar, showSys, showFooter := m.layout()
 	vp := m.vp // sized copies: View must not depend on Update having run first
@@ -838,8 +1071,9 @@ func (m Model) inputSideHint(vp viewport.Model) string {
 // renderChatLines renders the human conversation: bright, word-wrapped,
 // never mixed with machine output. Consecutive messages from the same
 // nick within five minutes group under one timestamp + nickname.
-func (m Model) renderChatLines() []string {
-	cw := m.contentWidth()
+func (m Model) renderChatLines() []string { return m.renderChatLinesAt(m.chatWidth()) }
+
+func (m Model) renderChatLinesAt(cw int) []string {
 	var out []string
 	prevIdx := -1
 	for i, e := range m.log {
@@ -857,8 +1091,9 @@ func (m Model) renderChatLines() []string {
 // renderSysLines renders events and engine lines dim; consecutive same-type
 // engine lines collapse to their last line plus a hidden count, so sync
 // chatter stays a compact tail instead of burying the conversation.
-func (m Model) renderSysLines() []string {
-	cw := m.contentWidth()
+func (m Model) renderSysLines() []string { return m.renderSysLinesAt(m.sysWidth()) }
+
+func (m Model) renderSysLinesAt(cw int) []string {
 	var out []string
 	for i := 0; i < len(m.log); i++ {
 		e := m.log[i]
