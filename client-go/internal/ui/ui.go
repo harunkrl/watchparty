@@ -916,10 +916,10 @@ func padLines(lines []string, n int) []string {
 	return lines
 }
 
-// dashView assembles the two-column dashboard: left carries playback
-// state, watchers, queue and the system log; the right column is the
-// conversation with the input box under it. A hotkey hint bar closes.
-func (m Model) chatBoxH() int { return max(4, m.height-2-3-2) } // rows minus header, hotbar, message box, chat borders
+// dashView assembles the two-column dashboard: a full-width NOW PLAYING
+// band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
+// conversation with the input box on the right. A hotkey bar closes.
+func (m Model) chatBoxH() int { return max(4, m.height-2-5-3-2) } // header, hotbar, now band, message box, chat borders
 
 func (m Model) dashView() string {
 	leftW, rightW := m.dashGeom()
@@ -928,33 +928,37 @@ func (m Model) dashView() string {
 	vp := m.vp
 	vp.Width, vp.Height = rightW-2, chatH
 
-	nowH, sysH, watH := 5, 0, 2+len(m.watcherLines())
+	const sysLines = 7
+	watH := 2 + len(m.watcherLines())
+	sysH := 0
 	if !m.sysOff {
-		sysH = 4
+		sysH = sysLines + 2
 	}
-	queueH := avail - nowH - sysH - watH
-	if queueH < 4 { // cramped: drop the system box, then the watchers
-		if sysH > 0 {
-			sysH, queueH = 0, queueH+sysH
-		}
-		if queueH < 4 && watH > 2 {
-			queueH += watH - 2
-			watH = 2
-		}
-		queueH = max(queueH, 4)
+	queueH := avail - 5 - sysH - watH                // minus the now-playing band
+	for n := sysLines; queueH < 4 && n > 2; n -= 3 { // cramped: shrink system first
+		sysH, queueH = n+2, queueH+3
 	}
+	if queueH < 4 && sysH > 0 {
+		sysH, queueH = 0, queueH+sysH // then drop system entirely
+	}
+	if queueH < 4 && watH > 2 { // then hide watchers
+		queueH += watH - 2
+		watH = 2
+	}
+	queueH = max(queueH, 4)
 
-	left := box(leftW, "NOW PLAYING", m.nowPlayingLines(leftW-4))
+	band := box(m.width, "NOW PLAYING", m.nowPlayingLines(m.width-4))
+	var left []string
 	if watH > 2 {
 		left = append(left, box(leftW, "WATCHERS", m.watcherLines())...)
 	}
 	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2))...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
-		if len(sys) > 2 {
-			sys = sys[len(sys)-2:] // a glanceable tail, never a reading surface
+		if len(sys) > sysH-2 {
+			sys = sys[len(sys)-sysH+2:] // a glanceable tail, never a reading surface
 		}
-		for len(sys) < 2 {
+		for len(sys) < sysH-2 {
 			sys = append(sys, "")
 		}
 		left = append(left, box(leftW, "SYSTEM", sys)...)
@@ -977,6 +981,9 @@ func (m Model) dashView() string {
 
 	var b strings.Builder
 	b.WriteString(header + "\n")
+	for _, l := range band { // the now-playing band spans both columns
+		b.WriteString(l + "\n")
+	}
 	rows := max(len(left), len(right))
 	for i := 0; i < rows; i++ {
 		l, r := "", ""
@@ -1320,10 +1327,8 @@ func (m Model) progressBar(cw int) string {
 	}
 	head := lipgloss.NewStyle().Foreground(col)
 	rest := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	bar := head.Render(strings.Repeat("█", fill))
-	if fill < bw {
-		bar += head.Render("●") + rest.Render(strings.Repeat("░", bw-fill-1))
-	}
+	bar := head.Render(strings.Repeat("█", fill)) +
+		rest.Render(strings.Repeat("░", bw-fill))
 	return timeStyle.Render(elapsed) + " " + bar + " " + timeStyle.Render(total)
 }
 
