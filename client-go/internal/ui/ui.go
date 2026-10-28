@@ -34,7 +34,7 @@ const (
 	dashMinH  = 20  // ... and this many rows; narrower falls back to the stacked layout
 	seekStep  = 5.0 // ctrl+arrow nudge, seconds
 	sysRows   = 13  // system tail lines in the dashboard
-	eqBars    = 28  // vibe equalizer bar count
+	eqBars    = 40  // vibe equalizer column budget (widest terminal)
 	eqPeriod  = 150 * time.Millisecond
 )
 
@@ -970,26 +970,39 @@ func (m Model) stepEq() Model {
 	return m
 }
 
-// vibeLines renders the equalizer row: block runes by height, green that
-// brightens with amplitude.
-func (m Model) vibeLines(w int) string {
+// vibePanel renders the spectrum-style equalizer: paired-width columns,
+// four rows tall, brighter with height. Live while playing (stepEq walk).
+func (m Model) vibePanel(w int) []string {
 	if len(m.eq) == 0 {
 		m = m.stepEq()
 	}
-	var b strings.Builder
-	for i, v := range m.eq {
-		if i >= w-6 {
-			break
+	cols := max(4, (w-2)/3) // "██ " per column
+	heights := make([]int, cols)
+	for i := range heights {
+		v := 0.04
+		if i < len(m.eq) {
+			v = m.eq[i]
 		}
-		lvl := int(v * 3.99)
-		runes := [4]string{"░", "▒", "▓", "█"}
-		col := "84" // green
-		if lvl >= 3 {
-			col = "10" // bright green at full amplitude
-		}
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(col)).Render(runes[lvl]))
+		heights[i] = int(v * 3.99)
 	}
-	return b.String()
+	rows := make([]string, 4) // top row first
+	for lvl := 4; lvl >= 1; lvl-- {
+		var b strings.Builder
+		for _, h := range heights {
+			col := "84" // green
+			if lvl >= 3 {
+				col = "10" // bright green at the top
+			}
+			if h >= lvl {
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(col)).Render("██"))
+			} else {
+				b.WriteString("  ")
+			}
+			b.WriteString(" ")
+		}
+		rows[4-lvl] = strings.TrimRight(b.String(), " ")
+	}
+	return rows
 }
 
 func (m Model) nowPlayingLines(w int) []string {
@@ -1008,6 +1021,9 @@ func (m Model) nowPlayingLines(w int) []string {
 	meta := ""
 	if m.st != nil && m.st.Pos != nil {
 		meta = fmt.Sprintf("%+.1fs drift", m.st.Drift)
+		if m.st.Cache > 0 {
+			meta += fmt.Sprintf(" · buf %.1fs", m.st.Cache)
+		}
 		if m.st.Paused {
 			meta += " · paused"
 		}
@@ -1062,7 +1078,9 @@ func padLines(lines []string, n int) []string {
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
 func (m Model) chatBoxH() int {
-	return max(4, m.height-2-5-3-3-2) // header, hotbar, now band, vibe, message box, chat borders
+	// header, hotbar, now band, equalizer, message box, chat borders,
+	// minus the rows the open completion menu borrows from chat
+	return max(4, m.height-2-5-6-3-2-m.menuRows())
 }
 
 func (m Model) dashView() string {
@@ -1102,7 +1120,7 @@ func (m Model) dashView() string {
 	band := box(m.width, "NOW PLAYING", m.nowPlayingLines(m.width-4), bord)
 	var left []string
 	if watH > 2 {
-		left = append(left, box(leftW, "WATCHERS", m.watcherLines(), bordWatch)...)
+		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), m.watcherLines(), bordWatch)...)
 	}
 	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), bordQueue)...)
 	if sysH > 0 {
@@ -1123,7 +1141,7 @@ func (m Model) dashView() string {
 	}
 	msg := []string{joinLR(in, hint, rightW-4)}
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
-	vibe := box(rightW, "VIBE", []string{m.vibeLines(rightW - 6)}, bordVibe)
+	vibe := box(rightW, "EQUALIZER", m.vibePanel(rightW-6), bordVibe)
 	right := vibe
 	right = append(right, box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)...)
 	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
@@ -1160,25 +1178,40 @@ func (m Model) dashView() string {
 }
 
 // menuLines renders the open completion menu: selected row reversed,
-// descriptions dim. Empty when closed.
+// descriptions dim, windowed to menuMax rows around the cursor so the
+// box never grows past the terminal. Empty when closed.
+const menuMax = 6
+
 func (m Model) menuLines(w int) []string {
-	if !m.compOpen {
+	if !m.compOpen || len(m.compItems) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(m.compItems))
-	for i, it := range m.compItems {
-		row := it.text
+	lo := max(0, min(m.compCursor-menuMax/2, len(m.compItems)-menuMax))
+	hi := min(len(m.compItems), lo+menuMax)
+	out := make([]string, 0, hi-lo)
+	for i := lo; i < hi; i++ {
+		it := m.compItems[i]
+		row := "   " + it.text
 		if i == m.compCursor {
 			row = pickCur.Render(" ▸ " + it.text + " ")
-		} else {
-			row = "   " + it.text
 		}
 		if it.desc != "" {
 			row += dim.Render("  " + it.desc)
 		}
 		out = append(out, padCut(row, w))
 	}
+	if hi < len(m.compItems) { // more below the window
+		out = append(out, dim.Render(padCut(fmt.Sprintf("   … +%d more", len(m.compItems)-hi), w)))
+	}
 	return out
+}
+
+// menuRows is the layout budget the open menu consumes.
+func (m Model) menuRows() int {
+	if !m.compOpen {
+		return 0
+	}
+	return min(len(m.compItems), menuMax) + 1 // +1 for the "more" row when windowed
 }
 
 func (m Model) View() string {
@@ -1466,7 +1499,7 @@ func (m Model) connChip() string {
 		if !m.connSince.IsZero() {
 			up = " · up " + humanDur(time.Since(m.connSince))
 		}
-		return connStyle["connected"].Render("● connected" + up)
+		return connStyle["connected"].Render(fmt.Sprintf("● connected · %d watchers", len(m.peers)+1)) + dim.Render(up)
 	case "reconnecting":
 		return connStyle["reconnecting"].Render(fmt.Sprintf("○ retry %d · backoff %ds", m.retry, m.retryDelay))
 	case "lost":

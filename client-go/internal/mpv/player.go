@@ -39,8 +39,9 @@ type State struct {
 	Pos       *float64 // nil: no time-pos (nothing loaded or idle)
 	Pause     bool
 	Idle      bool
-	Buffering bool // cache underrun: mpv stalled playback to refill (paused-for-cache)
-	Exited    bool // mpv window was closed; client should shut down
+	Buffering bool    // cache underrun: mpv stalled playback to refill (paused-for-cache)
+	Cache     float64 // demuxer-cache-time: seconds of read-ahead buffered
+	Exited    bool    // mpv window was closed; client should shut down
 }
 
 // Event is one pushed mpv notification (Name is the mpv event id, e.g.
@@ -388,6 +389,11 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		if v, err := p.Get("time-pos"); err == nil && v != nil {
 			if f, ok := v.(float64); ok {
 				st.Pos = &f
+			}
+		}
+		if v, err := p.Get("demuxer-cache-time"); err == nil && v != nil {
+			if f, ok := v.(float64); ok {
+				st.Cache = f
 			}
 		}
 		select {

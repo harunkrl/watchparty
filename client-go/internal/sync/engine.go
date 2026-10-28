@@ -75,6 +75,7 @@ type UiState struct {
 	Drift  float64  // follower pos - master expected, seconds
 	Pos    *float64 // local playback position (master: own, follower: own)
 	Paused bool
+	Cache  float64 // seconds of read-ahead buffered (demuxer-cache-time)
 }
 
 type Engine struct {
@@ -538,7 +539,7 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 		return
 	}
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache}:
 	default:
 	}
 }
