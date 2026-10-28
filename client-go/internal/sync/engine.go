@@ -103,6 +103,11 @@ type Engine struct {
 	// mpv event is only an echo when it matches this — the user pressing
 	// space right after a remote apply must never be swallowed
 	lastPost time.Time // last follower discrete post (grace window)
+	// postedPause is the pause state this follower posted and the room has
+	// not confirmed yet. A heartbeat that was already in flight overwrites
+	// the snapshot mirror (snap.paused), so this pending state is what
+	// keeps a late echo of our own apply from posting the same state twice.
+	postedPause *bool
 
 	speedSet  bool    // a Speed value has been sent (0.0 is a valid speed)
 	lastSpeed float64 // current tempo nudge; cache avoids IPC spam per tick
@@ -182,6 +187,10 @@ func (e *Engine) OnRoom(ev room.Event) {
 		if ev.Now != "" && ev.Now != e.loaded {
 			e.load(ev.Now)
 		}
+		// a reconnect is a fresh stall window: a behind-tick from before
+		// the outage must not trip the stall counter on the first tick
+		// after it (the room would be paused for a stall that is over)
+		e.behind, e.autoPaused = 0, false
 		// Server may carry an age-adjusted media position + paused flag
 		// from the room's live snapshot (set after every position relay,
 		// cleared by load/ended/skip). When present, snap now and seek
@@ -203,7 +212,8 @@ func (e *Engine) OnRoom(ev room.Event) {
 		}
 	case "pause":
 		e.setPause(true)
-		e.lastPause = true // master dedup stays consistent with reality
+		e.lastPause = true  // master dedup stays consistent with reality
+		e.postedPause = nil // the room's state supersedes our pending post
 		if e.snap != nil {
 			e.snap.paused = true // discrete events are room truth; don't wait for the next heartbeat
 		}
@@ -212,6 +222,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 		e.behind = 0         // fresh stall window: resume-into-dry-cache must not re-pause instantly
 		e.setPause(false)
 		e.lastPause = false
+		e.postedPause = nil // the room's state supersedes our pending post
 		if e.snap != nil {
 			e.snap.paused = false
 			// re-anchor: the snapshot's age spans the pause; aging it into
@@ -220,6 +231,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 		}
 	case "seek":
 		e.seekTo(ev.T)
+		e.lastPos = nil // the applied seek moved us: the scrub baseline is stale
 	case "chat":
 		// chat OSD over the video (client.py parity: 3s show-text)
 		_ = e.Player.ShowText(fmt.Sprintf("%s: %s", ev.Nick, ev.Text), 3000)
@@ -246,6 +258,7 @@ func (e *Engine) load(name string) {
 	}
 	e.loaded = name // claim it only once mpv actually took the file
 	e.loadedAt = e.Clock.Now()
+	e.lastPos = nil // a new file starts at the head: the old scrub baseline is stale
 }
 
 // OwnLoad records a file the local user started outside the room-event
@@ -257,6 +270,7 @@ func (e *Engine) OwnLoad(name string) {
 	e.loaded = name
 	e.loadedAt = e.Clock.Now()
 	e.behind, e.autoPaused = 0, false
+	e.lastPos = nil // same as load(): the position jumped, the baseline is stale
 }
 
 // PauseToggle is the TUI hotkey equivalent of a space-bar press in the
@@ -273,8 +287,17 @@ func (e *Engine) PauseToggle() {
 		if e.snap == nil {
 			return
 		}
-		want = !e.snap.paused
+		paused := e.snap.paused
+		// our pending post is newer than the room's last heartbeat: trust it
+		// over the snapshot, or the toggle repeats the state we just posted
+		// (the room would never resume)
+		if e.postedPause != nil && !e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+			paused = *e.postedPause
+		}
+		want = !paused
 		e.snap.paused = want // mirror: the echo event must not re-post
+		p := want
+		e.postedPause = &p
 	}
 	e.setPause(want)
 	e.lastPost = e.Clock.Now()
@@ -308,6 +331,18 @@ func (e *Engine) SeekBy(dt float64) {
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// EOF transition (either role): at idle mpv keeps pause=false and drops
+	// time-pos, so without this the UI sits on a stale ▶ forever. Ended
+	// reads as paused until the next load.
+	if s.Idle && e.wasActive {
+		e.wasActive = false
+		e.emitUi(mpv.State{Pause: true}, 0)
+		if e.Master {
+			e.post1(room.Event{Type: "ended"}) // server auto-advances the queue
+		}
+	} else if !s.Idle && s.Pos != nil {
+		e.wasActive = true
+	}
 	if e.Master {
 		e.masterTick(s)
 		return
@@ -373,11 +408,21 @@ func (e *Engine) OnMpvEvent(name string) {
 		if e.snap == nil || e.snap.paused == wantPause {
 			return
 		}
+		// our own post is still pending: a heartbeat that was in flight
+		// overwrote the snapshot mirror, and the late echo of our own
+		// apply must not post the same state again (the room would
+		// apply it twice)
+		if e.postedPause != nil && *e.postedPause == wantPause &&
+			!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+			return
+		}
 		e.lastPost = e.Clock.Now()
 		// mirror our post into the snapshot: the next heartbeat still carries
 		// the pre-post state, and without the mirror a quick opposite-direction
 		// user move is swallowed by the check above (python room_pause parity)
 		e.snap.paused = wantPause
+		p := wantPause
+		e.postedPause = &p
 		e.postDiscrete(room.Event{Type: typ})
 	case "seek":
 		if !e.loadedAt.IsZero() && e.Clock.Since(e.loadedAt) < loadQuiet {
@@ -445,12 +490,6 @@ func (e *Engine) masterTick(s mpv.State) {
 		e.lastPos = s.Pos
 		e.emitUi(s, 0) // master: no drift, but the status bar wants pos/paused
 	}
-	if s.Idle && e.wasActive {
-		e.post1(room.Event{Type: "ended"}) // EOF: server auto-advances the queue
-		e.wasActive = false
-	} else if !s.Idle && s.Pos != nil {
-		e.wasActive = true
-	}
 }
 
 func (e *Engine) followerTick(s mpv.State) {
@@ -462,13 +501,16 @@ func (e *Engine) followerTick(s mpv.State) {
 	}
 	if e.snap.paused != s.Pause {
 		// self-heal: converge to the master's playback state even if the
-		// discrete play/pause event never arrived
+		// discrete play/pause event never arrived. Emit with the TARGET state:
+		// s.Pause is pre-actuation and the next poll is 2s away — without this
+		// the follower UI sits on a stale ▶/⏸ while mpv is already there
 		e.setPause(e.snap.paused)
+		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume}, 0)
 		return
 	}
 	if e.snap.paused {
-		e.setSpeed(1) // paused: clear any tempo nudge for a clean resume
-		// both paused: hold position
+		e.setSpeed(1)  // paused: clear any tempo nudge for a clean resume
+		e.emitUi(s, 0) // both paused: hold position — the UI still tracks mpv
 		return
 	}
 	if s.Buffering {

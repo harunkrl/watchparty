@@ -135,6 +135,60 @@ func TestMasterEndedOnIdleAfterActive(t *testing.T) {
 	}
 }
 
+func TestEndedEmitsPausedUiState(t *testing.T) {
+	for _, master := range []bool{true, false} {
+		e, _, _ := newEngine(master)
+		ui := make(chan UiState, 8)
+		e.Ui = ui
+		e.OnMpvp(mpv.State{Pos: ptr(5)}) // active
+		e.OnMpvp(mpv.State{Idle: true})  // EOF
+		var last UiState
+		n := 0
+		for {
+			select {
+			case last = <-ui:
+				n++
+				continue
+			default:
+			}
+			break
+		}
+		if n == 0 {
+			t.Fatalf("master=%v: no UI state emitted on EOF", master)
+		}
+		if !last.Paused || last.Pos != nil {
+			t.Fatalf("master=%v: EOF UiState = %+v, want paused with no pos", master, last)
+		}
+	}
+}
+
+func lastUi(ui chan UiState) UiState {
+	var last UiState
+	for {
+		select {
+		case last = <-ui:
+			continue
+		default:
+			return last
+		}
+	}
+}
+
+func TestFollowerUiTracksRoomPause(t *testing.T) {
+	e, _, _ := newEngine(false)
+	ui := make(chan UiState, 8)
+	e.Ui = ui
+	e.OnRoom(masterAt(5, true))                    // room paused
+	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: false}) // we still play: self-heal
+	if last := lastUi(ui); !last.Paused {
+		t.Fatalf("self-heal UiState = %+v, want paused", last)
+	}
+	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: true}) // both paused: hold
+	if last := lastUi(ui); !last.Paused || last.Pos == nil {
+		t.Fatalf("hold UiState = %+v, want paused with pos", last)
+	}
+}
+
 func TestMasterNothingLoadedIsSilent(t *testing.T) {
 	e, _, po := newEngine(true)
 	e.OnMpvp(mpv.State{}) // pos nil, not idle
