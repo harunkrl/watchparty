@@ -142,6 +142,8 @@ type Model struct {
 	retry      int // reconnect attempts since the last connect
 	retryDelay int // current backoff in seconds
 	duration   float64
+	durCache   map[string]float64 // known file durations: a reload paints the bar instantly
+	lostAt     time.Time          // when the connection dropped (reconnect delta)
 	mode       mode
 	pickItems  []string
 	pickCursor int
@@ -177,8 +179,9 @@ func New(nick string, api *room.Client, player *mpv.Player, master bool, engine 
 	m := Model{
 		nick: nick, master: master, api: api, player: player, engine: engine,
 		input: in, peers: map[string]bool{}, conn: "connecting",
-		spin:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(dim)),
-		histIdx: -1, width: 80, height: 24,
+		durCache: map[string]float64{},
+		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(dim)),
+		histIdx:  -1, width: 80, height: 24,
 		vp: viewport.New(76, 14), sysVp: viewport.New(76, 2),
 	}
 	return m.syncLayout()
@@ -247,7 +250,8 @@ func fetchFiles(api *room.Client) tea.Cmd {
 
 // fetchDuration polls mpv for the duration of the current file; loadfile is
 // async so a fresh load needs a few probes before the property exists.
-func fetchDuration(pl *mpv.Player, name string) tea.Cmd {
+func (m Model) fetchDuration(name string) tea.Cmd {
+	pl := m.player
 	if pl == nil {
 		return nil
 	}
@@ -262,6 +266,19 @@ func fetchDuration(pl *mpv.Player, name string) tea.Cmd {
 		}
 		return nil
 	}
+}
+
+// setFile points the UI at a file: a duration we already measured paints
+// the bar instantly (no mpv re-probe), an unknown one is probed in the
+// background.
+func (m Model) setFile(name string) (Model, tea.Cmd) {
+	m.now = name
+	if d, ok := m.durCache[name]; ok {
+		m.duration = d
+		return m, nil
+	}
+	m.duration = 0
+	return m, m.fetchDuration(name)
 }
 
 func (m Model) addEntry(e entry) Model {
@@ -346,24 +363,36 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	case ReconnectingMsg:
 		m.conn = "reconnecting"
 		m.retry, m.retryDelay = msg.Try, msg.Delay
+		if m.lostAt.IsZero() {
+			m.lostAt = time.Now() // the outage starts now (C4)
+		}
 		return m.logEngine(msg.Note), nil
 	case EngineLogMsg:
 		return m.logEngine(msg.Line), nil
 	case StreamClosedMsg:
 		m.conn = "lost"
 		m.connSince = time.Time{}
+		if m.lostAt.IsZero() {
+			m.lostAt = time.Now()
+		}
 		return m.logEngine("> connection closed"), nil
 	case MpvExitedMsg:
 		return m.logEngine("> mpv exited or stopped talking - restart the client"), tea.Quit
 	case loadedMsg: // the server never echoes our own load back to us
 		if msg.name != m.now {
-			m.now = msg.name
-			m.duration = 0
-			return m, fetchDuration(m.player, m.now)
+			var c tea.Cmd
+			m, c = m.setFile(msg.name)
+			return m, c
 		}
 	case durationMsg:
 		if msg.name == m.now && msg.dur > 0 {
 			m.duration = msg.dur
+		}
+		if msg.dur > 0 { // remember it: the next load of this file is instant
+			if m.durCache == nil {
+				m.durCache = map[string]float64{}
+			}
+			m.durCache[msg.name] = msg.dur
 		}
 	}
 	return m, nil
@@ -734,10 +763,12 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		m.conn = "connected"
 		m.retry, m.retryDelay = 0, 0
 		m.connSince = time.Now()
+		if !m.lostAt.IsZero() { // the outage is over: say how long it lasted
+			m = m.logEvent(fmt.Sprintf("> reconnected after %s", humanDur(time.Since(m.lostAt))))
+			m.lostAt = time.Time{}
+		}
 		if ev.Now != m.now { // joining mid-film or reconnecting: probe the file mpv is loading
-			m.now = ev.Now
-			m.duration = 0 // the file changed: the old duration is meaningless
-			c = fetchDuration(m.player, m.now)
+			m, c = m.setFile(ev.Now)
 		}
 		m.queue = ev.Queue
 		// roster replaces guesswork: a late joiner sees everyone already in
@@ -765,9 +796,7 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		}
 	case "load": // auto-advance and other people's plays (own loads arrive as loadedMsg)
 		if ev.Name != m.now {
-			m.now = ev.Name
-			m.duration = 0
-			c = fetchDuration(m.player, m.now)
+			m, c = m.setFile(ev.Name)
 		}
 	case "queue":
 		m.queue = ev.Queue
@@ -1060,8 +1089,14 @@ func (m Model) nowPlayingLines(w int) []string {
 			vs := lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 			stats = append(stats, vs.Render(fmt.Sprintf("♪ you: vol %.0f%%", m.st.Volume)))
 		}
+		if m.st.Muted { // mpv reports the mute flag: the volume number alone would lie
+			stats = append(stats, pausedStyle.Render("♪ muted"))
+		}
 		if m.st.Paused {
 			stats = append(stats, pausedStyle.Render("paused"))
+		}
+		if m.st.Stale { // the master's heartbeat stopped: say so instead of pretending
+			stats = append(stats, pausedStyle.Render("⚠ master heartbeat stale"))
 		}
 	}
 	// a blank row above and below the bar: the position reads calmer
@@ -1585,7 +1620,7 @@ func (m Model) headerLines(cw int) (string, string) {
 		role = "master"
 	}
 	if m.zen {
-		return joinLR(m.nowChip(), m.clockChip(), cw), ""
+		return joinLR(m.nowChip(), m.zenSyncChip(), cw), ""
 	}
 	l1 := joinLR(roleStyle[role].Render("watchparty "+role), m.connChip(), cw)
 	l2 := joinLR(m.nowChip(), m.clockChip(), cw)
@@ -1637,6 +1672,26 @@ func (m Model) clockChip() string {
 		clock += " / " + clockStr(m.duration)
 	}
 	return dim.Render(clock)
+}
+
+// zenSyncChip is the movie-night header's right side: time left in the
+// film plus the drift chip (state-colored — the one semantic signal).
+// The file itself is the left side of that row.
+func (m Model) zenSyncChip() string {
+	if m.st == nil || m.st.Pos == nil {
+		return ""
+	}
+	var parts []string
+	if m.duration > 0 {
+		parts = append(parts, dim.Render("-"+clockStr(max(0, m.duration-*m.st.Pos))+" left"))
+	}
+	if m.master {
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("◷ master clock"))
+	} else {
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
+			Render(fmt.Sprintf("≈ %+.1fs", m.st.Drift)))
+	}
+	return strings.Join(parts, dim.Render(" · "))
 }
 
 // progressBar renders the seek bar with a position head and time labels

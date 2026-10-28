@@ -6,6 +6,7 @@ package mpv
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,7 +48,17 @@ type State struct {
 	Buffering bool    // cache underrun: mpv stalled playback to refill (paused-for-cache)
 	Cache     float64 // demuxer-cache-time: seconds of read-ahead buffered
 	Volume    float64 // audio volume, percent (display only; mpv window owns the keys)
+	Muted     bool    // mpv mute flag (display only)
+	Dur       float64 // media duration in seconds (0 = unknown)
 	Exited    bool    // mpv window was closed; client should shut down
+}
+
+// pollProps is what one poll tick reads. They travel as ONE IPC round
+// trip (see batchGet): eight separate get_property calls would be eight
+// sequential request/response pairs.
+var pollProps = []string{
+	"pause", "idle-active", "paused-for-cache", "time-pos",
+	"demuxer-cache-time", "volume", "mute", "duration",
 }
 
 // Event is one pushed mpv notification (Name is the mpv event id, e.g.
@@ -283,6 +294,97 @@ func (p *Player) Get(prop string) (any, error) {
 	return v, json.Unmarshal(raw, &v)
 }
 
+// batchGet reads several properties in ONE IPC round trip: the requests
+// go out as a single write and the replies come back tagged with their
+// request_id (the read loop already routes them). A property mpv does
+// not answer is simply absent from the result.
+func (p *Player) batchGet(props []string) map[string]any {
+	out := map[string]any{}
+	if p.conn == nil {
+		return out
+	}
+	type req struct {
+		rid  int
+		prop string
+		ch   chan ipcMsg
+	}
+	p.mu.Lock()
+	reqs := make([]req, 0, len(props))
+	var buf bytes.Buffer
+	for _, prop := range props {
+		p.seq++
+		rid := p.seq
+		ch := make(chan ipcMsg, 1)
+		p.pend[rid] = ch
+		reqs = append(reqs, req{rid, prop, ch})
+		b, err := json.Marshal(struct {
+			Command   []any `json:"command"`
+			RequestID int   `json:"request_id"`
+		}{[]any{"get_property", prop}, rid})
+		if err != nil {
+			p.mu.Unlock()
+			return out
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	n, err := p.conn.Write(buf.Bytes())
+	p.mu.Unlock()
+	if err != nil || n != buf.Len() { // a short write would split a command
+		p.mu.Lock()
+		for _, r := range reqs {
+			delete(p.pend, r.rid)
+		}
+		p.mu.Unlock()
+		return out
+	}
+	// one budget for the whole batch: a wedged mpv must not stretch a poll
+	// tick into seven command timeouts
+	deadline := time.NewTimer(cmdTimeout)
+	defer deadline.Stop()
+	for i, r := range reqs {
+		select {
+		case m := <-r.ch:
+			if m.Error != "success" || len(m.Data) == 0 {
+				continue
+			}
+			var v any
+			if json.Unmarshal(m.Data, &v) == nil && v != nil {
+				out[r.prop] = v
+			}
+		case <-deadline.C:
+			p.mu.Lock()
+			for _, rest := range reqs[i:] {
+				delete(p.pend, rest.rid)
+			}
+			p.mu.Unlock()
+			return out
+		}
+	}
+	return out
+}
+
+// numProp reads a numeric property out of a batch result.
+func numProp(props map[string]any, key string) (float64, bool) {
+	v, ok := props[key]
+	if !ok || v == nil {
+		return 0, false
+	}
+	f, ok := v.(float64)
+	return f, ok
+}
+
+// boolProp reads a boolean property out of a batch result.
+func boolProp(props map[string]any, key string) bool {
+	v, ok := props[key]
+	if !ok || v == nil {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
+}
+
 // Pos returns the current playback position; ok=false when nothing plays.
 func (p *Player) Pos() (float64, bool) {
 	v, err := p.Get("time-pos")
@@ -423,30 +525,17 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		case <-t.C:
 		}
 		st := State{}
-		if v, err := p.Get("pause"); err == nil && v != nil {
-			st.Pause, _ = v.(bool)
+		props := p.batchGet(pollProps) // one IPC round trip for the whole tick
+		st.Pause = boolProp(props, "pause")
+		st.Idle = boolProp(props, "idle-active")
+		st.Buffering = boolProp(props, "paused-for-cache")
+		st.Muted = boolProp(props, "mute")
+		if f, ok := numProp(props, "time-pos"); ok {
+			st.Pos = &f
 		}
-		if v, err := p.Get("idle-active"); err == nil && v != nil {
-			st.Idle, _ = v.(bool)
-		}
-		if v, err := p.Get("paused-for-cache"); err == nil && v != nil {
-			st.Buffering, _ = v.(bool)
-		}
-		if v, err := p.Get("time-pos"); err == nil && v != nil {
-			if f, ok := v.(float64); ok {
-				st.Pos = &f
-			}
-		}
-		if v, err := p.Get("demuxer-cache-time"); err == nil && v != nil {
-			if f, ok := v.(float64); ok {
-				st.Cache = f
-			}
-		}
-		if v, err := p.Get("volume"); err == nil && v != nil {
-			if f, ok := v.(float64); ok {
-				st.Volume = f
-			}
-		}
+		st.Cache, _ = numProp(props, "demuxer-cache-time")
+		st.Volume, _ = numProp(props, "volume")
+		st.Dur, _ = numProp(props, "duration")
 		select {
 		case out <- st:
 		case <-ctx.Done():

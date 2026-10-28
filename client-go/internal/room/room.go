@@ -18,6 +18,12 @@ import (
 // bodies differ only in which fields are set. `p` is the paused flag
 // (plan section 1, fixed wire name). `pos` is the hello-time media
 // position the server sends only when it has a live snapshot.
+// T and P are always on the wire: with omitempty a seek to 0 and a
+// paused=false heartbeat lost their payload and vanished (the server
+// gates on `typeof t === "number"`).
+// Dur is the media duration the master reports with its heartbeats (S3):
+// the server clamps a long-downtime join before EOF. It stays off the
+// wire while unknown, so an old server never sees a field it ignores.
 type Event struct {
 	Type   string   `json:"type"`
 	Nick   string   `json:"nick,omitempty"`
@@ -26,8 +32,9 @@ type Event struct {
 	Now    string   `json:"now,omitempty"`
 	Queue  []string `json:"queue,omitempty"`
 	Roster []string `json:"roster,omitempty"`
-	T      float64  `json:"t,omitempty"`
-	P      bool     `json:"p,omitempty"`
+	T      float64  `json:"t"`
+	P      bool     `json:"p"`
+	Dur    float64  `json:"dur,omitempty"`
 	From   string   `json:"from,omitempty"`
 	Pos    *float64 `json:"pos,omitempty"`
 }

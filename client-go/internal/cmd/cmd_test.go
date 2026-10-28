@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestIsCommand(t *testing.T) {
+	// C8: only a verb is a command; everything else is chat.
+	for _, c := range []string{"list", "pick", "play a.mkv", "queue", "skip", "chat hi", "quit", "help"} {
+		if !IsCommand(c) {
+			t.Errorf("IsCommand(%q) = false, want true", c)
+		}
+	}
+	for _, c := range []string{"", "hello", "playlist", "hey there", "playlists", "skipping"} {
+		if IsCommand(c) {
+			t.Errorf("IsCommand(%q) = true, want false", c)
+		}
+	}
+	// a verb with trailing words is still that verb (cmd.Parse parity:
+	// no-argument verbs ignore the extra text)
+}
+
 func TestParse(t *testing.T) {
 	cases := []struct {
 		in    string

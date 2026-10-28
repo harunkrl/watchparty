@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"watchparty/client-go/internal/cmd"
 	"watchparty/client-go/internal/mpv"
@@ -31,6 +32,17 @@ func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine,
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
+			continue
+		}
+		if !cmd.IsCommand(line) {
+			// bare text is chat: the headless adapter is verb-first, so
+			// anything that is not a known verb goes to the room as chat
+			if utf8.RuneCountInString(line) > cmd.ChatMaxLen {
+				fmt.Fprintf(out, "> chat too long (max %d chars)\n", cmd.ChatMaxLen)
+				continue
+			}
+			fmt.Fprintf(out, "[%s] %s\n", nick, line) // local echo
+			report(out, api.Post(room.Event{Type: "chat", Nick: nick, Text: line}))
 			continue
 		}
 		c, err := cmd.Parse(line)

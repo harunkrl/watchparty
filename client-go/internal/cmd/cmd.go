@@ -30,6 +30,18 @@ type Cmd struct {
 	Arg  string
 }
 
+// IsCommand reports whether the line is one of the known verbs. Anything
+// else is chat. The headless adapter is verb-first (no leading '/');
+// the TUI instead requires the slash and sends everything else as chat.
+func IsCommand(line string) bool {
+	verb, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+	switch verb {
+	case List, Pick, Play, Queue, Skip, Chat, Quit, Help:
+		return true
+	}
+	return false
+}
+
 // Parse splits a line into verb + argument. Like client.py, verbs that
 // take no argument ignore any extra text.
 func Parse(line string) (Cmd, error) {

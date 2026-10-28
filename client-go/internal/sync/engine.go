@@ -48,6 +48,11 @@ const (
 // measurement: .pi-state/wan-baseline.md).
 const stallTicks = 2 // consecutive behind-live polls before a stall
 
+// staleAge: a follower whose snapshot is older than this is no longer
+// hearing the master's heartbeat — the room may be gone (or the master's
+// SSE died). The UI says so instead of showing a confident drift.
+const staleAge = 6 * time.Second
+
 // Clock is the engine's time source; fake it in tests.
 type Clock interface {
 	Now() time.Time
@@ -77,6 +82,8 @@ type UiState struct {
 	Paused bool
 	Cache  float64 // seconds of read-ahead buffered (demuxer-cache-time)
 	Volume float64 // audio volume percent (display only)
+	Muted  bool    // mpv mute flag (display only)
+	Stale  bool    // follower: the master's heartbeat is older than staleAge
 }
 
 type Engine struct {
@@ -338,7 +345,7 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	// reads as paused until the next load.
 	if s.Idle && e.wasActive {
 		e.wasActive = false
-		e.emitUi(mpv.State{Pause: true}, 0)
+		e.emitUi(mpv.State{Pause: true, Muted: s.Muted}, 0)
 		if e.Master {
 			e.post1(room.Event{Type: "ended"}) // server auto-advances the queue
 		}
@@ -488,7 +495,11 @@ func (e *Engine) masterTick(s mpv.State) {
 		if e.lastPos != nil && abs(*s.Pos-*e.lastPos-PollSecs) > SeekScrubThreshold {
 			e.postDiscrete(room.Event{Type: "seek", T: *s.Pos}) // user scrubbed
 		}
-		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause})
+		// S3: the heartbeat carries the media duration, so the server can
+		// clamp a long-downtime join before EOF. Dur stays off the wire
+		// while unknown (omitempty): an old server ignores it, and the
+		// server keeps its last known value.
+		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause, Dur: s.Dur})
 		e.lastPos = s.Pos
 		e.emitUi(s, 0) // master: no drift, but the status bar wants pos/paused
 	}
@@ -507,7 +518,7 @@ func (e *Engine) followerTick(s mpv.State) {
 		// s.Pause is pre-actuation and the next poll is 2s away — without this
 		// the follower UI sits on a stale ▶/⏸ while mpv is already there
 		e.setPause(e.snap.paused)
-		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume}, 0)
+		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted}, 0)
 		return
 	}
 	if e.snap.paused {
@@ -583,8 +594,11 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 	if e.Ui == nil {
 		return
 	}
+	// follower only: a snapshot older than staleAge means no heartbeat
+	// arrived for a while — the drift number below is then meaningless
+	stale := !e.Master && e.snap != nil && e.Clock.Since(e.snap.at) > staleAge
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale}:
 	default:
 	}
 }
