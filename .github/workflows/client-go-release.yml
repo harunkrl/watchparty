@@ -4,6 +4,12 @@ on:
   push:
     tags: ['v*']
 
+env:
+  # pinned mpv daily build (shinchiro date tags): same tag => same bytes,
+  # verified against the GitHub asset digest at download time. Bump the
+  # tag to refresh the bundled player — never build from "latest".
+  MPV_TAG: '20261021'
+
 permissions:
   contents: write
 
@@ -65,17 +71,21 @@ jobs:
             zip -j "dist/${plat}.zip" "$d"/watchparty* \
               client-go/README-friend.txt
           done
-          # friend bundle: portable mpv next to the exe (plan Q2)
+          # friend bundle: portable mpv next to the exe (plan Q2), pinned to
+          # MPV_TAG and digest-verified — a repackaged download must fail
           sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
-          latest=$(curl -sL \
-            "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=1")
-          url=$(echo "$latest" | jq -r '
-            .[0].assets[]
-            | select(.name | test("mpv-x86_64-[0-9]"))
-            | .browser_download_url' | head -1)
-          # mpv-x86_64-<date>: plain x86_64; -v3- needs AVX-512, excluded
-          test -n "$url"
+          tagged=$(curl -sL \
+            "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/$MPV_TAG")
+          pick='mpv-x86_64-[0-9]' # plain x86_64; -v3- needs AVX-512, excluded
+          url=$(echo "$tagged" | jq -r --arg re "$pick" \
+            '.assets[] | select(.name | test($re))
+             | .browser_download_url' | head -1)
+          want=$(echo "$tagged" | jq -r --arg re "$pick" \
+            '.assets[] | select(.name | test($re))
+             | .digest' | head -1)
+          test -n "$url" && test "$want" != "null"
           curl -sL -o /tmp/mpv.7z "$url"
+          echo "${want#sha256:}  /tmp/mpv.7z" | sha256sum -c -
           7z x -y /tmp/mpv.7z -o/tmp/mpv-portable >/dev/null
           mkdir /tmp/bundle
           cp artifacts/watchparty-windows-amd64/watchparty.exe /tmp/bundle/
@@ -83,10 +93,12 @@ jobs:
           cp -r /tmp/mpv-portable/* /tmp/bundle/
           cd /tmp/bundle
           zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum *.zip > SHA256SUMS
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            --title "watchparty $GITHUB_REF_NAME" \
-            --notes-file client-go/CHANGELOG.md dist/*.zip
+            --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
+            --notes-file client-go/CHANGELOG.md dist/*.zip dist/SHA256SUMS

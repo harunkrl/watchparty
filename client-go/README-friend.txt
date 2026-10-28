@@ -8,6 +8,10 @@ watchparty — how to watch together (3 steps)
 3. Type the server address your host gives you (looks like
    http://100.101.102.103:8090), press Enter, type your name, press Enter.
 
+Optional, to check the download was not corrupted: in PowerShell run
+  Get-FileHash watchparty-windows-bundle.zip -Algorithm SHA256
+and compare with the matching line in SHA256SUMS on the release page.
+
 The movie plays in a separate mpv window. The black window is the remote
 control — just type your message there and press Enter to talk.
 Commands start with "/": /list | /pick | /play <file> | /queue <file> |

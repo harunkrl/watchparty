@@ -4,6 +4,11 @@
 
 Room quality (P2):
 
+- releases: the bundled mpv is pinned to a dated shinchiro build
+  (MPV_TAG in the release workflow) and the download is verified against
+  the GitHub asset digest — a repackaged/tampered archive fails the
+  build; every release zip ships with a SHA256SUMS file (PowerShell:
+  Get-FileHash) and the release title names the mpv build inside
 - subtitles: all language siblings (`Movie.tr.srt`, `Movie.es.srt`, ...)
   load as selectable mpv tracks (new server `/subs` listing); each person
   switches with `j`/`J` in the player window — the plain `Movie.srt`
