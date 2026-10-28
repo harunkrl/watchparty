@@ -1024,11 +1024,15 @@ func (m Model) nowPlayingLines(w int) []string {
 		if m.st.Cache > 0 {
 			meta += fmt.Sprintf(" · buf %.1fs", m.st.Cache)
 		}
+		if m.st.Volume > 0 {
+			meta += fmt.Sprintf(" · vol %.0f%%", m.st.Volume)
+		}
 		if m.st.Paused {
 			meta += " · paused"
 		}
 	}
-	return []string{style.Render(icon) + " " + name, bar, dim.Render(meta)}
+	// a blank row above and below the bar: the position reads calmer
+	return []string{style.Render(icon) + " " + name, "", bar, "", dim.Render(meta)}
 }
 
 func (m Model) watcherLines() []string {
@@ -1078,9 +1082,10 @@ func padLines(lines []string, n int) []string {
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
 func (m Model) chatBoxH() int {
-	// header, hotbar, now band, equalizer, message box, chat borders,
-	// minus the rows the open completion menu borrows from chat
-	return max(4, m.height-2-5-6-3-2-m.menuRows())
+	// header, hotbar, now band (7 with the bar's breathing rows), equalizer,
+	// message box, chat borders, minus the rows the open completion menu
+	// borrows from chat
+	return max(4, m.height-2-7-6-3-2-m.menuRows())
 }
 
 func (m Model) dashView() string {
@@ -1095,7 +1100,7 @@ func (m Model) dashView() string {
 	if !m.sysOff {
 		sysH = sysRows + 2
 	}
-	queueH := avail - 5 - sysH - watH               // minus the now-playing band
+	queueH := avail - 7 - sysH - watH               // minus the 7-row now-playing band
 	for n := sysRows; queueH < 4 && n > 2; n -= 3 { // cramped: shrink system first
 		sysH, queueH = n+2, queueH+3
 	}
@@ -1173,6 +1178,7 @@ func (m Model) dashView() string {
 		}
 		b.WriteString(l + " " + padCut(r, rightW) + "\n")
 	}
+	_ = avail
 	b.WriteString(hotbar + "\n")
 	return b.String()
 }
@@ -1347,6 +1353,42 @@ func (m Model) renderSysLinesAt(cw int) []string {
 	return out
 }
 
+// sysIcon maps a system-line's first token to an icon + color, shared by
+// engine lines and room events: the tail reads at a glance.
+func sysIcon(body string) (string, lipgloss.Style) {
+	tok := body
+	if i := strings.IndexAny(tok, " 	"); i >= 0 {
+		tok = tok[:i]
+	}
+	switch {
+	case tok == "playing" || tok == "load":
+		return "▶ ", loadStyle
+	case tok == "pause":
+		return "⏸ ", pausedStyle
+	case tok == "play":
+		return "▶ ", playingStyle
+	case tok == "seek":
+		return "⇄ ", seekStyle
+	case tok == "err:":
+		return "✗ ", errStyle
+	case tok == "queued":
+		return "＋ ", bordQueue
+	case tok == "queue:":
+		return "≡ ", bordQueue
+	case strings.HasSuffix(body, " joined"):
+		return "→ ", joinStyle
+	case strings.HasSuffix(body, " left"):
+		return "← ", leftStyle
+	case strings.HasPrefix(body, "two masters"):
+		return "⚠ ", noticeStyle
+	case strings.HasPrefix(body, "[conn]"):
+		return "⌁ ", noticeStyle
+	case tok == "room:":
+		return "⌂ ", dim
+	}
+	return "· ", dim
+}
+
 func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 	switch e.kind {
 	case entChat:
@@ -1359,28 +1401,17 @@ func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 		prefix := timeStyle.Render(e.at.Format("15:04")) + " " + who + " "
 		return wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix)
 	case entEngine:
-		return wrapIndented(e.text, cw, 0, "")
-	default: // entEvent: "·"-prefixed — visibly not a human speaking
 		body := strings.TrimPrefix(e.text, "> ")
-		style := dim
-		switch {
-		case body == "play":
-			style = playingStyle
-		case body == "pause":
-			style = pausedStyle
-		case strings.HasPrefix(body, "seek @"):
-			style = seekStyle
-		case strings.HasPrefix(body, "load "), strings.HasPrefix(body, "playing "):
-			style = loadStyle
-		case strings.HasSuffix(body, " joined"):
-			style = joinStyle
-		case strings.HasSuffix(body, " left"):
-			style = leftStyle
-		case strings.HasPrefix(body, "two masters"):
-			style = noticeStyle
+		icon, style := sysIcon(body)
+		lines := wrapIndented(icon+body, cw, lipgloss.Width(icon), "")
+		for i, l := range lines {
+			lines[i] = style.Render(l)
 		}
-		lines := wrapIndented(body, cw, 2, "")
-		lines[0] = "· " + lines[0]
+		return lines
+	default: // entEvent: icon-prefixed, colored by kind
+		body := strings.TrimPrefix(e.text, "> ")
+		icon, style := sysIcon(body)
+		lines := wrapIndented(icon+body, cw, lipgloss.Width(icon), "")
 		for i, l := range lines {
 			lines[i] = style.Render(l)
 		}
@@ -1495,11 +1526,13 @@ func (m Model) headerLines(cw int) (string, string) {
 func (m Model) connChip() string {
 	switch m.conn {
 	case "connected":
+		n := len(m.peers) + 1
 		up := ""
 		if !m.connSince.IsZero() {
 			up = " · up " + humanDur(time.Since(m.connSince))
 		}
-		return connStyle["connected"].Render(fmt.Sprintf("● connected · %d watchers", len(m.peers)+1)) + dim.Render(up)
+		plural := map[bool]string{true: "watcher", false: "watchers"}[n == 1]
+		return connStyle["connected"].Render(fmt.Sprintf("● connected · %d %s", n, plural)) + dim.Render(up)
 	case "reconnecting":
 		return connStyle["reconnecting"].Render(fmt.Sprintf("○ retry %d · backoff %ds", m.retry, m.retryDelay))
 	case "lost":

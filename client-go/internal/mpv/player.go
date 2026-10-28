@@ -41,6 +41,7 @@ type State struct {
 	Idle      bool
 	Buffering bool    // cache underrun: mpv stalled playback to refill (paused-for-cache)
 	Cache     float64 // demuxer-cache-time: seconds of read-ahead buffered
+	Volume    float64 // audio volume, percent (display only; mpv window owns the keys)
 	Exited    bool    // mpv window was closed; client should shut down
 }
 
@@ -394,6 +395,11 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		if v, err := p.Get("demuxer-cache-time"); err == nil && v != nil {
 			if f, ok := v.(float64); ok {
 				st.Cache = f
+			}
+		}
+		if v, err := p.Get("volume"); err == nil && v != nil {
+			if f, ok := v.(float64); ok {
+				st.Volume = f
 			}
 		}
 		select {

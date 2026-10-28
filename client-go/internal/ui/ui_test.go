@@ -358,7 +358,7 @@ func TestPickerQEnqueues(t *testing.T) {
 	if m.mode != modeInput {
 		t.Fatal("q did not leave pick mode")
 	}
-	if !strings.Contains(m.View(), "> queued b.mkv") {
+	if !strings.Contains(m.View(), "queued b.mkv") {
 		t.Fatalf("no queued log:\n%s", m.View())
 	}
 }
@@ -411,19 +411,19 @@ func TestEngineRunCollapse(t *testing.T) {
 		m = m.logEngine("> play")
 	}
 	out := strings.Join(m.renderSysLines(), "\n")
-	if strings.Count(out, "> play") != 1 || !strings.Contains(out, "(2)") {
+	if strings.Count(out, "play") != 1 || !strings.Contains(out, "(2)") { // icon-prefixed now
 		t.Fatalf("3 identical engine lines did not collapse: %q", out)
 	}
 	m = m.logEngine("> pause")
 	out = strings.Join(m.renderSysLines(), "\n")
-	if !strings.Contains(out, "> play") || !strings.Contains(out, "> pause") {
+	if !strings.Contains(out, "play") || !strings.Contains(out, "pause") {
 		t.Fatalf("type change must end the run: %q", out)
 	}
 	m = m.logEngine("> play") // alternating play/pause: every state stays visible
 	m = m.logChat("ada", "hello")
 	m = m.logEngine("> play")
 	out = strings.Join(m.renderSysLines(), "\n")
-	if strings.Count(out, "> play") != 3 { // 1 collapsed + 1 before chat + 1 after: the run did not cross the chat
+	if strings.Count(out, "play") != 3 { // 1 collapsed + 1 before chat + 1 after: the run did not cross the chat
 		t.Fatalf("chat must break an engine run: %q", out)
 	}
 }
