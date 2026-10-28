@@ -251,6 +251,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 func (e *Engine) load(name string) {
 	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
 	e.behind, e.autoPaused = 0, false
+	e.wasActive = false          // the new file gets its own EOF: the old one is over
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
 	if err := e.Player.Load(name); err != nil {
 		e.logf("mpv: %s", err)
@@ -270,7 +271,8 @@ func (e *Engine) OwnLoad(name string) {
 	e.loaded = name
 	e.loadedAt = e.Clock.Now()
 	e.behind, e.autoPaused = 0, false
-	e.lastPos = nil // same as load(): the position jumped, the baseline is stale
+	e.wasActive = false // same as load(): the new file owns the next EOF
+	e.lastPos = nil     // same as load(): the position jumped, the baseline is stale
 }
 
 // PauseToggle is the TUI hotkey equivalent of a space-bar press in the

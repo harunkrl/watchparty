@@ -354,7 +354,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		m.connSince = time.Time{}
 		return m.logEngine("> connection closed"), nil
 	case MpvExitedMsg:
-		return m.logEngine("> mpv exited (window closed?) - restart the client"), tea.Quit
+		return m.logEngine("> mpv exited or stopped talking - restart the client"), tea.Quit
 	case loadedMsg: // the server never echoes our own load back to us
 		if msg.name != m.now {
 			m.now = msg.name
@@ -468,6 +468,8 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 // pickKeys handles the cursor list: arrows/j/k move, enter plays, esc backs.
 func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
+	case "ctrl+c": // the picker owns the keys, but ctrl+c must always quit
+		return m, tea.Quit
 	case "up", "k":
 		m.pickCursor = max(0, m.pickCursor-1)
 	case "down", "j":
@@ -732,9 +734,9 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		m.conn = "connected"
 		m.retry, m.retryDelay = 0, 0
 		m.connSince = time.Now()
-		m.duration = 0
 		if ev.Now != m.now { // joining mid-film or reconnecting: probe the file mpv is loading
 			m.now = ev.Now
+			m.duration = 0 // the file changed: the old duration is meaningless
 			c = fetchDuration(m.player, m.now)
 		}
 		m.queue = ev.Queue

@@ -110,6 +110,8 @@ func main() {
 			tea.WithAltScreen(),       // the dashboard owns the full viewport: the header can never scroll off
 			tea.WithMouseCellMotion()) // wheel scrolls chat; clicks on the bar seek
 	}
+	// the player's diagnostics go the same way: stderr would corrupt the frame
+	player.Logf = engine.Logf
 
 	go player.Poll(ctx, sync.PollSecs*time.Second, chMpv)
 	go func() { // pushed mpv events -> instant discrete posts (master only)
@@ -128,7 +130,7 @@ func main() {
 			if st.Exited {
 				mpvExited.Store(true)
 				if *headless {
-					fmt.Fprintln(os.Stderr, "> mpv exited (window closed?) - restart the client")
+					fmt.Fprintln(os.Stderr, "> mpv exited or stopped talking - restart the client")
 					stop()
 					player.Close()
 					os.Exit(1)

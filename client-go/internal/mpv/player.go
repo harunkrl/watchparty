@@ -31,7 +31,12 @@ var subClient = &http.Client{Timeout: 5 * time.Second}
 const (
 	demuxerReadaheadSecs = 300
 	demuxerMaxBytes      = "2GiB"
-	cmdTimeout           = 5 * time.Second
+)
+
+// Bounds on the IPC layer. Vars, not consts, so tests can shrink them.
+var (
+	cmdTimeout = 5 * time.Second // one IPC round trip
+	loadWait   = 5 * time.Second // how long Load waits for the file to go live
 )
 
 // State is one poll sample of the player, consumed by the sync engine.
@@ -58,10 +63,17 @@ type Player struct {
 	dir    string        // temp dir holding the socket (removed on Close)
 	drops  int           // logged event drops (bounded; a silent drop hid user seeks for a day)
 	exited chan struct{} // closed when the mpv process is reaped
+	dead   chan struct{} // closed when the IPC connection dies with mpv still alive
+	closed bool          // Close() ran: a dead conn is expected, not a crash
 	events chan Event
-	mu     sync.Mutex // guards pend, seq, drops and writes
-	pend   map[int]chan ipcMsg
-	seq    int
+	// Logf receives player diagnostics. It must not be stderr: in the TUI
+	// the alt-screen frame is owned by the renderer and a stray stderr line
+	// corrupts it (the engine's log goes through the program for the same
+	// reason).
+	Logf func(format string, args ...any)
+	mu   sync.Mutex // guards pend, seq, drops and writes
+	pend map[int]chan ipcMsg
+	seq  int
 }
 
 func Start(base string, extra []string) (*Player, error) {
@@ -97,6 +109,7 @@ func Start(base string, extra []string) (*Player, error) {
 	exited := make(chan struct{})
 	p := &Player{
 		base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited,
+		dead:   make(chan struct{}),
 		events: make(chan Event, 64),
 		pend:   map[int]chan ipcMsg{},
 	}
@@ -173,20 +186,38 @@ func (p *Player) readLoop() {
 				// but never silently again: silent drops hid user seeks for a
 				// whole day of soak flake
 				p.mu.Lock()
-				if p.drops < 3 {
+				dropped := p.drops < 3
+				if dropped {
 					p.drops++
-					fmt.Fprintln(os.Stderr, "mpv: event dropped (engine stalled?)")
 				}
 				p.mu.Unlock()
+				if dropped {
+					p.logf("mpv: event dropped (engine stalled?)")
+				}
 			}
 		}
 	}
 	p.mu.Lock()
+	if !p.closed && p.dead != nil {
+		// the IPC died with mpv alive: every later command fails and the
+		// client would freeze on a stale frame — report it instead
+		close(p.dead)
+	}
 	for rid, ch := range p.pend {
 		delete(p.pend, rid)
 		ch <- ipcMsg{Error: "ipc closed"}
 	}
 	p.mu.Unlock()
+}
+
+// logf routes a diagnostic to the caller's logger. stderr would corrupt
+// the TUI's alt-screen frame, so the caller must provide Logf.
+func (p *Player) logf(format string, args ...any) {
+	if p.Logf != nil {
+		p.Logf(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
 // cmd runs one IPC command and waits for its response.
@@ -290,8 +321,15 @@ func (p *Player) Load(name string) error {
 	if err := p.tell("loadfile", vurl); err != nil {
 		return err
 	}
+	deadline := time.Now().Add(loadWait)
 	for i := 0; i < 50; i++ { // wait until loaded AND seekable: a seek issued
 		// between loadfile and file-loaded is silently dropped by mpv
+		// The wait is bounded by a deadline, not by a round count: on a wedged
+		// mpv every Get() costs a full cmdTimeout, and the caller (the engine)
+		// holds its lock across this call.
+		if time.Now().After(deadline) {
+			break
+		}
 		if got, _ := p.Get("path"); got == vurl {
 			if v, _ := p.Get("seekable"); v == true {
 				break
@@ -375,6 +413,13 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 			case <-ctx.Done():
 			}
 			return
+		case <-p.dead:
+			// the IPC died under us: the client cannot drive mpv any more
+			select {
+			case out <- State{Exited: true}:
+			case <-ctx.Done():
+			}
+			return
 		case <-t.C:
 		}
 		st := State{}
@@ -413,10 +458,13 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 // Close reaps mpv: SIGTERM, 2s grace, then Kill — orphaned mpv must be
 // impossible (risk C) — and removes the temp socket dir.
 func (p *Player) Close() {
+	p.mu.Lock()
+	p.closed = true // from here on a dead conn is expected, not a crash
+	p.mu.Unlock()
 	if p.conn != nil {
 		p.conn.Close() // unblocks the reader and any pending cmd
 	}
-	if p.proc.Process != nil {
+	if p.proc != nil && p.proc.Process != nil {
 		_ = terminate(p.proc.Process)
 		select {
 		case <-p.exited:
