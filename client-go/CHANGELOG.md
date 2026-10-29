@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- client + server: every room action names its actor — system lines read
+  "pause by bo", the NOW PLAYING stat row says "⏸ paused by bo", and your
+  own pause never inherits the previous pauser's name
+- server: hello carries the invite address only the server can know —
+  tailscale first, then the LAN (a labeled second address when both
+  exist) — so the empty-room chat shows a URL the far side can dial
+- server: skip and EOF auto-advance broadcast the queue, so a client
+  never shows the playing file as queued
+- server: relays stamp the actor nick from the connection roster only —
+  a client-supplied nick can no longer spoof attribution
+- client: the QUEUE box can no longer overflow the dashboard (a long
+  queue truncates with "+N more"); its title counts the items and hints
+  "/skip next"
+- client: sparse conversations sit at the bottom of the chat pane, next
+  to the input, in every layout; zen mode fades messages older than
+  15 minutes into the background
+- client: the dashboard's progress bar is clickable (the stacked one
+  already was); the band tells you so
+- client: the Tab menu opens on an empty input too (browse every command
+  without knowing the slash), grows up to 16 rows, and never pushes the
+  dashboard past the terminal
+- client: NOW PLAYING carries an explicit "▶ playing" / "⏸ paused" chip,
+  a personal subtitle chip ("⊞ you: sub tr [j in mpv]", never synced)
+  and the system tail grows to 30 lines with an "n-line tail" label
+- client: the equalizer is state-honest — frozen and amber while paused
+  (a decaying bar claimed playback), labeled with the real volume and
+  channel layout, and its border follows playback state
+- docs: the known-limits and test sections match reality again
+
 ## v1.3.0 — honest signals, quiet sync
 
 - client: movie mode (ctrl+z) grows a sync strip in the header — the file,

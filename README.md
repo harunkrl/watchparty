@@ -121,6 +121,9 @@ cd client-go && go build && cd ..   # the mpv tests drive this binary
 nix-shell -p mpv ffmpeg --run "node tests/integration.mjs"   # real-mpv Phase A (skips if mpv/ffmpeg missing)
 nix-shell -p mpv ffmpeg --run "node tests/pause_sync.mjs"   # two real clients: pause/resume/seek sync, both directions
 nix-shell -p mpv ffmpeg --run "node tests/soak.mjs"         # both sides act; no echo storms, convergence holds
+nix-shell -p mpv ffmpeg --run "node tests/master_restart.mjs" # the room survives a master restart
+node tests/persist.mjs   # room state survives a server restart
+node tests/audit_server.mjs && node tests/audit2_server.mjs && node tests/audit3_server.mjs   # adversarial audit pins
 ```
 
 ## Deployment (homelab)
@@ -199,7 +202,8 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
   A second `--master` cannot duel for the clock: the server keeps the first
   heartbeat sender, drops the other's heartbeats and warns the room; the
   claim dies with the master's connection, so restarts succeed cleanly.
-- Chat is fire-and-forget; there is no history.
+- Chat history is in-memory only: the last 50 messages replay to each new
+  joiner; a server restart clears it.
 - Windows client (named-pipe IPC) is untested; treat it as best-effort.
 - Browsers are unsupported by design: generic Content-Type, no CORS — use mpv.
 - Follower drift correction is covered by `tests/pause_sync.mjs` (pause, resume,
