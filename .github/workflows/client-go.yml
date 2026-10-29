@@ -62,6 +62,11 @@ jobs:
           node-version: 20
       - run: node tests/smoke.mjs
       - run: node tests/persist.mjs
+      - run: |
+          # adversarial audit pins (server-only, no mpv needed)
+          node tests/audit_server.mjs
+          node tests/audit2_server.mjs
+          node tests/audit3_server.mjs
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
