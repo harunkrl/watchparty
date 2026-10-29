@@ -188,7 +188,7 @@ let lastIdleNotice = -Infinity;
 
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
-function advanceQueue() {
+function advanceQueue(byNick) {
   if (!state.now) {
     // S2: idle skip/ended stays a no-op, but explains itself (every client
     // renders notices; the queue keeps waiting)
@@ -205,7 +205,9 @@ function advanceQueue() {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
     state.dur = null; // so does its duration
-    broadcast({ type: 'load', name: state.now, from: null });
+    const ev = { type: 'load', name: state.now, from: null };
+    if (byNick) ev.nick = byNick; // actor nick (S-D); absent on restore/replay paths
+    broadcast(ev);
     broadcast({ type: 'queue', queue: state.queue });
     saveState();
   }
@@ -216,12 +218,12 @@ function handleCmd(cmd) {
     cmd.nick = clean(cmd.nick || '', 32);
     cmd.text = clean(cmd.text || '', 500); // mirrors client ChatMaxLen
   }
-  // S-B: play/pause/seek relays name the actor (client renders
+  // S-B/S-D: play/pause/seek/load relays name the actor (client renders
   // "> pause by <nick>"). cmd.from is client-supplied so attribution is
   // spoofable — tailnet-trusted; but the nick itself comes ONLY from the
   // roster (join-time cleaned): a never-connected poster has no entry, so
   // the relay carries no nick instead of a client-supplied fake (B3).
-  if (cmd.type === 'play' || cmd.type === 'pause' || cmd.type === 'seek') {
+  if (cmd.type === 'play' || cmd.type === 'pause' || cmd.type === 'seek' || cmd.type === 'load') {
     cmd.nick = nickById.get(cmd.from); // undefined => field drops off the wire
   }
   switch (cmd.type) {
@@ -270,7 +272,10 @@ function handleCmd(cmd) {
     case 'enqueue':
       if (list().includes(cmd.name) && !state.queue.includes(cmd.name) && cmd.name !== state.now) {
         state.queue.push(cmd.name);
-        broadcast({ type: 'queue', queue: state.queue });
+        const ev = { type: 'queue', queue: state.queue };
+        const enqNick = nickById.get(cmd.from);
+        if (enqNick) ev.nick = enqNick; // actor nick (S-D); unknown poster => no field (Karar #26)
+        broadcast(ev);
         saveState();
       }
       break;
@@ -278,10 +283,10 @@ function handleCmd(cmd) {
       // A1: ended never CLAIMS the clock — only position heartbeats do. A
       // follower's EOF in an ownerless room must advance the queue without
       // demoting the real master when it returns.
-      if (clockOwner === null || clockOwner === cmd.from) advanceQueue();
+      if (clockOwner === null || clockOwner === cmd.from) advanceQueue(nickById.get(cmd.from));
       break;
     case 'skip': // same advance, on demand — anyone (dual control)
-      advanceQueue();
+      advanceQueue(nickById.get(cmd.from));
       break;
   }
 }

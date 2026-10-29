@@ -358,6 +358,45 @@ try {
   assert.ok(!lastA.queue.includes('movie three.mkv'), 'playing file must leave the queue for alice');
   assert.ok(!lastB.queue.includes('movie three.mkv'), 'playing file must leave the queue for bob');
 
+  // S-D pins: every user action names its actor. Karar #26: the nick comes
+  // ONLY from the server roster — an unknown poster's relay carries no nick
+  // field at all, never a client-supplied one.
+
+  // (a) load by nick: the relay names the loader; the loader is echo-filtered
+  await post({ type: 'load', from: 'bob', name: 'movie three.mkv' });
+  await waitUntil(() => a.events.some((e) => e.type === 'load' && e.name === 'movie three.mkv' && e.nick === 'Bob'));
+  assert.ok(!b.events.some((e) => e.type === 'load' && e.name === 'movie three.mkv' && e.nick === 'Bob'),
+    'sender must not hear his own load');
+
+  // (b) enqueue: the queue broadcast carries the enqueuer's nick
+  await post({ type: 'enqueue', from: 'bob', name: 'movie one.mkv' });
+  await waitUntil(() => {
+    const last = [...a.events].reverse().find((e) => e.type === 'queue');
+    return last && last.nick === 'Bob' && last.queue.includes('movie one.mkv');
+  }, 3000);
+
+  // (c) skip: the auto-advance load carries the skipper's nick
+  const sLoads = a.events.filter((e) => e.type === 'load').length;
+  await post({ type: 'skip', from: 'bob' });
+  await waitUntil(() => a.events.filter((e) => e.type === 'load').length > sLoads);
+  const skipLoad = [...a.events].reverse().find((e) => e.type === 'load');
+  assert.equal(skipLoad.nick, 'Bob', 'skip advance load must carry the skipper nick');
+  assert.equal(skipLoad.name, 'movie one.mkv', 'skip advances to the enqueued file');
+
+  // (d) ended auto-advance: the load carries the EOF-ing master's nick.
+  // Fresh file so state.now cannot shadow later scenarios' enqueue names.
+  writeFileSync(join(dir, 'movie four.mkv'), Buffer.alloc(1000, 1));
+  await post({ type: 'enqueue', from: 'bob', name: 'movie four.mkv' });
+  await waitUntil(() => {
+    const last = [...a.events].reverse().find((e) => e.type === 'queue');
+    return last && last.queue.includes('movie four.mkv');
+  }, 3000);
+  const eLoads = a.events.filter((e) => e.type === 'load').length;
+  await post({ type: 'ended', from: 'bob' }); // bob owns the clock at this point
+  await waitUntil(() => a.events.filter((e) => e.type === 'load').length > eLoads);
+  const eofLoad = [...a.events].reverse().find((e) => e.type === 'load');
+  assert.equal(eofLoad.nick, 'Bob', 'EOF advance load must carry the master nick');
+
   // the claim dies with the owner's connection: the next poster takes over
   b.close();
   await waitUntil(() => a.events.some((e) => e.type === 'bye' && e.nick === 'Bob'));
