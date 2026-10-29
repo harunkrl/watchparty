@@ -99,10 +99,12 @@ process.on('SIGTERM', () => {
   state.queue = Array.isArray(saved.queue) ? saved.queue.filter((n) => files.includes(n)) : [];
   if (saved.now && files.includes(saved.now)) {
     state.now = saved.now;
-    if (typeof saved.pos === 'number') {
+    if (typeof saved.pos === 'number' && Number.isFinite(saved.pos) && saved.pos >= 0) {
       state.pos = saved.pos;
       state.paused = !!saved.paused;
-      state.posAt = mono() - Math.max(0, Date.now() - (saved.wall || Date.now()));
+      // F2: a garbage wall must not NaN the age (hello.pos serialized as null)
+      const wall = typeof saved.wall === 'number' && Number.isFinite(saved.wall) ? saved.wall : Date.now();
+      state.posAt = mono() - Math.max(0, Date.now() - wall);
       state.dur = typeof saved.dur === 'number' && saved.dur > 0 ? saved.dur : null;
     }
   }
@@ -146,13 +148,20 @@ function isClockOwner(from) {
   return false;
 }
 
+// A2: room-wide cooldown — the idle notice explains a no-op, it must not
+// become an amplifier for a stuck key or a hostile loop
+let lastIdleNotice = -Infinity;
+
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
 function advanceQueue() {
   if (!state.now) {
     // S2: idle skip/ended stays a no-op, but explains itself (every client
     // renders notices; the queue keeps waiting)
-    broadcast({ type: 'notice', from: null, text: 'nothing playing; queue keeps waiting' });
+    if (mono() - lastIdleNotice > 2000) {
+      lastIdleNotice = mono();
+      broadcast({ type: 'notice', from: null, text: 'nothing playing; queue keeps waiting' });
+    }
     return;
   }
   // enqueue checked the disk, but a file may have vanished since; never
@@ -180,9 +189,10 @@ function handleCmd(cmd) {
       broadcast(cmd, cmd.from);
       break;
     case 'seek':
-      // trust boundary: t must be a plain finite number, or state.pos (and
-      // every late joiner's hello.pos) gets poisoned with strings/objects
-      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t)) break;
+      // trust boundary: t must be a plain finite non-negative number, or
+      // state.pos (and every late joiner's hello.pos) gets poisoned with
+      // strings/objects
+      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t) || cmd.t < 0) break;
       broadcast(cmd, cmd.from);
       break;
     case 'play':
@@ -192,7 +202,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'position':
-      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t)) break; // same trust boundary as seek
+      if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t) || cmd.t < 0) break; // same trust boundary as seek
       if (!isClockOwner(cmd.from)) break;
       state.pos = cmd.t;
       state.paused = !!cmd.p;
@@ -220,7 +230,10 @@ function handleCmd(cmd) {
       }
       break;
     case 'ended': // master hit EOF; a follower cannot end the file
-      if (isClockOwner(cmd.from)) advanceQueue();
+      // A1: ended never CLAIMS the clock — only position heartbeats do. A
+      // follower's EOF in an ownerless room must advance the queue without
+      // demoting the real master when it returns.
+      if (clockOwner === null || clockOwner === cmd.from) advanceQueue();
       break;
     case 'skip': // same advance, on demand — anyone (dual control)
       advanceQueue();
@@ -333,7 +346,9 @@ const server = http.createServer((req, res) => {
       // age-adjusted: where the master is right now, not at heartbeat time
       hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
       // S3: a known duration keeps long-downtime joins before EOF
-      if (state.dur != null) hello.pos = Math.max(0, Math.min(hello.pos, state.dur - 1));
+      if (state.dur != null) hello.pos = Math.min(hello.pos, state.dur - 1);
+      // A3: never hand out a negative position
+      hello.pos = Math.max(0, hello.pos);
       hello.p = state.paused;
     }
     res.write(`data: ${JSON.stringify(hello)}\n\n`);

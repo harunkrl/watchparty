@@ -118,6 +118,14 @@ try {
   assert.deepEqual(h2.queue, [], 'vanished file stayed in the restored queue');
   assert.equal(h2.now, 'x.mp4', 'existing now was dropped by the restore filter');
 
+  // audit3 F2: a garbage wall in state.json must not NaN the restored age
+  // (NaN used to serialize as hello.pos = null for every late joiner)
+  writeFileSync(STATE_FILE, JSON.stringify({ now: 'x.mp4', queue: ['y.mp4'], pos: 7, paused: false, dur: 60, wall: 'x' }));
+  await restart();
+  const h3 = await grabHello();
+  assert.equal(h3.now, 'x.mp4', 'garbage wall dropped the restore');
+  assert.ok(Number.isFinite(h3.pos) && h3.pos >= 7 && h3.pos <= 10, `garbage wall must not poison hello.pos, got ${h3.pos}`);
+
   console.log('PASS: room state persisted across restarts, vanished files filtered');
   cleanup(0);
 } catch (e) {
