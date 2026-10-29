@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## v1.3.0 — honest signals, quiet sync
+
+- client: movie mode (ctrl+z) grows a sync strip in the header — the file,
+  the time left in it and a drift chip colored by state (green/amber/red).
+  One number, colored, instead of a second value to interpret
+- client: a file's duration is remembered — reloading it paints the
+  progress bar instantly instead of probing the player again
+- client: the stat row says "♪ muted" when the local player is muted, and
+  the flag survives every pause transition (it used to blink off for a
+  tick when the room paused)
+- client: the system pane reports "reconnected after 42s" after an outage
+- client: a follower whose master heartbeat went quiet shows an amber
+  "⚠ master heartbeat stale" hint instead of a confident drift number
+- client: the player is polled in ONE IPC round trip (was seven) — a tick
+  costs a single write instead of seven request/response pairs
+- client + server: `t` and `p` are always on the wire — a seek to 0 and a
+  paused=false heartbeat used to vanish, and the room self-healed ~2 s
+  later
+- client: headless mode speaks the TUI's language — bare text goes to the
+  room as chat (a line that starts with a reserved word is still that
+  command)
+- server: file and subtitle listings sort naturally ("movie2" before
+  "movie10")
+- server: skipping or ending with nothing playing explains itself instead
+  of silently doing nothing
+- server: the master reports the media duration with its heartbeat, so a
+  joiner returning after a long downtime lands before the end of the film
+- server: `GET /library` lists the videos with their subtitle siblings
+- server: `GET /health` reports `{now, queueLen, listeners}` for watchdog
+  and manual checks
 
 Room quality (P2):
 
@@ -77,6 +106,7 @@ WAN livability (P0):
   the room (5 s post-load quiet window) — closes the late-join rewind
   race and a demoted impostor's spurious rewind; real scrubs inside the
   window self-heal via the master heartbeat
+
 ## v1.2.0 — slash commands, split panes
 
 - commands now require the slash prefix (`/play`, `/queue`, `/pick`,
@@ -113,8 +143,6 @@ WAN livability (P0):
 - master's own play now reflects in the UI immediately (loadedMsg) — the
   server never echoes our own load back, so "now" used to stick at "-"
 - pick overlay on ctrl+p in addition to the command; headless parity kept
-
-## Unreleased (v1.0.x line)
 
 Hardening and sync fixes after a two-agent review; wire protocol stays
 backward compatible (hello gained optional `pos`/`p` fields).
