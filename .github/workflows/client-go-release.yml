@@ -91,6 +91,12 @@ jobs:
           cp artifacts/watchparty-windows-amd64/watchparty.exe /tmp/bundle/
           cp client-go/README-friend.txt /tmp/bundle/
           cp -r /tmp/mpv-portable/* /tmp/bundle/
+          # shinchiro's 7z may extract into a single top-level dir; the
+          # canonical layout has mpv.exe beside watchparty.exe (the client
+          # also searches mpv*/ as a fallback, but the bundle stays flat)
+          if [ ! -f /tmp/bundle/mpv.exe ]; then
+            mv /tmp/bundle/mpv-*/* /tmp/bundle/ && rmdir /tmp/bundle/mpv-*
+          fi
           cd /tmp/bundle
           zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
           cd "$GITHUB_WORKSPACE/dist"

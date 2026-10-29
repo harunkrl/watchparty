@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- client (windows friend flow): errors no longer vanish with the console
+  (the window waits for Enter); a missing mpv says where it looked, and
+  the client now finds mpv both beside the exe and in an mpv*/ subfolder
+  — a fresh extraction of the release bundle starts as-is
+- client: the startup prompt accepts a bare host ("100.101.102.103" or
+  "host:9000" — http:// is optional, :8090 is the default) and remembers
+  the last server + nick: the next launch is Enter, Enter
+- ci: the Windows bundle flattens the mpv archive when it extracts into
+  a subfolder (mpv.exe belongs beside watchparty.exe)
+
 ## v1.3.1 — named actors, honest meters
 
 - client + server: every room action names its actor — system lines read
