@@ -99,7 +99,10 @@ func TestBatchGetIsOneRoundTrip(t *testing.T) {
 	p := testPlayer(t, sock)
 	go p.readLoop()
 
-	props := p.batchGet(pollProps)
+	props, complete := p.batchGet(pollProps)
+	if !complete {
+		t.Fatal("the batch came back truncated")
+	}
 	if len(props) != len(pollProps) {
 		t.Fatalf("got %d of %d properties: %v", len(props), len(pollProps), props)
 	}

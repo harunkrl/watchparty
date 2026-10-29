@@ -45,12 +45,14 @@ type State struct {
 	Pos       *float64 // nil: no time-pos (nothing loaded or idle)
 	Pause     bool
 	Idle      bool
-	Buffering bool    // cache underrun: mpv stalled playback to refill (paused-for-cache)
-	Cache     float64 // demuxer-cache-time: seconds of read-ahead buffered
-	Volume    float64 // audio volume, percent (display only; mpv window owns the keys)
-	Muted     bool    // mpv mute flag (display only)
-	Dur       float64 // media duration in seconds (0 = unknown)
-	Exited    bool    // mpv window was closed; client should shut down
+	Buffering bool      // cache underrun: mpv stalled playback to refill (paused-for-cache)
+	Cache     float64   // demuxer-cache-time: seconds of read-ahead buffered
+	Volume    float64   // audio volume, percent (display only; mpv window owns the keys)
+	Muted     bool      // mpv mute flag (display only)
+	Dur       float64   // media duration in seconds (0 = unknown)
+	Exited    bool      // mpv window was closed; client should shut down
+	At        time.Time // when the sample was taken (a sample older than a load is stale)
+	Partial   bool      // the property batch was truncated: the values are incomplete
 }
 
 // pollProps is what one poll tick reads. They travel as ONE IPC round
@@ -297,11 +299,13 @@ func (p *Player) Get(prop string) (any, error) {
 // batchGet reads several properties in ONE IPC round trip: the requests
 // go out as a single write and the replies come back tagged with their
 // request_id (the read loop already routes them). A property mpv does
-// not answer is simply absent from the result.
-func (p *Player) batchGet(props []string) map[string]any {
+// not answer is simply absent from the result. The second return value
+// says whether the batch was COMPLETE: a truncated batch (mpv wedged
+// mid-way) must not be mistaken for a real sample.
+func (p *Player) batchGet(props []string) (map[string]any, bool) {
 	out := map[string]any{}
 	if p.conn == nil {
-		return out
+		return out, false
 	}
 	type req struct {
 		rid  int
@@ -323,7 +327,7 @@ func (p *Player) batchGet(props []string) map[string]any {
 		}{[]any{"get_property", prop}, rid})
 		if err != nil {
 			p.mu.Unlock()
-			return out
+			return out, false
 		}
 		buf.Write(b)
 		buf.WriteByte('\n')
@@ -337,7 +341,7 @@ func (p *Player) batchGet(props []string) map[string]any {
 			delete(p.pend, r.rid)
 		}
 		p.mu.Unlock()
-		return out
+		return out, false
 	}
 	// one budget for the whole batch: a wedged mpv must not stretch a poll
 	// tick into seven command timeouts
@@ -359,10 +363,10 @@ func (p *Player) batchGet(props []string) map[string]any {
 				delete(p.pend, rest.rid)
 			}
 			p.mu.Unlock()
-			return out
+			return out, false // truncated: the sample is incomplete
 		}
 	}
-	return out
+	return out, true
 }
 
 // numProp reads a numeric property out of a batch result.
@@ -525,7 +529,9 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		case <-t.C:
 		}
 		st := State{}
-		props := p.batchGet(pollProps) // one IPC round trip for the whole tick
+		props, complete := p.batchGet(pollProps) // one IPC round trip for the whole tick
+		st.At = time.Now()                       // when the sample was taken
+		st.Partial = !complete                   // a truncated batch is not a real sample
 		st.Pause = boolProp(props, "pause")
 		st.Idle = boolProp(props, "idle-active")
 		st.Buffering = boolProp(props, "paused-for-cache")

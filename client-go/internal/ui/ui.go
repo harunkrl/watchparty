@@ -253,7 +253,7 @@ func fetchFiles(api *room.Client) tea.Cmd {
 func (m Model) fetchDuration(name string) tea.Cmd {
 	pl := m.player
 	if pl == nil {
-		return nil
+		return func() tea.Msg { return nil } // no player (tests): nothing to probe
 	}
 	return func() tea.Msg {
 		for i := 0; i < durProbes; i++ {
@@ -274,8 +274,11 @@ func (m Model) fetchDuration(name string) tea.Cmd {
 func (m Model) setFile(name string) (Model, tea.Cmd) {
 	m.now = name
 	if d, ok := m.durCache[name]; ok {
+		// known duration: the bar renders instantly, but the file behind
+		// the name may have been replaced (a new cut of the same film) —
+		// one background probe corrects it
 		m.duration = d
-		return m, nil
+		return m, m.fetchDuration(name)
 	}
 	m.duration = 0
 	return m, m.fetchDuration(name)
@@ -800,6 +803,13 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		}
 	case "queue":
 		m.queue = ev.Queue
+	case "notice":
+		// the engine demoted ITSELF when the room named us as the second
+		// master: the UI must follow, or it keeps showing the master clock
+		// and hides the drift of a client that now follows the other one
+		if ev.From != "" && m.master && m.engine != nil && ev.From == m.engine.ID {
+			m.master = false
+		}
 	}
 	// position heartbeats are deliberately not logged (client.py parity)
 	return m, c
@@ -902,7 +912,10 @@ func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
 	if showFooter {
 		fixed++
 	}
-	vh = max(1, inner-fixed)
+	// the open completion menu floats above the input: its rows come out
+	// of the chat, or the frame grows past the terminal and the header
+	// scrolls off (A3-UI5 follow-up)
+	vh = max(1, inner-fixed-m.menuRows())
 	return cw, vh, showBar, showSys, showFooter
 }
 
@@ -916,7 +929,31 @@ func (m Model) contentWidth() int {
 }
 
 func (m Model) prompt() string {
-	return nickStyle(m.nick).Render(m.nick) + " › "
+	nick := m.nick
+	// the prompt must leave room for the input (10 cols minimum): a long
+	// nickname would otherwise grow the row past the frame
+	if budget := m.contentWidth() - 12; budget > 0 && lipgloss.Width(nick) > budget {
+		nick = fitWidth(nick, budget)
+	}
+	return nickStyle(nick).Render(nick) + " › "
+}
+
+// fitWidth cuts a string to at most w visible columns, with an ellipsis.
+func fitWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r)+"…") > w {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 func (m Model) hasChat() bool {
@@ -1620,10 +1657,10 @@ func (m Model) headerLines(cw int) (string, string) {
 		role = "master"
 	}
 	if m.zen {
-		return joinLR(m.nowChip(), m.zenSyncChip(), cw), ""
+		return joinLR(m.nowChip(cw-lipgloss.Width(m.zenSyncChip())-1), m.zenSyncChip(), cw), ""
 	}
 	l1 := joinLR(roleStyle[role].Render("watchparty "+role), m.connChip(), cw)
-	l2 := joinLR(m.nowChip(), m.clockChip(), cw)
+	l2 := joinLR(m.nowChip(cw-lipgloss.Width(m.clockChip())-1), m.clockChip(), cw)
 	return l1, l2
 }
 
@@ -1649,7 +1686,7 @@ func (m Model) connChip() string {
 	}
 }
 
-func (m Model) nowChip() string {
+func (m Model) nowChip(budget int) string {
 	if m.now == "" {
 		if m.st != nil && m.st.Pos != nil {
 			return dim.Render("—") // playing, but the title is not known yet
@@ -1660,7 +1697,9 @@ func (m Model) nowChip() string {
 	if m.st != nil && m.st.Paused {
 		icon, style = "⏸", pausedStyle
 	}
-	return style.Render(icon) + " " + m.now
+	// the title must never grow the row past the frame: a long file name
+	// would push the header off the terminal
+	return style.Render(icon) + " " + fitWidth(m.now, budget-2)
 }
 
 func (m Model) clockChip() string {
@@ -1788,6 +1827,9 @@ func clockStr(sec float64) string {
 
 // humanDur renders "42s", "12m" or "1h 3m" for the connection age.
 func humanDur(d time.Duration) string {
+	if d < 0 {
+		d = 0 // a backwards clock step must not print a negative duration
+	}
 	switch {
 	case d < time.Minute:
 		return fmt.Sprintf("%ds", int(d.Seconds()))

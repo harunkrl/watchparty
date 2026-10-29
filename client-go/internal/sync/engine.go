@@ -105,6 +105,10 @@ type Engine struct {
 	behind     int       // follower: consecutive polls behind live (starvation signal)
 	autoPaused bool      // follower: WE paused the room over a stall
 
+	dur          float64  // the locally known media duration (0 = unknown yet)
+	pendingPos   *float64 // a hello position waiting for the duration to clamp it
+	pendingPause bool     // the paused flag that came with the pending position
+
 	lastActuate  time.Time // last programmatic SetPause/Seek (echo gate)
 	actuatePause *bool     // pause state that actuation set (nil = seek); an
 	// mpv event is only an echo when it matches this — the user pressing
@@ -128,7 +132,8 @@ type Engine struct {
 type snapshot struct {
 	t      float64
 	paused bool
-	at     time.Time
+	at     time.Time // when the snapshot was anchored (drift math; re-anchored on resume)
+	beat   time.Time // when the last heartbeat arrived (the stale check uses this)
 }
 
 func (e *Engine) logf(format string, args ...any) {
@@ -156,6 +161,9 @@ func (e *Engine) setPause(paused bool) {
 }
 
 func (e *Engine) seekTo(t float64) {
+	if t < 0 {
+		t = 0 // the server rejects a negative target: never seek before the head
+	}
 	e.lastActuate = e.Clock.Now()
 	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
 	e.lastSeekAt = e.lastActuate
@@ -181,7 +189,9 @@ func (e *Engine) OnRoom(ev room.Event) {
 	defer e.mu.Unlock()
 	switch ev.Type {
 	case "position":
-		e.snap = &snapshot{t: ev.T, paused: ev.P, at: e.Clock.Now()}
+		now := e.Clock.Now()
+		e.snap = &snapshot{t: ev.T, paused: ev.P, at: now, beat: now}
+		e.pendingPos = nil // a fresh heartbeat supersedes a pending hello position
 	case "hello":
 		// Resume-by-design: a reconnecting client (follower OR master)
 		// reloads the room's file and seeks to the live position. For a
@@ -203,11 +213,16 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// cleared by load/ended/skip). When present, snap now and seek
 		// before the first heartbeat would even arrive.
 		if ev.Pos != nil {
-			e.snap = &snapshot{t: *ev.Pos, paused: ev.P, at: e.Clock.Now()}
-			// skip the seek when already there: on an SSE blip this is a
-			// sub-second rewind that would flash the same frame (F3)
-			if t, ok := e.Player.Pos(); !ok || abs(t-*ev.Pos) > Tolerance {
-				e.seekTo(*ev.Pos)
+			// F1: clamp the room's position to the file we actually have.
+			// mpv reports the duration only after the file is loaded, so
+			// the duration is often unknown here: seeking then could land
+			// past the end of the film (EOF). Wait for the first sample
+			// that knows the duration.
+			if e.dur > 0 {
+				e.applySnapshot(*ev.Pos, ev.P)
+			} else {
+				p := *ev.Pos
+				e.pendingPos, e.pendingPause = &p, ev.P
 			}
 			if ev.P {
 				e.setPause(true)
@@ -267,6 +282,12 @@ func (e *Engine) load(name string) {
 	e.loaded = name // claim it only once mpv actually took the file
 	e.loadedAt = e.Clock.Now()
 	e.lastPos = nil // a new file starts at the head: the old scrub baseline is stale
+	e.dur = 0       // the new file's duration is unknown until mpv reports it
+	// the old snapshot describes the PREVIOUS file: keeping it would make
+	// the follower chase a position that does not exist in this one (and
+	// the room could be paused for a "stall" that is just the new head)
+	e.snap = nil
+	e.pendingPos = nil
 }
 
 // OwnLoad records a file the local user started outside the room-event
@@ -280,6 +301,25 @@ func (e *Engine) OwnLoad(name string) {
 	e.behind, e.autoPaused = 0, false
 	e.wasActive = false // same as load(): the new file owns the next EOF
 	e.lastPos = nil     // same as load(): the position jumped, the baseline is stale
+	e.dur = 0           // same as load(): the new duration is unknown yet
+	e.snap = nil        // same as load(): the old snapshot belongs to the old file
+	e.pendingPos = nil
+}
+
+// applySnapshot anchors the room's live position, clamped to the file we
+// actually have: the room's position can be past the end of our file
+// (a stale room snapshot), and seeking there would EOF the player.
+func (e *Engine) applySnapshot(pos float64, paused bool) {
+	if e.dur > 0 && pos > e.dur-1 {
+		pos = e.dur - 1
+	}
+	now := e.Clock.Now()
+	e.snap = &snapshot{t: pos, paused: paused, at: now, beat: now}
+	// skip the seek when already there: on an SSE blip this is a
+	// sub-second rewind that would flash the same frame (F3)
+	if t, ok := e.Player.Pos(); !ok || abs(t-pos) > Tolerance {
+		e.seekTo(pos)
+	}
 }
 
 // PauseToggle is the TUI hotkey equivalent of a space-bar press in the
@@ -340,6 +380,16 @@ func (e *Engine) SeekBy(dt float64) {
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// SYNC2: a sample taken BEFORE the last load describes the previous
+	// file. The poll samples in its own goroutine, so it can hand us an
+	// old sample after the room already moved on: posting it would carry
+	// the old position and duration into the new film's heartbeat.
+	if !e.loadedAt.IsZero() && !s.At.IsZero() && s.At.Before(e.loadedAt) {
+		return
+	}
+	if s.Dur > 0 {
+		e.dur = s.Dur // the locally known media duration (F1 clamp)
+	}
 	// EOF transition (either role): at idle mpv keeps pause=false and drops
 	// time-pos, so without this the UI sits on a stale ▶ forever. Ended
 	// reads as paused until the next load.
@@ -351,6 +401,13 @@ func (e *Engine) OnMpvp(s mpv.State) {
 		}
 	} else if !s.Idle && s.Pos != nil {
 		e.wasActive = true
+	}
+	// F1: the hello position waited for the duration — now it can be
+	// clamped and applied.
+	if e.pendingPos != nil && e.dur > 0 {
+		pos := *e.pendingPos
+		e.pendingPos = nil
+		e.applySnapshot(pos, e.pendingPause)
 	}
 	if e.Master {
 		e.masterTick(s)
@@ -473,6 +530,13 @@ func (e *Engine) postDiscrete(ev room.Event) {
 }
 
 func (e *Engine) masterTick(s mpv.State) {
+	if s.Partial {
+		// MPV1: the property batch was truncated (mpv wedged mid-way).
+		// The values are incomplete, so no heartbeat goes out: the room's
+		// clock must not jump on a partial read.
+		e.logf("> mpv sample truncated: no heartbeat this tick")
+		return
+	}
 	if s.Pos == nil && !s.Idle {
 		return // nothing loaded yet
 	}
@@ -594,9 +658,12 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 	if e.Ui == nil {
 		return
 	}
-	// follower only: a snapshot older than staleAge means no heartbeat
-	// arrived for a while — the drift number below is then meaningless
-	stale := !e.Master && e.snap != nil && e.Clock.Since(e.snap.at) > staleAge
+	// follower only: a heartbeat older than staleAge means the master's
+	// heartbeats stopped — the drift number below is then meaningless.
+	// The heartbeat age is measured on its own stamp (snap.beat): the
+	// snapshot's anchor (snap.at) is re-anchored by a discrete play event
+	// (R5), which would hide a dead master.
+	stale := !e.Master && e.snap != nil && e.Clock.Since(e.snap.beat) > staleAge
 	select {
 	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale}:
 	default:

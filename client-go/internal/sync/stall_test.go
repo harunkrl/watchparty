@@ -131,6 +131,9 @@ func TestHelloBlipNoReload(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(room.Event{Type: "load", Name: "x.mkv"})
 	pl.pos = ptr(30.5) // ~0.5s from the hello position: inside Tolerance
+	// the local duration must be known before a hello position can be
+	// clamped to it (F1): mpv reports the duration a moment after a load
+	e.OnMpvp(mpv.State{Pos: ptr(30.5), Dur: 300})
 
 	p := 30.0
 	e.OnRoom(room.Event{Type: "hello", Now: "x.mkv", Pos: &p})

@@ -13,8 +13,9 @@ import (
 	"watchparty/client-go/internal/sync"
 )
 
-// C2: a duration we already measured must never be probed again — the
-// reload paints the bar instantly.
+// C2 (+ UI5): a duration we already measured must paint the bar INSTANTLY
+// on a reload — and one background probe still verifies it, because the
+// file behind a name may have been replaced.
 func TestDurationCacheAvoidsReprobe(t *testing.T) {
 	m := New("ada", nil, nil, false, nil)
 	m = upd(t, m, durationMsg{name: "movie.mkv", dur: 600})
@@ -25,8 +26,8 @@ func TestDurationCacheAvoidsReprobe(t *testing.T) {
 	if m2.duration != 600 {
 		t.Fatalf("cached duration lost: %v", m2.duration)
 	}
-	if cmd != nil {
-		t.Fatal("a cached duration must not re-probe mpv")
+	if cmd == nil {
+		t.Fatal("a cached duration must still be verified in the background")
 	}
 	// the room's load broadcast for a known file is instant too
 	m3 := upd(t, m, room.Event{Type: "load", Name: "movie.mkv"})
