@@ -105,6 +105,12 @@ try {
   // S-A: hello carries a dialable invite URL — the server is the only party
   // that knows its reachable address (the client may be off-host)
   assert.match(a.events[0].invite, /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/, `invite: ${a.events[0].invite}`);
+  // S-C: an optional second invite shares the URL shape and differs from the
+  // best one; when there is no second address the field is omitted entirely
+  if (a.events[0].inviteAlt !== undefined) {
+    assert.match(a.events[0].inviteAlt, /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/, `inviteAlt: ${a.events[0].inviteAlt}`);
+    assert.notEqual(a.events[0].inviteAlt, a.events[0].invite, 'inviteAlt must differ from invite');
+  }
   await waitUntil(() => a.events.some((e) => e.type === 'join' && e.nick === 'Bob'));
 
   // S5: health endpoint for watchdog/manual liveness checks

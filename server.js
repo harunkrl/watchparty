@@ -38,28 +38,37 @@ const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort(n
 const SUB_RE = /\.(srt|ass|ssa|vtt)$/i;
 const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort(natural);
 
-// S-A: the invite URL only the server can know — a client may sit on another
-// host, so hello points at a dialable IPv4 instead of localhost. Preference:
-// tailscale (100.64/10), then RFC1918 private, then any non-internal v4;
-// loopback only as the last resort.
-function inviteHost() {
-  const rank = (a) => {
-    const [o1, o2] = a.split('.').map(Number);
-    if (o1 === 100 && o2 >= 64 && o2 <= 127) return 0; // CGNAT / tailscale
-    if (o1 === 10 || (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168)) return 1;
-    return 2;
-  };
-  let best = '127.0.0.1';
-  let bestRank = 3;
+// S-A/S-C: the invite URLs only the server can know — a client may sit on
+// another host, so hello points at dialable IPv4s instead of localhost.
+// invite = best (tailscale 100.64/10, then RFC1918 private, then any other
+// non-internal v4); inviteAlt = the best address from a DIFFERENT rank,
+// drawn only from the CGNAT/RFC1918 pools (the tailscale+LAN pair is the
+// goal). shortcut: docker's 172.16/12 ranks below the other RFC1918 ranges
+// (bridges are rarely the address a friend can reach) — it is only picked
+// when no other private address exists. Loopback only as the last resort.
+function inviteHosts() {
+  const oct = (a) => a.split('.').map(Number);
+  const isCgnat = ([o1, o2]) => o1 === 100 && o2 >= 64 && o2 <= 127;
+  const isDocker = ([o1, o2]) => o1 === 172 && o2 >= 16 && o2 <= 31;
+  const isPrivate = ([o1, o2]) => o1 === 10 || (o1 === 192 && o2 === 168) || isDocker([o1, o2]);
+  const cands = [];
   for (const ifs of Object.values(os.networkInterfaces())) {
     // some platforms return undefined entries (H): never crash the /events handler
     for (const it of ifs || []) {
       if (it.family !== 'IPv4' || it.internal) continue;
-      const r = rank(it.address);
-      if (r < bestRank) [best, bestRank] = [it.address, r];
+      const o = oct(it.address);
+      // 0 CGNAT/tailscale · 1 RFC1918 · 2 docker 172.16/12 · 3 other non-internal
+      const r = isCgnat(o) ? 0 : isPrivate(o) && !isDocker(o) ? 1 : isDocker(o) ? 2 : 3;
+      cands.push({ addr: it.address, r });
     }
   }
-  return best;
+  cands.sort((a, b) => a.r - b.r); // stable sort: interface order breaks ties
+  const best = cands[0];
+  // S-C2: alt comes only from the CGNAT/real-RFC1918 pools — docker 172.16/12
+  // (r=2) must never become inviteAlt (a docker bridge is not the friend's LAN);
+  // it stays eligible for best when it is the only address (unlabeled single).
+  const alt = best && cands.find((c) => c !== best && c.r <= 1 && c.r !== best.r);
+  return [best ? best.addr : '127.0.0.1', alt && alt.addr];
 }
 
 // R9: recent chat replayed once to each NEW connection id — a joiner sees
@@ -377,11 +386,13 @@ const server = http.createServer((req, res) => {
     nickById.set(id, nick);
     // roster rides hello: late joiners must see everyone already in the
     // room, not only the joins that happen after them
+    const [inviteHost, inviteHostAlt] = inviteHosts();
     const hello = {
       type: 'hello', now: state.now, queue: state.queue,
       roster: [...new Set(nickById.values())],
-      invite: `http://${inviteHost()}:${PORT}`,
+      invite: `http://${inviteHost}:${PORT}`,
     };
+    if (inviteHostAlt) hello.inviteAlt = `http://${inviteHostAlt}:${PORT}`; // absent when there is no second address
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
       hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
