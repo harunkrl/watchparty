@@ -53,6 +53,8 @@ type State struct {
 	Exited    bool      // mpv window was closed; client should shut down
 	At        time.Time // when the sample was taken (a sample older than a load is stale)
 	Partial   bool      // the property batch was truncated: the values are incomplete
+	Sub       string    // language of the active subtitle track ("" = none/unknown)
+	Layout    string    // audio channel layout as mpv names it ("stereo", "5.1"; "" = unknown)
 }
 
 // pollProps is what one poll tick reads. They travel as ONE IPC round
@@ -61,6 +63,7 @@ type State struct {
 var pollProps = []string{
 	"pause", "idle-active", "paused-for-cache", "time-pos",
 	"demuxer-cache-time", "volume", "mute", "duration",
+	"audio-params", "track-list",
 }
 
 // Event is one pushed mpv notification (Name is the mpv event id, e.g.
@@ -389,6 +392,47 @@ func boolProp(props map[string]any, key string) bool {
 	return b
 }
 
+// audioLayout reads the channel layout name out of the batch
+// ("stereo", "5.1", ...). mpv only answers audio-params while an audio
+// stream is loaded, so an unknown layout stays EMPTY: the UI must not
+// claim "stereo" it cannot see.
+func audioLayout(props map[string]any) string {
+	m, ok := props["audio-params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m["channels"].(string)
+	return s
+}
+
+// subLang returns the language of the active subtitle track. Empty when
+// there is none, when mpv does not know it ("und") or when the property
+// is missing (an older build).
+func subLang(props map[string]any) string {
+	list, ok := props["track-list"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, t := range list {
+		m, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if ty, _ := m["type"].(string); ty != "sub" {
+			continue
+		}
+		if sel, _ := m["selected"].(bool); !sel {
+			continue
+		}
+		lang, _ := m["lang"].(string)
+		if lang == "" || lang == "und" {
+			return ""
+		}
+		return lang
+	}
+	return ""
+}
+
 // Pos returns the current playback position; ok=false when nothing plays.
 func (p *Player) Pos() (float64, bool) {
 	v, err := p.Get("time-pos")
@@ -542,6 +586,8 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 		st.Cache, _ = numProp(props, "demuxer-cache-time")
 		st.Volume, _ = numProp(props, "volume")
 		st.Dur, _ = numProp(props, "duration")
+		st.Layout = audioLayout(props)
+		st.Sub = subLang(props)
 		select {
 		case out <- st:
 		case <-ctx.Done():

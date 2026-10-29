@@ -77,13 +77,16 @@ type Player interface {
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
 // when nobody consumes yet.
 type UiState struct {
-	Drift  float64  // follower pos - master expected, seconds
-	Pos    *float64 // local playback position (master: own, follower: own)
-	Paused bool
-	Cache  float64 // seconds of read-ahead buffered (demuxer-cache-time)
-	Volume float64 // audio volume percent (display only)
-	Muted  bool    // mpv mute flag (display only)
-	Stale  bool    // follower: the master's heartbeat is older than staleAge
+	Drift    float64  // follower pos - master expected, seconds
+	Pos      *float64 // local playback position (master: own, follower: own)
+	Paused   bool
+	Cache    float64 // seconds of read-ahead buffered (demuxer-cache-time)
+	Volume   float64 // audio volume percent (display only)
+	Muted    bool    // mpv mute flag (display only)
+	Stale    bool    // follower: the master's heartbeat is older than staleAge
+	PausedBy string  // who paused the room ("" = our own action or unknown)
+	Sub      string  // language of the active subtitle track (personal only)
+	Layout   string  // audio channel layout ("stereo"; "" = unknown)
 }
 
 type Engine struct {
@@ -98,6 +101,7 @@ type Engine struct {
 	lastPos   *float64
 	lastPause bool
 	wasActive bool
+	pausedBy  string    // who paused the room (the relay's nick); "" = our own action
 	snap      *snapshot // follower: latest master position heartbeat
 
 	loaded     string    // file our mpv is playing ("" = none; set on successful load)
@@ -226,6 +230,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 			}
 			if ev.P {
 				e.setPause(true)
+				e.pausedBy = "" // the snapshot names no actor: honest empty
 			}
 		}
 	case "load":
@@ -234,8 +239,9 @@ func (e *Engine) OnRoom(ev room.Event) {
 		}
 	case "pause":
 		e.setPause(true)
-		e.lastPause = true  // master dedup stays consistent with reality
-		e.postedPause = nil // the room's state supersedes our pending post
+		e.lastPause = true   // master dedup stays consistent with reality
+		e.postedPause = nil  // the room's state supersedes our pending post
+		e.pausedBy = ev.Nick // the relay names the actor ("" = unstamped)
 		if e.snap != nil {
 			e.snap.paused = true // discrete events are room truth; don't wait for the next heartbeat
 		}
@@ -245,6 +251,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 		e.setPause(false)
 		e.lastPause = false
 		e.postedPause = nil // the room's state supersedes our pending post
+		e.pausedBy = ""     // playing: nobody holds the pause
 		if e.snap != nil {
 			e.snap.paused = false
 			// re-anchor: the snapshot's age spans the pause; aging it into
@@ -350,6 +357,7 @@ func (e *Engine) PauseToggle() {
 	}
 	e.setPause(want)
 	e.lastPost = e.Clock.Now()
+	e.pausedBy = "" // our own action: nobody else holds the pause
 	typ := "play"
 	if want {
 		typ = "pause"
@@ -582,7 +590,7 @@ func (e *Engine) followerTick(s mpv.State) {
 		// s.Pause is pre-actuation and the next poll is 2s away — without this
 		// the follower UI sits on a stale ▶/⏸ while mpv is already there
 		e.setPause(e.snap.paused)
-		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted}, 0)
+		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Sub: s.Sub, Layout: s.Layout}, 0)
 		return
 	}
 	if e.snap.paused {
@@ -649,6 +657,7 @@ func (e *Engine) stallBlock(s mpv.State) {
 	}
 	e.autoPaused = true
 	e.snap.paused = true // mirror our post: heartbeats carry the pre-post state briefly
+	e.pausedBy = ""      // our own stall pause: no actor
 	e.lastPost = e.Clock.Now()
 	e.postDiscrete(room.Event{Type: "pause"})
 	_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
@@ -664,8 +673,12 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 	// snapshot's anchor (snap.at) is re-anchored by a discrete play event
 	// (R5), which would hide a dead master.
 	stale := !e.Master && e.snap != nil && e.Clock.Since(e.snap.beat) > staleAge
+	by := e.pausedBy
+	if !s.Pause {
+		by = "" // playing: the chip is not shown, the actor is moot
+	}
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Sub: s.Sub, Layout: s.Layout}:
 	default:
 	}
 }

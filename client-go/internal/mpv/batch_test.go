@@ -89,6 +89,13 @@ func fakeValue(prop string) any {
 		return 90.0
 	case "pause", "idle-active", "paused-for-cache":
 		return false
+	case "audio-params":
+		return map[string]any{"channels": "stereo", "channel-count": 2}
+	case "track-list":
+		return []any{
+			map[string]any{"id": 1, "type": "audio", "selected": true},
+			map[string]any{"id": 2, "type": "sub", "lang": "trg", "selected": true},
+		}
 	}
 	return nil
 }
@@ -165,5 +172,61 @@ func TestPollReadsBatchInOneRoundTrip(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the fake mpv never saw the poll batch")
+	}
+}
+
+// H2/H5: the poll fills the audio layout and the active subtitle — both
+// come out of the same batch (one IPC round trip).
+func TestPollReadsLayoutAndSubtitle(t *testing.T) {
+	reads := make(chan int, 8)
+	sock := fakeMpv(t, reads)
+	p := testPlayer(t, sock)
+	go p.readLoop()
+
+	out := make(chan State, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Poll(ctx, 50*time.Millisecond, out)
+
+	select {
+	case st := <-out:
+		if st.Layout != "stereo" {
+			t.Fatalf("layout = %q, want stereo", st.Layout)
+		}
+		if st.Sub != "trg" {
+			t.Fatalf("subtitle = %q, want trg", st.Sub)
+		}
+		if st.Partial {
+			t.Fatal("a complete batch must not be marked partial")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the poll never produced a state")
+	}
+}
+
+// H2/H5: a property mpv does not answer must not break the sample — the
+// layout and the subtitle stay EMPTY (the UI must not guess "stereo").
+func TestMissingPropertyLeavesTheSampleHonest(t *testing.T) {
+	props := map[string]any{"pause": true}
+	if l := audioLayout(props); l != "" {
+		t.Fatalf("layout without audio-params = %q, want empty", l)
+	}
+	if s := subLang(props); s != "" {
+		t.Fatalf("subtitle without track-list = %q, want empty", s)
+	}
+	// a track list without an active subtitle stays empty too
+	props = map[string]any{"track-list": []any{
+		map[string]any{"type": "sub", "lang": "trg", "selected": false},
+		map[string]any{"type": "audio", "selected": true},
+	}}
+	if s := subLang(props); s != "" {
+		t.Fatalf("subtitle without a selected track = %q, want empty", s)
+	}
+	// an unknown language is not a language
+	props = map[string]any{"track-list": []any{
+		map[string]any{"type": "sub", "lang": "und", "selected": true},
+	}}
+	if s := subLang(props); s != "" {
+		t.Fatalf("subtitle with an unknown language = %q, want empty", s)
 	}
 }

@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +201,10 @@ func TestRenderEventTable(t *testing.T) {
 		{room.Event{Type: "pause", Nick: "bo"}, "ada", "> pause by bo"},
 		{room.Event{Type: "play", Nick: "bo"}, "ada", "> play by bo"},
 		{room.Event{Type: "seek", T: 12.3, Nick: "bo"}, "ada", "> seek @12.3s by bo"},
+		{room.Event{Type: "load", Name: "a.mkv", Nick: "bo"}, "ada", "> load a.mkv by bo"},
+		{room.Event{Type: "queue", Queue: []string{"a"}, Nick: "bo"}, "ada", "> queue: [a] by bo"},
+		{room.Event{Type: "load", Name: "a.mkv", Nick: "ada"}, "ada", "> load a.mkv"},
+		{room.Event{Type: "queue", Queue: []string{"a"}, Nick: "ada"}, "ada", "> queue: [a]"},
 		{room.Event{Type: "pause", Nick: "ada"}, "ada", "> pause"}, // our own action stays bare
 		{room.Event{Type: "seek", T: 12.3, Nick: "ada"}, "ada", "> seek @12.3s"},
 	}
@@ -965,27 +972,40 @@ func TestInviteFromHello(t *testing.T) {
 
 // --- v2 polish round (T1..T6, K1, K2) ---------------------------------------
 
-// T1/T2: the queue box says how many files it holds and how to skip —
-// the hint row comes out of the same row budget.
+// T1/FB1: the queue box says how many files it holds and how to skip —
+// the hint rides in the TITLE, so it costs no row.
 func TestQueueBoxShowsCountAndSkipHint(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
 	if !strings.Contains(m.View(), "QUEUE (0)") {
 		t.Fatalf("the empty queue must show its count:\n%s", m.View())
 	}
+	if strings.Contains(m.View(), "/skip next") {
+		t.Fatalf("an empty queue must not advertise a skip:\n%s", m.View())
+	}
 	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv", "b.mkv"}})
 	v := m.View()
-	if !strings.Contains(v, "QUEUE (2)") {
-		t.Fatalf("the queue count missing:\n%s", v)
+	if !strings.Contains(v, "QUEUE (2) · /skip next") {
+		t.Fatalf("the queue count or the skip hint missing:\n%s", v)
 	}
-	lines := strings.Split(v, "\n")
-	for i, l := range lines {
-		if strings.Contains(l, "QUEUE (2)") {
-			if i+1 >= len(lines) || !strings.Contains(lines[i+1], "/skip next") {
-				t.Fatalf("the skip hint must be the first queue row: %q", lines)
-			}
-			break
-		}
+}
+
+// FB1: a non-empty queue ALWAYS shows at least one file name — even at
+// the 4-row floor, where the overflow hint takes the second row.
+func TestQueueAlwaysShowsAFileName(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	q := make([]string, 25)
+	for i := range q {
+		q[i] = fmt.Sprintf("video-%02d.mkv", i)
+	}
+	m = upd(t, m, room.Event{Type: "queue", Queue: q})
+	v := m.View()
+	if !strings.Contains(v, "1. video-00.mkv") {
+		t.Fatalf("the queue box shows no file name:\n%s", v)
+	}
+	if !strings.Contains(v, "+24 more") {
+		t.Fatalf("the overflow hint missing:\n%s", v)
 	}
 }
 
@@ -1002,50 +1022,72 @@ func TestWaitingForFollowerHint(t *testing.T) {
 	}
 }
 
-// T4: the hotbar verb follows the state: resume while paused.
+// H8: the hotbar verb is the ACTION the key does now: pause while the
+// room plays, play while it is paused.
 func TestHotbarVerbIsContextual(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
-	if !strings.Contains(m.View(), "play/pause") {
-		t.Fatalf("the hotbar must offer play/pause by default:\n%s", m.View())
+	if !strings.Contains(m.View(), "[ctrl+space] pause") {
+		t.Fatalf("the hotbar must offer pause by default:\n%s", m.View())
 	}
 	pos := 10.0
 	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
 	v := m.View()
-	if !strings.Contains(v, "resume") {
-		t.Fatalf("the paused hotbar must offer resume:\n%s", v)
-	}
-	if strings.Contains(v, "play/pause") {
-		t.Fatalf("the paused hotbar still says play/pause:\n%s", v)
+	if !strings.Contains(v, "[ctrl+space] play") {
+		t.Fatalf("the paused hotbar must offer play:\n%s", v)
 	}
 }
 
-// T5: the band title names the seek keys (the dashboard bar is not clickable).
+// H3: the band names the seek keys in its right segment (and says
+// PAUSED while the room is paused).
 func TestBandTitleNamesSeekKeys(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
-	if !strings.Contains(m.View(), "NOW PLAYING · ctrl+←/→ to seek") {
-		t.Fatalf("the band title misses the seek hint:\n%s", m.View())
+	v := m.View()
+	if !strings.Contains(v, "NOW PLAYING") {
+		t.Fatalf("the band title missing:\n%s", v)
+	}
+	if strings.Contains(v, "click bar") {
+		t.Fatalf("no bar, no click hint:\n%s", v)
+	}
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos})
+	m.now = "vid.mp4"
+	m = upd(t, m, durationMsg{name: "vid.mp4", dur: 100})
+	if !strings.Contains(m.View(), "click bar or ctrl+←/→ to seek") {
+		t.Fatalf("the band misses the seek hint:\n%s", m.View())
+	}
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	if !strings.Contains(m.View(), "NOW PLAYING · PAUSED") {
+		t.Fatalf("the paused band must say so:\n%s", m.View())
 	}
 }
 
-// T6: the equalizer title names the real state only.
-func TestEqualizerTitleSuffix(t *testing.T) {
+// H2: the equalizer names the real state only — and the layout is only
+// named when mpv told us.
+func TestEqualizerLabel(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
 	pos := 10.0
 	m = upd(t, m, sync.UiState{Pos: &pos, Volume: 80})
-	if !strings.Contains(m.View(), "EQUALIZER · ♪ vol 80%") {
-		t.Fatalf("the volume suffix missing:\n%s", m.View())
+	if !strings.Contains(m.View(), "♪ vol 80%") {
+		t.Fatalf("the volume label missing:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "stereo") {
+		t.Fatal("an unknown layout must not be claimed")
+	}
+	m = upd(t, m, sync.UiState{Pos: &pos, Volume: 80, Layout: "stereo"})
+	if !strings.Contains(m.View(), "♪ vol 80% · stereo") {
+		t.Fatalf("the layout label missing:\n%s", m.View())
 	}
 	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
-	if !strings.Contains(m.View(), "EQUALIZER · ⏸ paused · decaying") {
-		t.Fatalf("the paused suffix missing:\n%s", m.View())
+	if !strings.Contains(m.View(), "⏸ paused") {
+		t.Fatalf("the paused label missing:\n%s", m.View())
 	}
 	// idle: no state, no claim
 	m2 := New("t", nil, nil, false, nil)
 	m2 = upd(t, m2, tea.WindowSizeMsg{Width: 120, Height: 30})
-	if strings.Contains(m2.View(), "EQUALIZER ·") {
+	if strings.Contains(m2.View(), "vol") || strings.Contains(m2.View(), "⏸") {
 		t.Fatalf("the idle equalizer must not claim a state:\n%s", m2.View())
 	}
 }
@@ -1153,5 +1195,199 @@ func TestZenContinuationInheritsHeadState(t *testing.T) {
 	lines = m.renderChatLines()
 	if !strings.Contains(lines[0], code) || !strings.Contains(lines[1], code) {
 		t.Fatalf("the continuation must inherit the dim head: %q", lines)
+	}
+}
+
+// --- v2b round (H1..H8) ---------------------------------------------------
+
+// H3: the dashboard bar is clickable — a click in the middle of it seeks
+// the room to the middle of the film.
+func TestDashboardBarClickSeeks(t *testing.T) {
+	posted := make(chan room.Event, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev room.Event
+		if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
+			t.Errorf("bad /cmd body: %v", err)
+			return
+		}
+		posted <- ev
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	api := room.New(srv.URL, "sen-1")
+	m := New("sen", api, nil, true, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	pos := 0.0
+	m = upd(t, m, sync.UiState{Pos: &pos})
+	m.now = "vid.mp4"
+	m = upd(t, m, durationMsg{name: "vid.mp4", dur: 100})
+
+	// the bar row of the band: header, gap, border, name, blank, bar
+	click := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 59, Y: 5})
+	_, cmd := m.Update(click)
+	if cmd == nil {
+		t.Fatal("the dashboard bar click produced no seek")
+	}
+	cmd()
+	select {
+	case ev := <-posted:
+		if ev.Type != "seek" {
+			t.Fatalf("posted %+v, want a seek", ev)
+		}
+		if ev.T < 40 || ev.T > 60 {
+			t.Fatalf("seek target %.1fs, want about the middle of 100s", ev.T)
+		}
+	default:
+		t.Fatal("no seek was posted")
+	}
+	// a click outside the bar row must not seek
+	_, cmd2 := m.Update(tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 59, Y: 4}))
+	if cmd2 != nil {
+		t.Fatal("a click off the bar row must not seek")
+	}
+}
+
+// H4: the stat row names who paused the room — and stays bare when the
+// pause is ours.
+func TestStatRowNamesThePauseActor(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true, PausedBy: "bo"})
+	row := strings.Join(m.nowPlayingLines(100), "\n")
+	if !strings.Contains(row, "⏸ paused by bo") {
+		t.Fatalf("the actor chip missing: %q", row)
+	}
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	row = strings.Join(m.nowPlayingLines(100), "\n")
+	if !strings.Contains(row, "⏸ paused") || strings.Contains(row, "by ") {
+		t.Fatalf("our own pause must stay bare: %q", row)
+	}
+}
+
+// H5: the subtitle chip is PERSONAL — it shows the local track and is
+// never synced or posted.
+func TestSubtitleChipIsPersonal(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Sub: "tr"})
+	row := strings.Join(m.nowPlayingLines(100), "\n")
+	if !strings.Contains(row, "⊞ you: sub tr [j in mpv]") {
+		t.Fatalf("the subtitle chip missing: %q", row)
+	}
+	chip := m.zenSyncChip()
+	if !strings.Contains(chip, "⊞ tr") {
+		t.Fatalf("the zen chip misses the subtitle: %q", chip)
+	}
+	// no subtitle, no chip anywhere
+	m2 := New("t", nil, nil, false, nil)
+	m2 = upd(t, m2, sync.UiState{Pos: &pos})
+	if strings.Contains(strings.Join(m2.nowPlayingLines(100), "\n"), "sub") {
+		t.Fatal("the subtitle chip must not appear without a subtitle")
+	}
+	if strings.Contains(m2.zenSyncChip(), "⊞") {
+		t.Fatal("the zen chip must not appear without a subtitle")
+	}
+}
+
+// H6: the system tail grows to 30 lines on a tall terminal.
+func TestSystemTailHasThirtyLines(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 50})
+	for i := 0; i < 40; i++ {
+		m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: fmt.Sprintf("line-%02d", i)})
+		m = m.logEngine(fmt.Sprintf("> tick %02d", i))
+	}
+	v := m.View()
+	if !strings.Contains(v, "30-line tail") {
+		t.Fatalf("the system tail must show 30 lines:\n%s", v)
+	}
+	if n := len(strings.Split(v, "\n")); n > 50 {
+		t.Fatalf("the dashboard overflows: %d rows", n)
+	}
+}
+
+// H8: all six hotbar items fit in the narrowest dashboard (100 columns).
+func TestHotbarFitsNarrowDashboard(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 20})
+	v := m.View()
+	for _, want := range []string{"[tab]", "[ctrl+g]", "[ctrl+space]", "[ctrl+p]"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("the hotbar misses %q:\n%s", want, v)
+		}
+	}
+	for i, l := range strings.Split(v, "\n") {
+		if w := lipgloss.Width(l); w > 100 {
+			t.Fatalf("line %d is %d cols (> 100): %q", i, w, l)
+		}
+	}
+}
+
+// H8: an empty input + Tab opens the command menu (the verbs must be
+// discoverable without the slash).
+func TestEmptyInputTabOpensCommandMenu(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("Tab on an empty input must open the menu")
+	}
+	joined := strings.Join(m.menuLines(m.contentWidth()), "\n")
+	if !strings.Contains(joined, "/play") {
+		t.Fatalf("the menu misses the verbs: %q", joined)
+	}
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.HasPrefix(m.input.Value(), "/") {
+		t.Fatalf("enter must fill the input: %q", m.input.Value())
+	}
+}
+
+// H2b: while paused the equalizer FREEZES (no decay) and wears the
+// pause color; while playing it is green.
+func TestPausedEqualizerFreezes(t *testing.T) {
+	orig := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(orig)
+
+	m := New("t", nil, nil, false, nil)
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	m = m.stepEq()
+	before := append([]float64{}, m.eq...)
+	m = m.stepEq()
+	for i := range before {
+		if m.eq[i] != before[i] {
+			t.Fatalf("the paused bars must freeze: %v -> %v", before, m.eq)
+		}
+	}
+	panel := strings.Join(m.vibePanel(40), "\n")
+	if !strings.Contains(panel, "\x1b[33m") { // the amber pause color
+		t.Fatalf("the paused bars must wear the pause color: %q", panel)
+	}
+	// playing: green
+	m2 := New("t", nil, nil, false, nil)
+	m2 = upd(t, m2, sync.UiState{Pos: &pos})
+	m2 = m2.stepEq()
+	panel = strings.Join(m2.vibePanel(40), "\n")
+	if !strings.Contains(panel, "\x1b[32m") {
+		t.Fatalf("the playing bars must be green: %q", panel)
+	}
+}
+
+// FB5: a right label that does not fit is dropped — the border must
+// never grow past the box.
+func TestBoxRightLabelNeverOverflows(t *testing.T) {
+	lines := box(20, "T", "a very long right label", nil, lipgloss.NewStyle())
+	if w := lipgloss.Width(lines[0]); w != 20 {
+		t.Fatalf("the top border is %d cols, want 20: %q", w, lines[0])
+	}
+	// a label that fits is kept
+	lines = box(40, "T", "right", nil, lipgloss.NewStyle())
+	if !strings.Contains(lines[0], "right") {
+		t.Fatalf("the right label was dropped although it fits: %q", lines[0])
+	}
+	if w := lipgloss.Width(lines[0]); w != 40 {
+		t.Fatalf("the top border is %d cols, want 40: %q", w, lines[0])
 	}
 }

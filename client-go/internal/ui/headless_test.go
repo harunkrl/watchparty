@@ -97,9 +97,11 @@ func TestHeadlessPrintsActorLines(t *testing.T) {
 		Clock:  sync.RealClock{},
 	}
 	out := &syncBuffer{}
-	ch := make(chan room.Event, 2)
+	ch := make(chan room.Event, 4)
 	ch <- room.Event{Type: "pause", Nick: "bo"}
 	ch <- room.Event{Type: "pause", Nick: "ada"}
+	ch <- room.Event{Type: "load", Name: "a.mkv", Nick: "bo"}
+	ch <- room.Event{Type: "queue", Queue: []string{"a"}, Nick: "bo"}
 	close(ch)
 	if err := Run("ada", api, nil, engine, ch, strings.NewReader(""), out); err != nil {
 		t.Fatal(err)
@@ -118,5 +120,12 @@ func TestHeadlessPrintsActorLines(t *testing.T) {
 	}
 	if !strings.Contains(got, "> pause\n") {
 		t.Fatalf("our own action must stay bare: %q", got)
+	}
+	// H7: the actor also names the loader and the queueer
+	if !strings.Contains(got, "> load a.mkv by bo") {
+		t.Fatalf("the load actor is missing: %q", got)
+	}
+	if !strings.Contains(got, "> queue: [a] by bo") {
+		t.Fatalf("the queue actor is missing: %q", got)
 	}
 }

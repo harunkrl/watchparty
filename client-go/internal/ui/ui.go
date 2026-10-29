@@ -34,7 +34,7 @@ const (
 	dashMin     = 100 // two-column dashboard needs this many columns
 	dashMinH    = 20  // ... and this many rows; narrower falls back to the stacked layout
 	seekStep    = 5.0 // ctrl+arrow nudge, seconds
-	sysRows     = 13  // system tail lines in the dashboard
+	sysRows     = 30  // system tail lines in the dashboard
 	eqBars      = 40  // vibe equalizer column budget (widest terminal)
 	eqPeriod    = 150 * time.Millisecond
 	zenDimAfter = 15 * time.Minute // zen only: messages older than this fade out
@@ -551,7 +551,15 @@ var verbDescs = map[string]string{
 // slash verbs while typing the first word, file names for /play and
 // /queue arguments.
 func (m Model) candidatesFor(v string) (items []compItem, isFile bool, verb, word string) {
-	if v == "" || !strings.HasPrefix(v, "/") {
+	if v == "" {
+		// an empty input + Tab shows the whole command menu: the verbs
+		// must be discoverable without knowing the slash
+		for _, c := range verbs {
+			items = append(items, compItem{text: "/" + c, desc: verbDescs[c]})
+		}
+		return items, false, "", ""
+	}
+	if !strings.HasPrefix(v, "/") {
 		return nil, false, "", ""
 	}
 	verbPart, rest, hasArg := strings.Cut(strings.TrimPrefix(v, "/"), " ")
@@ -626,16 +634,20 @@ func (m Model) complete() (Model, tea.Cmd) {
 }
 
 // barClick turns a left click on the progress bar into a room seek.
-// The bar renders on screen row 3 (border + two header lines) and starts
-// at column frame-left + 1; the click's column maps linearly to time.
+// The stacked layout draws the bar on screen row 3 (border + two header
+// lines) and starts at column frame-left + 1; the dashboard draws it
+// inside the now-playing band (row 5). The click's column maps
+// linearly to time.
 func (m Model) barClick(msg tea.MouseMsg) tea.Cmd {
+	if msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress ||
+		m.duration <= 0 || m.st == nil || m.st.Pos == nil {
+		return nil
+	}
 	if m.dashOn() && !m.zen {
-		return nil // the dashboard bar lives inside its box; ctrl+←/→ nudges instead
+		return m.dashBarClick(msg)
 	}
 	_, _, showBar, _, _ := m.layout()
-	if !showBar || m.zen || m.mode == modePick ||
-		msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress ||
-		m.duration <= 0 || m.st == nil || m.st.Pos == nil {
+	if !showBar || m.zen || m.mode == modePick {
 		return nil
 	}
 	if msg.Y != frame.GetVerticalFrameSize()/2+2 { // top border (1) + two header rows = row 3
@@ -649,6 +661,27 @@ func (m Model) barClick(msg tea.MouseMsg) tea.Cmd {
 	frac := float64(msg.X-left) / float64(cw)
 	t := frac * m.duration
 	return postEvent(m.api, room.Event{Type: "seek", T: t})
+}
+
+// dashBarClick maps a click on the dashboard band's progress bar to a
+// room seek. The band spans the whole screen: its content starts after
+// the box border and padding, the bar itself after the elapsed label.
+func (m Model) dashBarClick(msg tea.MouseMsg) tea.Cmd {
+	if m.mode == modePick {
+		return nil
+	}
+	if msg.Y != 5 { // header, gap, band border, name, blank — then the bar
+		return nil
+	}
+	cw := m.width - 4 // the band's content width
+	elapsed, total := clockStr(*m.st.Pos), clockStr(m.duration)
+	left := 3 + lipgloss.Width(elapsed) // border + padding + the label + a space
+	barW := cw - lipgloss.Width(elapsed) - lipgloss.Width(total) - 4
+	if barW < 1 || msg.X < left || msg.X > left+barW {
+		return nil
+	}
+	frac := min(max(float64(msg.X-left)/float64(barW), 0), 1)
+	return postEvent(m.api, room.Event{Type: "seek", T: frac * m.duration})
 }
 
 // enqueue mirrors the server's enqueue conditions for instant feedback;
@@ -842,9 +875,9 @@ func RenderEvent(ev room.Event, self string) string {
 	case "chat":
 		return fmt.Sprintf("[%s] %s", ev.Nick, ev.Text)
 	case "queue":
-		return fmt.Sprintf("> queue: %s", queueStr(ev.Queue))
+		return fmt.Sprintf("> queue: %s", queueStr(ev.Queue)) + actor(ev.Nick, self)
 	case "load":
-		return fmt.Sprintf("> load %s", ev.Name)
+		return fmt.Sprintf("> load %s", ev.Name) + actor(ev.Nick, self)
 	case "play", "pause":
 		return "> " + ev.Type + actor(ev.Nick, self)
 	case "notice":
@@ -1104,11 +1137,21 @@ func padCut(s string, w int) string {
 }
 
 // box renders a mock-style titled panel with a colored border:
-// `╭─ TITLE ─╮` top, `│` sides.
-func box(w int, title string, lines []string, border lipgloss.Style) []string {
+// `╭─ TITLE ─╮` top, `│` sides. An optional right label is aligned to
+// the right of the top border: `╭─ TITLE ──── right ─╮`.
+func box(w int, title, right string, lines []string, border lipgloss.Style) []string {
 	t := "╭─ " + title + " "
-	top := border.Render(t + strings.Repeat("─", max(1, w-lipgloss.Width(t)-1)) + "╮")
-	out := []string{top}
+	fill := w - lipgloss.Width(t) - 1
+	top := t + strings.Repeat("─", max(1, fill))
+	if right != "" {
+		r := " " + right + " ─"
+		if fill-lipgloss.Width(r) >= 1 {
+			top = t + strings.Repeat("─", fill-lipgloss.Width(r)) + r
+		}
+		// no room for the label: drop it — a border wider than the box
+		// would break every layout that uses it
+	}
+	out := []string{border.Render(top + "╮")}
 	for _, l := range lines {
 		out = append(out, border.Render("│")+" "+padCut(l, w-4)+" "+border.Render("│"))
 	}
@@ -1116,7 +1159,8 @@ func box(w int, title string, lines []string, border lipgloss.Style) []string {
 }
 
 // stepEq advances the vibe equalizer: a lively walk while the room plays,
-// a slow decay while paused, flat when nothing is loaded.
+// frozen while paused (a decaying spectrum would claim the room is still
+// playing), flat when nothing is loaded.
 func (m Model) stepEq() Model {
 	if len(m.eq) == 0 {
 		m.eq = make([]float64, eqBars)
@@ -1129,8 +1173,7 @@ func (m Model) stepEq() Model {
 		switch {
 		case live:
 			m.eq[i] = min(1, max(0.08, m.eq[i]+(rand.Float64()-0.5)*0.55))
-		case m.st != nil && m.st.Pos != nil: // paused: settle low
-			m.eq[i] = max(0.06, m.eq[i]*0.85)
+		case m.st != nil && m.st.Pos != nil: // paused: the bars freeze
 		default: // nothing playing: flatline
 			m.eq[i] = 0.04
 		}
@@ -1138,20 +1181,25 @@ func (m Model) stepEq() Model {
 	return m
 }
 
-// vibeTitleSuffix labels the equalizer with real state only: the local
-// volume while playing, the decaying state while paused, nothing when
-// idle (no state = no claim).
-func (m Model) vibeTitleSuffix() string {
+// vibeLabel labels the equalizer with real state only: the local volume
+// and the channel layout while playing, the frozen state while paused,
+// nothing when idle (no state = no claim). The layout is only named when
+// mpv told us ("stereo"); an unknown layout stays unsaid.
+func (m Model) vibeLabel() string {
 	if m.st == nil || m.st.Pos == nil {
 		return ""
 	}
 	if m.st.Paused {
-		return " · ⏸ paused · decaying"
+		return "⏸ paused"
 	}
-	if m.st.Volume > 0 {
-		return fmt.Sprintf(" · ♪ vol %.0f%%", m.st.Volume)
+	if m.st.Volume <= 0 {
+		return ""
 	}
-	return ""
+	label := fmt.Sprintf("♪ vol %.0f%%", m.st.Volume)
+	if m.st.Layout != "" {
+		label += " · " + m.st.Layout
+	}
+	return label
 }
 
 // vibePanel renders the spectrum-style equalizer: paired-width columns,
@@ -1172,13 +1220,18 @@ func (m Model) vibePanel(w int) []string {
 		}
 		heights[i] = max(1, int(v*float64(rows)*0.99)) // never an empty column: a flatline must still be visible
 	}
+	paused := m.st != nil && m.st.Pos != nil && m.st.Paused
 	lines := make([]string, rows) // top row first
 	for lvl := rows; lvl >= 1; lvl-- {
 		var b strings.Builder
 		for _, h := range heights {
-			col := "2" // the progress bar's green: one playback color, not two
+			col := "2"  // the progress bar's green: one playback color, not two
+			tip := "10" // bright tips on the top two rows
+			if paused {
+				col, tip = "3", "11" // amber: the pause color of the project
+			}
 			if lvl >= 7 {
-				col = "10" // bright tips on the top two rows
+				col = tip
 			}
 			if h >= lvl {
 				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(col)).Render("██"))
@@ -1231,7 +1284,17 @@ func (m Model) nowPlayingLines(w int) []string {
 			stats = append(stats, pausedStyle.Render("♪ muted"))
 		}
 		if m.st.Paused {
-			stats = append(stats, pausedStyle.Render("paused"))
+			chip := "⏸ paused"
+			if m.st.PausedBy != "" {
+				chip += " by " + m.st.PausedBy // the room named the actor
+			}
+			stats = append(stats, pausedStyle.Render(chip))
+		}
+		if m.st.Sub != "" {
+			// PERSONAL: the subtitle track is local (never posted, never
+			// synced) — it only tells the viewer what is on screen
+			ss := lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+			stats = append(stats, ss.Render(fmt.Sprintf("⊞ you: sub %s [j in mpv]", m.st.Sub)))
 		}
 		if m.st.Stale { // the master's heartbeat stopped: say so instead of pretending
 			stats = append(stats, pausedStyle.Render("⚠ master heartbeat stale"))
@@ -1271,8 +1334,8 @@ func (m Model) sortedPeers() []string {
 // queueLines renders the queue box contents, at most n rows: a long queue
 // is truncated and the last row says how many files are hidden (the box
 // must never grow past its row budget — the whole dashboard would scroll
-// the header off the terminal). A non-empty queue starts with the
-// "/skip next" hint; that row comes out of the same budget.
+// the header off the terminal). At least one file name always survives:
+// the overflow hint is not worth an empty box.
 func (m Model) queueLines(n int) []string {
 	if n <= 0 {
 		return nil
@@ -1280,15 +1343,11 @@ func (m Model) queueLines(n int) []string {
 	if len(m.queue) == 0 {
 		return []string{dim.Render("empty — ") + keyStyle.Render("/queue <file>") + dim.Render(" to add")}
 	}
-	out := []string{dim.Render("/skip next")}
-	rows := n - 1 // the hint took one row
-	if rows <= 0 {
-		return out
+	shown := len(m.queue)
+	if shown > n {
+		shown = max(1, n-1) // the last row carries the overflow hint
 	}
-	shown := min(len(m.queue), rows)
-	if shown < len(m.queue) {
-		shown = rows - 1 // the last row carries the overflow hint
-	}
+	out := make([]string, 0, n)
 	for i := 0; i < shown; i++ {
 		out = append(out, fmt.Sprintf("%d. %s", i+1, m.queue[i]))
 	}
@@ -1330,27 +1389,20 @@ func (m Model) dashView() string {
 
 	budget := avail - 7 // left-column rows under the band
 	watH := 2 + len(m.watcherLines())
+	// the budget gives the SYSTEM tail its lines first (it is the panel
+	// that reads), but the boxes are drawn top down: WATCHERS, QUEUE,
+	// SYSTEM. The QUEUE keeps a 4-row floor.
+	queueFloor := 4
 	sysH := 0
 	if !m.sysOff {
-		sysH = sysRows + 2
-	}
-	queueH := budget - watH - sysH
-	for step := 0; queueH < 4 && step < 4; step++ { // cramped: shrink system, then watchers
-		switch step {
-		case 0:
-			sysH = min(sysH, 7) // 5 tail lines
-		case 1:
-			sysH = 0
-		case 2:
-			watH = 2
-		case 3:
-			queueH = 4
-		}
-		if step < 3 {
-			queueH = budget - watH - sysH
+		if n := min(sysRows, budget-watH-2-queueFloor); n > 0 {
+			sysH = n + 2
 		}
 	}
-	queueH = max(4, queueH) // stretches to fill the left column — no dead space
+	if budget-watH-sysH < queueFloor {
+		watH = 2 // cramped: the watchers shrink, the queue floor wins
+	}
+	queueH := max(queueFloor, budget-watH-sysH) // stretches to fill the left column
 
 	// the band's border breathes with playback: green, amber, idle grey
 	bord := bordIdle
@@ -1361,25 +1413,39 @@ func (m Model) dashView() string {
 			bord = bordPlay
 		}
 	}
-	band := box(m.width, "NOW PLAYING · ctrl+←/→ to seek", m.nowPlayingLines(m.width-4), bord)
+	bandTitle := "NOW PLAYING"
+	if m.st != nil && m.st.Pos != nil && m.st.Paused {
+		bandTitle += " · PAUSED"
+	}
+	bandHint := ""
+	if m.duration > 0 && m.st != nil && m.st.Pos != nil {
+		bandHint = "click bar or ctrl+←/→ to seek" // there is a bar to click
+	}
+	band := box(m.width, bandTitle, bandHint, m.nowPlayingLines(m.width-4), bord)
 	var left []string
 	if watH > 2 {
-		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), m.watcherLines(), bordWatch)...)
+		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), "", m.watcherLines(), bordWatch)...)
 	}
 	qBord := bordQueue // vivid pink: content
 	if len(m.queue) == 0 {
 		qBord = bordQueueIdle // muted orchid: same family, quieter than grey
 	}
-	left = append(left, box(leftW, fmt.Sprintf("QUEUE (%d)", len(m.queue)), padLines(m.queueLines(queueH-2), queueH-2), qBord)...)
+	queueTitle := fmt.Sprintf("QUEUE (%d)", len(m.queue))
+	if len(m.queue) > 0 {
+		queueTitle += " · /skip next" // the hint lives in the title, not in the rows
+	}
+	left = append(left, box(leftW, queueTitle, "", padLines(m.queueLines(queueH-2), queueH-2), qBord)...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
-		if len(sys) > sysH-2 {
-			sys = sys[len(sys)-sysH+2:] // a glanceable tail, never a reading surface
+		shown := len(sys)
+		if shown > sysH-2 {
+			sys = sys[shown-(sysH-2):] // a glanceable tail, never a reading surface
+			shown = sysH - 2
 		}
 		for len(sys) < sysH-2 {
 			sys = append(sys, "")
 		}
-		left = append(left, box(leftW, "SYSTEM", sys, bordSys)...)
+		left = append(left, box(leftW, "SYSTEM", fmt.Sprintf("%d-line tail", shown), sys, bordSys)...)
 	}
 
 	in := strings.TrimRight(m.input.View(), " ")
@@ -1389,11 +1455,11 @@ func (m Model) dashView() string {
 	}
 	msg := []string{joinLR(in, hint, rightW-4)}
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
-	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)
+	right := box(rightW, "CHAT", "", strings.Split(vp.View(), "\n"), bordChat)
 	if m.vibeH() > 0 {
-		right = append(box(rightW, "EQUALIZER"+m.vibeTitleSuffix(), m.vibePanel(rightW-4), bordVibe), right...)
+		right = append(box(rightW, "EQUALIZER", m.vibeLabel(), m.vibePanel(rightW-4), bordVibe), right...)
 	}
-	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
+	right = append(right, box(rightW, "MESSAGE", "", msg, bordMsg)...)
 
 	role := "follower"
 	if m.master {
@@ -1404,16 +1470,17 @@ func (m Model) dashView() string {
 	// what it controls (green=playback, cyan=seek, purple=menu, amber=movie,
 	// orange=system pane)
 	hue := func(c string) lipgloss.Style { return lipgloss.NewStyle().Foreground(lipgloss.Color(c)) }
-	verb := "play/pause"
+	verb := "pause" // contextual: the key does what the room needs now
 	if m.st != nil && m.st.Paused {
-		verb = "resume" // contextual: the room is paused, ctrl+space resumes
+		verb = "play"
 	}
-	hotbar := dim.Render(" ") +
+	hotbar :=
 		keyStyle.Render("[ctrl+space]") + hue("2").Render(" "+verb+" · ") +
-		keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
-		keyStyle.Render("[ctrl+p]") + hue("141").Render(" files · ") +
-		keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
-		keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
+			keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
+			keyStyle.Render("[ctrl+p]") + hue("141").Render(" files · ") +
+			keyStyle.Render("[tab]") + hue("141").Render(" menu · ") +
+			keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
+			keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
 
 	var b strings.Builder
 	b.WriteString(header + "\n\n") // gap row: the header reads calmer off the band
@@ -1887,6 +1954,9 @@ func (m Model) zenSyncChip() string {
 	var parts []string
 	if m.duration > 0 {
 		parts = append(parts, dim.Render("-"+clockStr(max(0, m.duration-*m.st.Pos))+" left"))
+	}
+	if m.st.Sub != "" { // personal: the local subtitle track
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Render("⊞ "+m.st.Sub))
 	}
 	if m.master {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("◷ master clock"))
