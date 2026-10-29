@@ -1289,6 +1289,8 @@ func (m Model) nowPlayingLines(w int) []string {
 				chip += " by " + m.st.PausedBy // the room named the actor
 			}
 			stats = append(stats, pausedStyle.Render(chip))
+		} else {
+			stats = append(stats, playingStyle.Render("▶ playing"))
 		}
 		if m.st.Sub != "" {
 			// PERSONAL: the subtitle track is local (never posted, never
@@ -1457,7 +1459,17 @@ func (m Model) dashView() string {
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
 	right := box(rightW, "CHAT", "", strings.Split(vp.View(), "\n"), bordChat)
 	if m.vibeH() > 0 {
-		right = append(box(rightW, "EQUALIZER", m.vibeLabel(), m.vibePanel(rightW-4), bordVibe), right...)
+		// the equalizer border follows the state, like the band's: the
+		// paused amber is the same one the bars wear
+		vBord := bordIdle
+		if m.st != nil && m.st.Pos != nil {
+			if m.st.Paused {
+				vBord = bordPause
+			} else {
+				vBord = bordVibe
+			}
+		}
+		right = append(box(rightW, "EQUALIZER", m.vibeLabel(), m.vibePanel(rightW-4), vBord), right...)
 	}
 	right = append(right, box(rightW, "MESSAGE", "", msg, bordMsg)...)
 
@@ -1509,7 +1521,7 @@ func (m Model) dashView() string {
 // menuLines renders the open completion menu: selected row reversed,
 // descriptions dim, windowed to menuMax rows around the cursor so the
 // box never grows past the terminal. Empty when closed.
-const menuMax = 6
+const menuMax = 16
 
 func (m Model) menuLines(w int) []string {
 	budget := m.menuBudget()

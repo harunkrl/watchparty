@@ -1391,3 +1391,129 @@ func TestBoxRightLabelNeverOverflows(t *testing.T) {
 		t.Fatalf("the top border is %d cols, want 40: %q", w, lines[0])
 	}
 }
+
+// H9: the equalizer border follows the state, exactly like the band's —
+// the paused amber is the same one the bars wear.
+func TestEqualizerBorderFollowsTheState(t *testing.T) {
+	orig := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(orig)
+
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	pos := 10.0
+
+	// idle: nothing loaded → the muted idle grey
+	if line := eqBorderLine(t, m); !strings.Contains(line, "38;5;241m") {
+		t.Fatalf("the idle equalizer border must be muted: %q", line)
+	}
+	// playing → the vibe green
+	m = upd(t, m, sync.UiState{Pos: &pos})
+	if line := eqBorderLine(t, m); !strings.Contains(line, "38;5;84m") {
+		t.Fatalf("the playing equalizer border must be the vibe color: %q", line)
+	}
+	// paused → the pause amber (the bars wear the same one)
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	if line := eqBorderLine(t, m); !strings.Contains(line, "\x1b[33m") {
+		t.Fatalf("the paused equalizer border must be the pause color: %q", line)
+	}
+}
+
+// eqBorderLine returns the top border of the equalizer box.
+func eqBorderLine(t *testing.T, m Model) string {
+	t.Helper()
+	for _, l := range strings.Split(m.View(), "\n") {
+		if strings.Contains(l, "EQUALIZER") {
+			return l
+		}
+	}
+	t.Fatal("the equalizer box is missing from the view")
+	return ""
+}
+
+// H10: the stat row always names the state — "▶ playing" while the room
+// plays, "⏸ paused" (with the actor) while it does not.
+func TestStatRowShowsThePlayingChip(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos})
+	row := strings.Join(m.nowPlayingLines(100), "\n")
+	if !strings.Contains(row, "▶ playing") {
+		t.Fatalf("the playing chip missing: %q", row)
+	}
+	if strings.Contains(row, "paused") {
+		t.Fatalf("a playing room must not show a paused chip: %q", row)
+	}
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	row = strings.Join(m.nowPlayingLines(100), "\n")
+	if !strings.Contains(row, "⏸ paused") {
+		t.Fatalf("the paused chip missing: %q", row)
+	}
+	if strings.Contains(row, "▶ playing") {
+		t.Fatalf("a paused room must not show a playing chip: %q", row)
+	}
+}
+
+// --- H12: the menu ceiling -----------------------------------------------
+
+// H12: an empty input + Tab shows the WHOLE command menu — with a
+// ceiling of 16 rows the eight verbs fit without a "+N more".
+func TestEmptyInputTabShowsEveryCommand(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("the empty input + Tab must open the command menu")
+	}
+	v := m.View()
+	for _, c := range verbs {
+		if !strings.Contains(v, "/"+c) {
+			t.Fatalf("/%s missing from the menu:\n%s", c, v)
+		}
+	}
+}
+
+// H12: the file menu grows to 16 rows and says how many candidates are
+// hidden below.
+func TestFileMenuGrowsToSixteenRows(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 60})
+	files := make([]string, 20)
+	for i := range files {
+		files[i] = fmt.Sprintf("movie-%02d.mkv", i)
+	}
+	m = upd(t, m, filesMsg{files: files})
+	m.input.SetValue("/play ")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("the file menu must open")
+	}
+	rows := m.menuLines(100)
+	if len(rows) != 16 {
+		t.Fatalf("the menu has %d rows, want 16", len(rows))
+	}
+	if !strings.Contains(rows[len(rows)-1], "more") {
+		t.Fatalf("the menu must say how many candidates are hidden: %q", rows[len(rows)-1])
+	}
+}
+
+// H12 INVARIANT: an open menu never pushes the dashboard past the
+// terminal — the chat gives up its rows and the menu shrinks into the
+// floor.
+func TestOpenMenuKeepsTheDashboardInsideTheTerminal(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	files := make([]string, 20)
+	for i := range files {
+		files[i] = fmt.Sprintf("movie-%02d.mkv", i)
+	}
+	m = upd(t, m, filesMsg{files: files})
+	m.input.SetValue("/play ")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("the file menu must open")
+	}
+	if n := len(strings.Split(m.View(), "\n")); n > 40 {
+		t.Fatalf("the dashboard is %d lines tall, want at most 40", n)
+	}
+}

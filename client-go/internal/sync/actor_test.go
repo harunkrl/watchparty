@@ -58,3 +58,34 @@ func TestSnapshotPauseHasNoActor(t *testing.T) {
 		t.Fatalf("PausedBy = %q, want empty (the snapshot names no actor)", st.PausedBy)
 	}
 }
+
+// H11: pausing from the mpv window (our own post) must clear the actor
+// of an earlier remote pause — otherwise our own pause is rendered as
+// "paused by <them>".
+func TestOwnPauseClearsTheStaleActor(t *testing.T) {
+	e, _, _ := newEngine(true)
+	ui := make(chan UiState, 8)
+	e.Ui = ui
+
+	// a remote pause names its actor
+	e.OnRoom(room.Event{Type: "pause", Nick: "bo"})
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: true})
+	if st := <-ui; st.PausedBy != "bo" {
+		t.Fatalf("PausedBy = %q, want bo", st.PausedBy)
+	}
+
+	// our own space bar in the mpv window: resume, then pause again —
+	// the second pause is OURS and must carry no actor
+	e.OnMpvEvent("unpause")
+	e.OnMpvp(mpv.State{Pos: ptr(10)})
+	e.OnMpvEvent("pause")
+	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: true})
+	// the newest state is ours: it must carry no actor
+	var last UiState
+	for len(ui) > 0 {
+		last = <-ui
+	}
+	if last.PausedBy != "" {
+		t.Fatalf("PausedBy = %q, want empty after our own pause", last.PausedBy)
+	}
+}

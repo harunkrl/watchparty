@@ -530,7 +530,15 @@ func (e *Engine) OnMpvEvent(name string) {
 func (e *Engine) postDiscrete(ev room.Event) {
 	e.post1(ev)
 	switch ev.Type {
-	case "pause", "play":
+	case "pause":
+		// our own pause: nobody else holds it. Without this the actor of
+		// an earlier remote pause stayed stale and our own pause was
+		// rendered as "paused by <them>" (the mpv window's space bar
+		// posts through here).
+		e.pausedBy = ""
+		e.logf("> %s", ev.Type)
+	case "play":
+		// no reset needed: emitUi drops the actor when we are playing
 		e.logf("> %s", ev.Type)
 	case "seek":
 		e.logf("> seek @%.1fs", ev.T)
