@@ -111,16 +111,21 @@ func Start(base string, extra []string) (*Player, error) {
 		fmt.Sprintf("--demuxer-readahead-secs=%d", demuxerReadaheadSecs),
 		"--demuxer-max-bytes=" + demuxerMaxBytes,
 	}, extra...)
-	cmd := exec.Command("mpv", args...)
-	// mpv.exe is bundled next to watchparty.exe; LookPath warns relative-cwd
-	// resolution (Go 1.19+ ErrDot); we deliberately accept the sibling.
+	bin, err := findMPV()
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	cmd := exec.Command(bin, args...)
+	// a relative hit warns about cwd resolution (Go 1.19+ ErrDot); we
+	// deliberately accept it.
 	if errors.Is(cmd.Err, exec.ErrDot) {
 		cmd.Err = nil
 	}
 	// Stdin nil = os.DevNull: otherwise mpv steals the keyboard from the TUI
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(dir)
-		return nil, fmt.Errorf("could not start mpv (is it installed?): %w", err)
+		return nil, fmt.Errorf("could not start mpv (%s): %w", bin, err)
 	}
 	exited := make(chan struct{})
 	p := &Player{
@@ -148,6 +153,66 @@ func Start(base string, extra []string) (*Player, error) {
 	}
 	p.Close()
 	return nil, fmt.Errorf("could not connect to mpv ipc")
+}
+
+// mpvBinaryNames are the file names an mpv build can carry.
+var mpvBinaryNames = []string{"mpv", "mpv.exe"}
+
+// findMPV locates the mpv binary: the PATH first, then the bundle next
+// to the executable. A release zip ships mpv in a subfolder (or beside
+// the exe), and on Windows there is no PATH entry for it — without this
+// the client would die with "could not start mpv".
+func findMPV() (string, error) {
+	var relative string
+	if p, err := exec.LookPath("mpv"); err == nil {
+		if !errors.Is(err, exec.ErrDot) {
+			return p, nil
+		}
+		relative = p // "./mpv": the current folder happens to hold it
+	}
+	looked := []string{"PATH"}
+	if exe, err := os.Executable(); err == nil {
+		edir := filepath.Dir(exe)
+		looked = append(looked, edir, filepath.Join(edir, "mpv*"))
+		if p := findMPVIn(edir); p != "" {
+			return p, nil
+		}
+	}
+	if relative != "" {
+		return relative, nil
+	}
+	return "", fmt.Errorf("mpv not found (looked in %s)", strings.Join(looked, ", "))
+}
+
+// findMPVIn returns the mpv binary inside dir: a sibling first, then an
+// mpv* subfolder (the bundle layout). "" when there is none.
+func findMPVIn(dir string) string {
+	for _, name := range mpvBinaryNames {
+		if p := filepath.Join(dir, name); isRegularFile(p) {
+			return p
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(strings.ToLower(e.Name()), "mpv") {
+			continue
+		}
+		sub := filepath.Join(dir, e.Name())
+		for _, name := range mpvBinaryNames {
+			if p := filepath.Join(sub, name); isRegularFile(p) {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func isRegularFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // Events exposes mpv's pushed notifications (never closed; drops when full).

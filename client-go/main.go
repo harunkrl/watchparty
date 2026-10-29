@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
@@ -50,12 +52,21 @@ func main() {
 	}
 	args := flag.Args()
 	var base string
-	if len(args) == 0 && flag.NFlag() == 0 && !*headless {
+	// the friend flow runs in a console window that closes with the
+	// process: its errors must be read, so they wait for a keypress.
+	friendFlow := len(args) == 0 && flag.NFlag() == 0 && !*headless
+	if friendFlow {
 		// friend flow (plan section 0): unzip, double-click, answer, watch
-		base = askURL()
-		if nick := askLine(fmt.Sprintf("your name [%s]: ", *name)); nick != "" {
+		last := loadLastServer()
+		base = askURL(last.URL)
+		def := *name
+		if last.Nick != "" {
+			def = last.Nick
+		}
+		if nick := askLine(fmt.Sprintf("your name [%s]: ", def)); nick != "" {
 			*name = nick
 		}
+		saveLastServer(base, *name)
 	} else {
 		if len(args) != 1 { // url-first ordering would silently drop later flags
 			fmt.Fprintln(os.Stderr, usage)
@@ -74,6 +85,9 @@ func main() {
 	player, err := mpv.Start(base, strings.Fields(os.Getenv("WATCHPARTY_MPV")))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		if friendFlow {
+			waitForEnter()
+		}
 		os.Exit(1)
 	}
 
@@ -201,6 +215,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		stop()
 		player.Close()
+		if friendFlow {
+			waitForEnter()
+		}
 		os.Exit(1)
 	}
 	stop()         // risk H: cancel ctx first, ...
@@ -223,22 +240,129 @@ func askLine(prompt string) string {
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
 		fmt.Fprintln(os.Stderr, "\nno input — exiting")
+		waitForEnter()
 		os.Exit(2)
 	}
 	return strings.TrimSpace(line)
 }
 
-// askURL asks until the answer looks like an http(s) URL (3 tries).
-func askURL() string {
-	for i := 0; i < 3; i++ {
-		s := askLine("server URL (e.g. http://100.101.102.103:8090): ")
-		if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-			return s
-		}
-		fmt.Println("must start with http:// — ask the host for the address")
+// urlPrompt is the friend-flow prompt: the bare address form. The
+// scheme is added by the client, so the prompt must not teach it —
+// and the remembered address is shown the way a friend types it.
+func urlPrompt(def string) string {
+	if def == "" {
+		return "server address (e.g. 192.168.1.181:8090): "
 	}
+	return fmt.Sprintf("server URL [%s]: ", bareAddr(def))
+}
+
+// bareAddr strips the scheme from an address.
+func bareAddr(s string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
+}
+
+// waitForEnter keeps the console window open until the user has read
+// the error: the friend flow's console closes with the process, so an
+// error would vanish unread. A closed stdin returns at once.
+func waitForEnter() {
+	fmt.Fprintln(os.Stderr, "press Enter to close")
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+// askURL asks until the answer is a usable server address (3 tries).
+// def is the remembered server: Enter takes it.
+func askURL(def string) string {
+	for i := 0; i < 3; i++ {
+		s := askLine(urlPrompt(def))
+		if s == "" && def != "" {
+			return def
+		}
+		if u := normalizeServerURL(s); u != "" {
+			return u
+		}
+		fmt.Println("that is not a server address — ask the host for it")
+	}
+	waitForEnter() // the console closes with the process: let the user read it
 	os.Exit(2)
 	return ""
+}
+
+// normalizeServerURL turns what a friend types into a server URL:
+// "host" becomes "http://host:8090", "host:port" becomes
+// "http://host:port", a full http(s) URL is kept as it is. "" when the
+// input cannot be an address.
+func normalizeServerURL(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return strings.TrimRight(s, "/")
+	}
+	if strings.ContainsAny(s, " \t") {
+		return "" // a host has no spaces
+	}
+	host, port := s, ""
+	if h, p, err := net.SplitHostPort(s); err == nil {
+		host, port = h, p
+	}
+	if port == "" {
+		port = defaultServerPort
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]" // a bare IPv6 address
+	}
+	return "http://" + host + ":" + port
+}
+
+// defaultServerPort is the port the room server listens on.
+const defaultServerPort = "8090"
+
+// lastServerPath is where the remembered server and nick live (next to
+// the executable). A var so the tests can point it elsewhere.
+var lastServerPath = defaultLastServerPath
+
+func defaultLastServerPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "last-server.txt")
+}
+
+// lastServer is the remembered server URL and nick.
+type lastServer struct{ URL, Nick string }
+
+// loadLastServer reads the remembered server file (empty when there is
+// none or it cannot be read).
+func loadLastServer() lastServer {
+	path := lastServerPath()
+	if path == "" {
+		return lastServer{}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return lastServer{}
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	ls := lastServer{}
+	if len(lines) > 0 {
+		ls.URL = strings.TrimSpace(lines[0])
+	}
+	if len(lines) > 1 {
+		ls.Nick = strings.TrimSpace(lines[1])
+	}
+	return ls
+}
+
+// saveLastServer remembers the server and the nick for the next start
+// (best effort: a read-only folder must not break the run).
+func saveLastServer(url, nick string) {
+	path := lastServerPath()
+	if path == "" {
+		return
+	}
+	_ = os.WriteFile(path, []byte(url+"\n"+nick+"\n"), 0o644)
 }
 
 // buildVersion reports the git commit this binary was built from
