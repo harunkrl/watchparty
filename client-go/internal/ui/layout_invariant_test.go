@@ -38,7 +38,7 @@ func TestViewFitsTerminal(t *testing.T) {
 	// the stacked layout (< 100 columns) is checked too: it has no boxes
 	// to truncate a long title, so the header and the input row must
 	// fit the frame themselves (A3-UI2/A3-UI3).
-	for _, h := range []int{20, 24, 30, 36, 40, 44, 50} {
+	for _, h := range []int{20, 24, 26, 27, 28, 30, 36, 40, 44, 50} {
 		for _, w := range []int{60, 80, 99, 100, 110, 118, 130, 160} {
 			for _, tc := range []string{"connecting", "playing", "menu", "picker", "sysoff", "zen", "menu-playing"} {
 				m := New("sen", nil, nil, true, nil)

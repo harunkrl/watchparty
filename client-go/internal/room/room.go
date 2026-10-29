@@ -25,19 +25,20 @@ import (
 // the server clamps a long-downtime join before EOF. It stays off the
 // wire while unknown, so an old server never sees a field it ignores.
 type Event struct {
-	Type   string   `json:"type"`
-	Nick   string   `json:"nick,omitempty"`
-	Text   string   `json:"text,omitempty"`
-	Name   string   `json:"name,omitempty"`
-	Now    string   `json:"now,omitempty"`
-	Queue  []string `json:"queue,omitempty"`
-	Roster []string `json:"roster,omitempty"`
-	Invite string   `json:"invite,omitempty"` // hello only: the address to invite people to
-	T      float64  `json:"t"`
-	P      bool     `json:"p"`
-	Dur    float64  `json:"dur,omitempty"`
-	From   string   `json:"from,omitempty"`
-	Pos    *float64 `json:"pos,omitempty"`
+	Type      string   `json:"type"`
+	Nick      string   `json:"nick,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Now       string   `json:"now,omitempty"`
+	Queue     []string `json:"queue,omitempty"`
+	Roster    []string `json:"roster,omitempty"`
+	Invite    string   `json:"invite,omitempty"`    // hello only: the address to invite people to
+	InviteAlt string   `json:"inviteAlt,omitempty"` // hello only: a second address (tailnet + LAN)
+	T         float64  `json:"t"`
+	P         bool     `json:"p"`
+	Dur       float64  `json:"dur,omitempty"`
+	From      string   `json:"from,omitempty"`
+	Pos       *float64 `json:"pos,omitempty"`
 }
 
 // readIdle bounds the SSE read silence before we declare the connection

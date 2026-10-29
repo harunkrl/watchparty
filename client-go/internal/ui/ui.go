@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,15 +28,16 @@ import (
 )
 
 const (
-	logCap    = 500
-	histCap   = 100
-	durProbes = 20  // duration fetch retries after a load (500ms apart)
-	dashMin   = 100 // two-column dashboard needs this many columns
-	dashMinH  = 20  // ... and this many rows; narrower falls back to the stacked layout
-	seekStep  = 5.0 // ctrl+arrow nudge, seconds
-	sysRows   = 13  // system tail lines in the dashboard
-	eqBars    = 40  // vibe equalizer column budget (widest terminal)
-	eqPeriod  = 150 * time.Millisecond
+	logCap      = 500
+	histCap     = 100
+	durProbes   = 20  // duration fetch retries after a load (500ms apart)
+	dashMin     = 100 // two-column dashboard needs this many columns
+	dashMinH    = 20  // ... and this many rows; narrower falls back to the stacked layout
+	seekStep    = 5.0 // ctrl+arrow nudge, seconds
+	sysRows     = 13  // system tail lines in the dashboard
+	eqBars      = 40  // vibe equalizer column budget (widest terminal)
+	eqPeriod    = 150 * time.Millisecond
+	zenDimAfter = 15 * time.Minute // zen only: messages older than this fade out
 )
 
 type mode int
@@ -135,6 +137,7 @@ type Model struct {
 	peers      map[string]bool
 	now        string
 	invite     string   // address to invite people to (server hello "invite")
+	inviteAlt  string   // second invite address (server hello "inviteAlt")
 	queue      []string // server queue state (hello/queue events)
 	files      []string // last known video list (typo guard, any filesMsg)
 	st         *sync.UiState
@@ -780,7 +783,8 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 			m, c = m.setFile(ev.Now)
 		}
 		m.queue = ev.Queue
-		m.invite = ev.Invite // the server knows its own reachable address
+		m.invite = ev.Invite       // the server knows its own reachable address
+		m.inviteAlt = ev.InviteAlt // ...and a second one (tailnet + LAN)
 		// roster replaces guesswork: a late joiner sees everyone already in
 		// the room, not only the joins that happened after them
 		m.peers = map[string]bool{}
@@ -1008,18 +1012,54 @@ func (m Model) padChatBottom(content string) string {
 
 // inviteLines is the empty-chat placeholder: the one thing a first-time
 // host needs is the address to send the other side. The server's hello
-// carries its own reachable address; our API base is the fallback.
+// carries its own reachable address (and optionally a second one); our
+// API base is the fallback. Two addresses are labeled by their network.
 func (m Model) inviteLines() string {
-	base := m.invite
-	if base == "" && m.api != nil && m.api.Base != "" {
-		base = m.api.Base
+	var addrs []string
+	if m.invite != "" {
+		addrs = append(addrs, m.invite)
 	}
-	if base == "" {
-		base = "http://<server>"
+	if m.inviteAlt != "" {
+		addrs = append(addrs, m.inviteAlt)
 	}
-	return dim.Render("no messages yet — invite them:") + "\n" +
-		title.Render("  "+base) + "\n" +
+	if len(addrs) == 0 {
+		if m.api != nil && m.api.Base != "" {
+			addrs = append(addrs, m.api.Base)
+		} else {
+			addrs = append(addrs, "http://<server>")
+		}
+	}
+	out := dim.Render("no messages yet — invite them:")
+	for _, a := range addrs {
+		line := title.Render("  " + a)
+		if len(addrs) > 1 {
+			line += " " + dim.Render(inviteLabel(a))
+		}
+		out += "\n" + line
+	}
+	return out + "\n" +
 		dim.Render("(everything you type here goes to the room as chat)")
+}
+
+// inviteLabel names an invite address by its network: the tailnet
+// (100.64/10) or the local LAN.
+func inviteLabel(addr string) string {
+	host := addr
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexAny(host, ":/"); i >= 0 {
+		host = host[:i]
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 {
+		o1, e1 := strconv.Atoi(parts[0])
+		o2, e2 := strconv.Atoi(parts[1])
+		if e1 == nil && e2 == nil && o1 == 100 && o2 >= 64 && o2 <= 127 {
+			return "(tailscale)"
+		}
+	}
+	return "(local lan)"
 }
 
 // dashOn reports whether the two-column dashboard fits.
@@ -1096,6 +1136,22 @@ func (m Model) stepEq() Model {
 		}
 	}
 	return m
+}
+
+// vibeTitleSuffix labels the equalizer with real state only: the local
+// volume while playing, the decaying state while paused, nothing when
+// idle (no state = no claim).
+func (m Model) vibeTitleSuffix() string {
+	if m.st == nil || m.st.Pos == nil {
+		return ""
+	}
+	if m.st.Paused {
+		return " · ⏸ paused · decaying"
+	}
+	if m.st.Volume > 0 {
+		return fmt.Sprintf(" · ♪ vol %.0f%%", m.st.Volume)
+	}
+	return ""
 }
 
 // vibePanel renders the spectrum-style equalizer: paired-width columns,
@@ -1191,6 +1247,9 @@ func (m Model) watcherLines() []string {
 		role = "you · master"
 	}
 	out := []string{"• " + nickStyle(m.nick).Render(m.nick) + dim.Render(" ("+role+")")}
+	if len(m.peers) == 0 {
+		out = append(out, dim.Render("○ waiting for follower…"))
+	}
 	for _, p := range m.sortedPeers() {
 		out = append(out, "• "+nickStyle(p).Render(p))
 	}
@@ -1212,19 +1271,24 @@ func (m Model) sortedPeers() []string {
 // queueLines renders the queue box contents, at most n rows: a long queue
 // is truncated and the last row says how many files are hidden (the box
 // must never grow past its row budget — the whole dashboard would scroll
-// the header off the terminal).
+// the header off the terminal). A non-empty queue starts with the
+// "/skip next" hint; that row comes out of the same budget.
 func (m Model) queueLines(n int) []string {
-	if len(m.queue) == 0 {
-		return []string{dim.Render("empty — ") + keyStyle.Render("/queue <file>") + dim.Render(" to add")}
-	}
 	if n <= 0 {
 		return nil
 	}
-	shown := len(m.queue)
-	if shown > n {
-		shown = n - 1 // the last row carries the overflow hint
+	if len(m.queue) == 0 {
+		return []string{dim.Render("empty — ") + keyStyle.Render("/queue <file>") + dim.Render(" to add")}
 	}
-	out := make([]string, 0, n)
+	out := []string{dim.Render("/skip next")}
+	rows := n - 1 // the hint took one row
+	if rows <= 0 {
+		return out
+	}
+	shown := min(len(m.queue), rows)
+	if shown < len(m.queue) {
+		shown = rows - 1 // the last row carries the overflow hint
+	}
 	for i := 0; i < shown; i++ {
 		out = append(out, fmt.Sprintf("%d. %s", i+1, m.queue[i]))
 	}
@@ -1297,7 +1361,7 @@ func (m Model) dashView() string {
 			bord = bordPlay
 		}
 	}
-	band := box(m.width, "NOW PLAYING", m.nowPlayingLines(m.width-4), bord)
+	band := box(m.width, "NOW PLAYING · ctrl+←/→ to seek", m.nowPlayingLines(m.width-4), bord)
 	var left []string
 	if watH > 2 {
 		left = append(left, box(leftW, fmt.Sprintf("WATCHERS (%d)", len(m.peers)+1), m.watcherLines(), bordWatch)...)
@@ -1306,7 +1370,7 @@ func (m Model) dashView() string {
 	if len(m.queue) == 0 {
 		qBord = bordQueueIdle // muted orchid: same family, quieter than grey
 	}
-	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(queueH-2), queueH-2), qBord)...)
+	left = append(left, box(leftW, fmt.Sprintf("QUEUE (%d)", len(m.queue)), padLines(m.queueLines(queueH-2), queueH-2), qBord)...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
 		if len(sys) > sysH-2 {
@@ -1327,7 +1391,7 @@ func (m Model) dashView() string {
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
 	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)
 	if m.vibeH() > 0 {
-		right = append(box(rightW, "EQUALIZER", m.vibePanel(rightW-4), bordVibe), right...)
+		right = append(box(rightW, "EQUALIZER"+m.vibeTitleSuffix(), m.vibePanel(rightW-4), bordVibe), right...)
 	}
 	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
 
@@ -1340,8 +1404,12 @@ func (m Model) dashView() string {
 	// what it controls (green=playback, cyan=seek, purple=menu, amber=movie,
 	// orange=system pane)
 	hue := func(c string) lipgloss.Style { return lipgloss.NewStyle().Foreground(lipgloss.Color(c)) }
+	verb := "play/pause"
+	if m.st != nil && m.st.Paused {
+		verb = "resume" // contextual: the room is paused, ctrl+space resumes
+	}
 	hotbar := dim.Render(" ") +
-		keyStyle.Render("[ctrl+space]") + hue("2").Render(" play/pause · ") +
+		keyStyle.Render("[ctrl+space]") + hue("2").Render(" "+verb+" · ") +
 		keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
 		keyStyle.Render("[ctrl+p]") + hue("141").Render(" files · ") +
 		keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
@@ -1403,7 +1471,7 @@ func (m Model) menuLines(w int) []string {
 
 // vibeH: the equalizer drops out on short screens — chat survives first.
 func (m Model) vibeH() int {
-	if m.height < 26 || m.zen {
+	if m.height < 29 || m.zen {
 		return 0
 	}
 	return 10
@@ -1515,13 +1583,17 @@ func (m Model) renderChatLines() []string { return m.renderChatLinesAt(m.chatWid
 func (m Model) renderChatLinesAt(cw int) []string {
 	var out []string
 	prevIdx := -1
+	faded := false // the group's head decides: a continuation inherits it
 	for i, e := range m.log {
 		if e.kind != entChat {
 			continue
 		}
 		cont := prevIdx >= 0 && m.log[prevIdx].nick == e.nick &&
 			e.at.Sub(m.log[prevIdx].at) < 5*time.Minute
-		out = append(out, m.renderEntry(e, cw, cont)...)
+		if !cont {
+			faded = m.zen && time.Since(e.at) > zenDimAfter
+		}
+		out = append(out, m.renderEntry(e, cw, cont, faded)...)
 		prevIdx = i
 	}
 	return out
@@ -1540,7 +1612,7 @@ func (m Model) renderSysLinesAt(cw int) []string {
 			continue // not system noise, but still breaks an engine run
 		}
 		if e.kind != entEngine {
-			out = append(out, m.renderEntry(e, cw, false)...)
+			out = append(out, m.renderEntry(e, cw, false, false)...)
 			continue
 		}
 		j := i
@@ -1548,7 +1620,7 @@ func (m Model) renderSysLinesAt(cw int) []string {
 			engineKind(m.log[j+1].text) == engineKind(e.text) {
 			j++
 		}
-		lines := m.renderEntry(m.log[j], cw, false)
+		lines := m.renderEntry(m.log[j], cw, false, false)
 		if j > i {
 			lines[len(lines)-1] += dim.Render(fmt.Sprintf("  (%d)", j-i))
 		}
@@ -1597,18 +1669,37 @@ func sysIcon(body string) (string, lipgloss.Style) {
 	return "· ", dim
 }
 
-func (m Model) renderEntry(e entry, cw int, cont bool) []string {
+func (m Model) renderEntry(e entry, cw int, cont, faded bool) []string {
 	switch e.kind {
 	case entChat:
 		// first line: HH:MM + nick; grouped lines keep the message column but
 		// swap time+nick for a speaker-colored anchor (▏) — attribution without noise
-		who := nickStyle(e.nick).Render(e.nick)
-		prefix := timeStyle.Render(e.at.Format("15:04")) + " " + who + " "
-		if cont {
-			prefix = strings.Repeat(" ", 6) + " " +
-				nickStyle(e.nick).Render("▏") + strings.Repeat(" ", lipgloss.Width(e.nick)-1) + " "
+		// zen only: a message older than zenDimAfter fades into the calm
+		// surface (the group head decides, a continuation inherits it).
+		// The whole line is dimmed, so the prefix carries no other color
+		// (an inner reset would end the dim mid-line).
+		var prefix string
+		if faded {
+			prefix = e.at.Format("15:04") + " " + e.nick + " "
+			if cont {
+				prefix = strings.Repeat(" ", 6) + " " + "▏" +
+					strings.Repeat(" ", lipgloss.Width(e.nick)-1) + " "
+			}
+		} else {
+			who := nickStyle(e.nick).Render(e.nick)
+			prefix = timeStyle.Render(e.at.Format("15:04")) + " " + who + " "
+			if cont {
+				prefix = strings.Repeat(" ", 6) + " " +
+					nickStyle(e.nick).Render("▏") + strings.Repeat(" ", lipgloss.Width(e.nick)-1) + " "
+			}
 		}
-		return wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix)
+		lines := wrapIndented(e.text, cw-lipgloss.Width(prefix)-1, lipgloss.Width(prefix)+1, prefix)
+		if faded {
+			for i := range lines {
+				lines[i] = dim.Render(lines[i])
+			}
+		}
+		return lines
 	case entEngine:
 		body := strings.TrimPrefix(e.text, "> ")
 		icon, style := sysIcon(body)

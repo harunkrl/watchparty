@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -667,10 +668,10 @@ func TestJoinLeftColored(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.ANSI)
 	defer lipgloss.SetColorProfile(orig)
 	m := New("ada", nil, nil, false, nil)
-	if got := m.renderEntry(entry{kind: entEvent, text: "> bo joined"}, 60, false)[0]; got == dim.Render("· bo joined") {
+	if got := m.renderEntry(entry{kind: entEvent, text: "> bo joined"}, 60, false, false)[0]; got == dim.Render("· bo joined") {
 		t.Fatalf("join line still renders dim: %q", got)
 	}
-	if got := m.renderEntry(entry{kind: entEvent, text: "> bo left"}, 60, false)[0]; got == dim.Render("· bo left") {
+	if got := m.renderEntry(entry{kind: entEvent, text: "> bo left"}, 60, false, false)[0]; got == dim.Render("· bo left") {
 		t.Fatalf("left line still renders dim: %q", got)
 	}
 }
@@ -959,5 +960,198 @@ func TestInviteFromHello(t *testing.T) {
 	m = m.syncViewport()
 	if !strings.Contains(m.vp.View(), "100.64.1.2:8090") {
 		t.Fatalf("the invite address is missing: %q", m.vp.View())
+	}
+}
+
+// --- v2 polish round (T1..T6, K1, K2) ---------------------------------------
+
+// T1/T2: the queue box says how many files it holds and how to skip —
+// the hint row comes out of the same row budget.
+func TestQueueBoxShowsCountAndSkipHint(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	if !strings.Contains(m.View(), "QUEUE (0)") {
+		t.Fatalf("the empty queue must show its count:\n%s", m.View())
+	}
+	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv", "b.mkv"}})
+	v := m.View()
+	if !strings.Contains(v, "QUEUE (2)") {
+		t.Fatalf("the queue count missing:\n%s", v)
+	}
+	lines := strings.Split(v, "\n")
+	for i, l := range lines {
+		if strings.Contains(l, "QUEUE (2)") {
+			if i+1 >= len(lines) || !strings.Contains(lines[i+1], "/skip next") {
+				t.Fatalf("the skip hint must be the first queue row: %q", lines)
+			}
+			break
+		}
+	}
+}
+
+// T3: alone in the room, the watcher panel says so.
+func TestWaitingForFollowerHint(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	if !strings.Contains(m.View(), "waiting for follower") {
+		t.Fatalf("the waiting hint missing:\n%s", m.View())
+	}
+	m = upd(t, m, room.Event{Type: "join", Nick: "bo"})
+	if strings.Contains(m.View(), "waiting for follower") {
+		t.Fatal("the waiting hint must vanish when someone is here")
+	}
+}
+
+// T4: the hotbar verb follows the state: resume while paused.
+func TestHotbarVerbIsContextual(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	if !strings.Contains(m.View(), "play/pause") {
+		t.Fatalf("the hotbar must offer play/pause by default:\n%s", m.View())
+	}
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	v := m.View()
+	if !strings.Contains(v, "resume") {
+		t.Fatalf("the paused hotbar must offer resume:\n%s", v)
+	}
+	if strings.Contains(v, "play/pause") {
+		t.Fatalf("the paused hotbar still says play/pause:\n%s", v)
+	}
+}
+
+// T5: the band title names the seek keys (the dashboard bar is not clickable).
+func TestBandTitleNamesSeekKeys(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	if !strings.Contains(m.View(), "NOW PLAYING · ctrl+←/→ to seek") {
+		t.Fatalf("the band title misses the seek hint:\n%s", m.View())
+	}
+}
+
+// T6: the equalizer title names the real state only.
+func TestEqualizerTitleSuffix(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	pos := 10.0
+	m = upd(t, m, sync.UiState{Pos: &pos, Volume: 80})
+	if !strings.Contains(m.View(), "EQUALIZER · ♪ vol 80%") {
+		t.Fatalf("the volume suffix missing:\n%s", m.View())
+	}
+	m = upd(t, m, sync.UiState{Pos: &pos, Paused: true})
+	if !strings.Contains(m.View(), "EQUALIZER · ⏸ paused · decaying") {
+		t.Fatalf("the paused suffix missing:\n%s", m.View())
+	}
+	// idle: no state, no claim
+	m2 := New("t", nil, nil, false, nil)
+	m2 = upd(t, m2, tea.WindowSizeMsg{Width: 120, Height: 30})
+	if strings.Contains(m2.View(), "EQUALIZER ·") {
+		t.Fatalf("the idle equalizer must not claim a state:\n%s", m2.View())
+	}
+}
+
+// K1: zen fades the old messages; the normal layouts never do.
+func TestZenDimsOldMessages(t *testing.T) {
+	// tests run without a TTY: force a color profile so lipgloss emits
+	// codes (truecolor keeps the 241 dim apart from the 243 timestamp)
+	orig := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(orig)
+
+	mark := dim.Render("X")
+	code := mark[:strings.Index(mark, "X")]
+	if code == "" {
+		t.Fatal("the color profile must emit codes")
+	}
+
+	log := []entry{
+		{kind: entChat, nick: "bo", text: "eski", at: time.Now().Add(-30 * time.Minute)},
+		{kind: entChat, nick: "bo", text: "yeni", at: time.Now()},
+	}
+	m := New("t", nil, nil, false, nil)
+	m.zen = true
+	m.log = log
+	lines := m.renderChatLines()
+	if len(lines) != 2 {
+		t.Fatalf("chat lines: %q", lines)
+	}
+	if !strings.Contains(lines[0], code) {
+		t.Fatalf("the old message must be dim in zen: %q", lines[0])
+	}
+	if strings.Contains(lines[1], code) {
+		t.Fatalf("the fresh message must stay bright in zen: %q", lines[1])
+	}
+	// the normal layout never dims
+	m2 := New("t", nil, nil, false, nil)
+	m2.log = log
+	for _, l := range m2.renderChatLines() {
+		if strings.Contains(l, code) {
+			t.Fatalf("the normal layout must not dim: %q", l)
+		}
+	}
+}
+
+// K2: two invite addresses are listed and labeled by their network; a
+// single address stays one unlabeled line.
+func TestDualInviteAddresses(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, room.Event{Type: "hello",
+		Invite: "http://100.84.22.15:8090", InviteAlt: "http://192.168.1.181:8090"})
+	m = m.syncViewport()
+	v := m.vp.View()
+	for _, want := range []string{"100.84.22.15:8090", "192.168.1.181:8090", "(tailscale)", "(local lan)"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("the placeholder misses %q: %q", want, v)
+		}
+	}
+	m2 := New("t", nil, nil, false, nil)
+	m2 = upd(t, m2, room.Event{Type: "hello", Invite: "http://100.84.22.15:8090"})
+	m2 = m2.syncViewport()
+	if v2 := m2.vp.View(); !strings.Contains(v2, "100.84.22.15:8090") || strings.Contains(v2, "(tailscale)") {
+		t.Fatalf("a single address must stay one unlabeled line: %q", v2)
+	}
+}
+
+// F2: a continuation inherits the group's head state — a bright head
+// with an older tail must not fade (the tail can be older than the
+// head, that quirk is pre-existing and stays).
+func TestZenContinuationInheritsHeadState(t *testing.T) {
+	orig := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(orig)
+
+	mark := dim.Render("X")
+	code := mark[:strings.Index(mark, "X")]
+
+	// head: 14 minutes old (bright), tail: 16 minutes old (dim on its own)
+	log := []entry{
+		{kind: entChat, nick: "bo", text: "head", at: time.Now().Add(-14 * time.Minute)},
+		{kind: entChat, nick: "bo", text: "tail", at: time.Now().Add(-16 * time.Minute)},
+	}
+	m := New("t", nil, nil, false, nil)
+	m.zen = true
+	m.log = log
+	lines := m.renderChatLines()
+	if len(lines) != 2 {
+		t.Fatalf("chat lines: %q", lines)
+	}
+	if strings.Contains(lines[0], code) {
+		t.Fatalf("the 14-minute head must stay bright: %q", lines[0])
+	}
+	if strings.Contains(lines[1], code) {
+		t.Fatalf("the continuation must inherit the bright head: %q", lines[1])
+	}
+
+	// the other way round: a dim head drags its tail down, even when the
+	// tail would be bright on its own (head -19.5min, tail -14.6min:
+	// same group, the tail inside the 15-minute window alone)
+	log2 := []entry{
+		{kind: entChat, nick: "bo", text: "head", at: time.Now().Add(-19500 * time.Second)},
+		{kind: entChat, nick: "bo", text: "tail", at: time.Now().Add(-14600 * time.Second)},
+	}
+	m.log = log2
+	lines = m.renderChatLines()
+	if !strings.Contains(lines[0], code) || !strings.Contains(lines[1], code) {
+		t.Fatalf("the continuation must inherit the dim head: %q", lines)
 	}
 }
