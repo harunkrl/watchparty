@@ -32,6 +32,7 @@ type Event struct {
 	Now    string   `json:"now,omitempty"`
 	Queue  []string `json:"queue,omitempty"`
 	Roster []string `json:"roster,omitempty"`
+	Invite string   `json:"invite,omitempty"` // hello only: the address to invite people to
 	T      float64  `json:"t"`
 	P      bool     `json:"p"`
 	Dur    float64  `json:"dur,omitempty"`

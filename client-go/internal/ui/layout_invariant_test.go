@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,29 @@ import (
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
 )
+
+// C-A: the QUEUE box must stay inside its row budget. queueLines() used to
+// return every queued file and padLines only grew the box, so a long queue
+// pushed the whole dashboard past the terminal height: the header and the
+// hotbar scrolled off the screen.
+func TestQueueOverflowKeepsDashboardHeight(t *testing.T) {
+	m := New("sen", nil, nil, true, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	q := make([]string, 25)
+	for i := range q {
+		q[i] = fmt.Sprintf("video-%02d.mkv", i)
+	}
+	m = upd(t, m, room.Event{Type: "queue", Queue: q})
+	v := m.View()
+	lines := strings.Split(v, "\n")
+	if len(lines) > 40 {
+		t.Fatalf("queue overflow: View has %d lines (> terminal 40)\noverflow near: %q",
+			len(lines), clip(lines[len(lines)-1]))
+	}
+	if !strings.Contains(v, "more") {
+		t.Fatalf("the truncated queue must say how many files are hidden:\n%s", clip(v))
+	}
+}
 
 func TestViewFitsTerminal(t *testing.T) {
 	// the stacked layout (< 100 columns) is checked too: it has no boxes

@@ -81,6 +81,7 @@ func TestSlashCommands(t *testing.T) {
 		t.Fatalf("/play dispatch wrong: c=%v log=%v", c, logTexts(m.log))
 	}
 	m.input.SetValue("/skip")
+	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"b.mkv"}}) // something to skip to
 	mm, c = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = mm.(Model)
 	if c == nil {
@@ -169,25 +170,38 @@ func TestBareChatTooLong(t *testing.T) {
 }
 
 func TestRenderEventTable(t *testing.T) {
+	big := make([]string, 25)
+	for i := range big {
+		big[i] = fmt.Sprintf("f%d.mkv", i)
+	}
 	cases := []struct {
 		ev   room.Event
+		self string
 		want string
 	}{
-		{room.Event{Type: "hello", Queue: []string{}}, "> room: now=- queue=[]"},
-		{room.Event{Type: "hello", Now: "a.mkv", Queue: []string{"b.mkv"}}, "> room: now=a.mkv queue=[b.mkv]"},
-		{room.Event{Type: "join", Nick: "bo"}, "> bo joined"},
-		{room.Event{Type: "bye", Nick: "bo"}, "> bo left"},
-		{room.Event{Type: "chat", Nick: "bo", Text: "hi"}, "[bo] hi"},
-		{room.Event{Type: "queue", Queue: []string{"a", "b"}}, "> queue: [a, b]"},
-		{room.Event{Type: "load", Name: "a.mkv"}, "> load a.mkv"},
-		{room.Event{Type: "play"}, "> play"},
-		{room.Event{Type: "pause"}, "> pause"},
-		{room.Event{Type: "seek", T: 59.96}, "> seek @60.0s"},
-		{room.Event{Type: "position"}, ""}, // heartbeats are never rendered
-		{room.Event{Type: "unknown"}, ""},
+		{room.Event{Type: "hello", Queue: []string{}}, "ada", "> room: now=- queue=[]"},
+		{room.Event{Type: "hello", Now: "a.mkv", Queue: []string{"b.mkv"}}, "ada", "> room: now=a.mkv queue=[b.mkv]"},
+		{room.Event{Type: "join", Nick: "bo"}, "ada", "> bo joined"},
+		{room.Event{Type: "bye", Nick: "bo"}, "ada", "> bo left"},
+		{room.Event{Type: "chat", Nick: "bo", Text: "hi"}, "ada", "[bo] hi"},
+		{room.Event{Type: "queue", Queue: []string{"a", "b"}}, "ada", "> queue: [a, b]"},
+		// R1: a long queue must not swallow the system tail
+		{room.Event{Type: "queue", Queue: big}, "ada", "> queue: [f0.mkv, f1.mkv, f2.mkv (+22)]"},
+		{room.Event{Type: "load", Name: "a.mkv"}, "ada", "> load a.mkv"},
+		{room.Event{Type: "play"}, "ada", "> play"},
+		{room.Event{Type: "pause"}, "ada", "> pause"},
+		{room.Event{Type: "seek", T: 59.96}, "ada", "> seek @60.0s"},
+		{room.Event{Type: "position"}, "ada", ""}, // heartbeats are never rendered
+		{room.Event{Type: "unknown"}, "ada", ""},
+		// C-F: the room stamps the actor on a state change
+		{room.Event{Type: "pause", Nick: "bo"}, "ada", "> pause by bo"},
+		{room.Event{Type: "play", Nick: "bo"}, "ada", "> play by bo"},
+		{room.Event{Type: "seek", T: 12.3, Nick: "bo"}, "ada", "> seek @12.3s by bo"},
+		{room.Event{Type: "pause", Nick: "ada"}, "ada", "> pause"}, // our own action stays bare
+		{room.Event{Type: "seek", T: 12.3, Nick: "ada"}, "ada", "> seek @12.3s"},
 	}
 	for _, tc := range cases {
-		if got := RenderEvent(tc.ev); got != tc.want {
+		if got := RenderEvent(tc.ev, tc.self); got != tc.want {
 			t.Errorf("RenderEvent(%+v) = %q, want %q", tc.ev, got, tc.want)
 		}
 	}
@@ -733,5 +747,217 @@ func TestWatchersOfflineTag(t *testing.T) {
 	m = upd(t, m, room.Event{Type: "join", Nick: "bo"})
 	if strings.Contains(strings.Join(m.watcherLines(), "\n"), "offline") {
 		t.Fatal("returning nick keeps its offline tag")
+	}
+}
+
+// --- Gemini round (C-B..C-G) -----------------------------------------------
+
+// C-B: the equalizer must fill its box. The idle flatline (0.04) rounded
+// down to zero blocks, so the whole panel rendered empty.
+func TestVibePanelNeverRendersEmpty(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = m.stepEq() // idle: no state at all
+	lines := m.vibePanel(40)
+	if len(lines) != 8 {
+		t.Fatalf("vibe panel rows = %d, want 8", len(lines))
+	}
+	blocks := false
+	for _, l := range lines {
+		if lipgloss.Width(l) > 40 {
+			t.Fatalf("panel row too wide (%d cols): %q", lipgloss.Width(l), l)
+		}
+		if strings.Contains(l, "██") {
+			blocks = true
+		}
+	}
+	if !blocks {
+		t.Fatalf("the idle equalizer renders no blocks at all: %q", lines)
+	}
+}
+
+// C-B: the equalizer box must use its full inner width (the panel used
+// to be rendered two columns narrower, leaving a gap on the right).
+func TestEqualizerFillsItsBoxWidth(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	_, rightW := m.dashGeom()
+	inner := rightW - 4 // the box's content width
+	lines := m.vibePanel(inner)
+	widest := 0
+	for _, l := range lines {
+		w := lipgloss.Width(l)
+		if w > inner {
+			t.Fatalf("panel row too wide (%d > %d): %q", w, inner, l)
+		}
+		if w > widest {
+			widest = w
+		}
+	}
+	if widest < inner-2 {
+		t.Fatalf("the equalizer leaves %d empty columns in its box: %q", inner-widest, lines)
+	}
+}
+
+// C-C: the hotbar points at the file picker; the tab key keeps working.
+func TestHotbarShowsCtrlPFiles(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	v := m.View()
+	if !strings.Contains(v, "[ctrl+p]") || !strings.Contains(v, "files") {
+		t.Fatalf("hotbar missing the picker hint:\n%s", v)
+	}
+	if strings.Contains(v, "[tab] commands") {
+		t.Fatalf("the hotbar still advertises the tab menu:\n%s", v)
+	}
+	m2 := New("t", nil, nil, false, nil)
+	m2.input.SetValue("/pl")
+	m2 = upd(t, m2, tea.KeyMsg{Type: tea.KeyTab})
+	if m2.input.Value() != "/play " {
+		t.Fatalf("tab completion broken: %q", m2.input.Value())
+	}
+}
+
+// C-D: /skip on an empty queue says so instead of silently doing nothing.
+func TestSkipOnEmptyQueueReports(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m.input.SetValue("/skip")
+	mm, c := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(Model)
+	if c != nil {
+		t.Fatal("skip on an empty queue must not post")
+	}
+	if !strings.Contains(m.lastErr, "queue is empty") {
+		t.Fatalf("no feedback for an empty queue: %q", m.lastErr)
+	}
+	if !strings.Contains(m.View(), "queue is empty") {
+		t.Fatalf("the feedback must be visible: %q", m.View())
+	}
+	// a queued file makes the skip real again
+	m = upd(t, m, room.Event{Type: "queue", Queue: []string{"a.mkv"}})
+	m.input.SetValue("/skip")
+	mm, c = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if c == nil {
+		t.Fatal("skip with a queued file must post")
+	}
+}
+
+// C-E: a short conversation sits at the bottom of the viewport, next to
+// the input row — and follow-bottom still wins when the chat is long.
+func TestSparseChatSitsAtTheBottom(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
+	m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: "selam"})
+	lines := strings.Split(m.vp.View(), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "selam") {
+		t.Fatalf("the message must be the last viewport row: %q", last)
+	}
+	for i := 0; i < 40; i++ {
+		m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: fmt.Sprintf("line-%02d", i)})
+	}
+	lines = strings.Split(m.vp.View(), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "line-39") {
+		t.Fatalf("follow-bottom broken: %q", last)
+	}
+}
+
+// B1: the completion menu borrows rows from the chat viewport. The
+// padding that keeps a sparse chat at the bottom must follow the
+// SHRUNK viewport height — otherwise the message is pushed out of the
+// visible window and the chat looks empty while the menu is open.
+func TestMenuOpenKeepsChatVisible(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
+	m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: "selam"})
+	m.input.SetValue("/p")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab}) // ambiguous: the menu opens
+	if !m.compOpen {
+		t.Fatal("precondition: the completion menu must be open")
+	}
+	_, vh, _, _, _ := m.layout()
+	if m.vp.Height != vh {
+		t.Fatalf("the chat viewport height is stale: model=%d layout=%d", m.vp.Height, vh)
+	}
+	lines := strings.Split(m.vp.View(), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "selam") {
+		t.Fatalf("the message must be the last viewport row: %q", last)
+	}
+	if !strings.Contains(m.View(), "selam") {
+		t.Fatalf("the message must be visible with the menu open:\n%s", m.View())
+	}
+	// a long chat still follows the bottom while the menu is open
+	for i := 0; i < 40; i++ {
+		m = upd(t, m, room.Event{Type: "chat", Nick: "bo", Text: fmt.Sprintf("line-%02d", i)})
+	}
+	lines = strings.Split(m.vp.View(), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "line-39") {
+		t.Fatalf("follow-bottom broken with the menu open: %q", last)
+	}
+}
+
+// B4: the menu budget must come from the REAL layout. The stacked
+// layout has no equalizer, so its chat is far taller than the
+// dashboard formula assumed — the budget collapsed to one row and the
+// candidates were never visible.
+func TestStackedMenuShowsCandidates(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
+	m.input.SetValue("/p")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("precondition: the completion menu must be open")
+	}
+	lines := m.menuLines(m.contentWidth())
+	if len(lines) < 2 {
+		t.Fatalf("the menu shows %d rows, the candidates are hidden: %q", len(lines), lines)
+	}
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"/pick", "/play"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("the menu misses %q: %q", want, joined)
+		}
+	}
+}
+
+// B4 regression guard: the dashboard keeps today's budget — there the
+// chat really is 5 rows tall and the 4-row floor wins.
+func TestDashboardMenuBudgetUnchanged(t *testing.T) {
+	m := New("t", nil, nil, false, nil)
+	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	m.input.SetValue("/p")
+	m = upd(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.compOpen {
+		t.Fatal("precondition: the completion menu must be open")
+	}
+	if lines := m.menuLines(m.contentWidth()); len(lines) != 1 {
+		t.Fatalf("the dashboard menu budget changed: %d rows", len(lines))
+	}
+}
+
+// C-F: a remote state change names its actor, and the icon/collapse keys
+// still work (the first token is unchanged).
+func TestSystemLineNamesTheActor(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, room.Event{Type: "pause", Nick: "bo"})
+	sys := strings.Join(m.renderSysLines(), "\n")
+	if !strings.Contains(sys, "pause by bo") {
+		t.Fatalf("the actor is missing: %q", sys)
+	}
+	if !strings.Contains(sys, "⏸") {
+		t.Fatalf("the pause icon is gone: %q", sys)
+	}
+	m = upd(t, m, room.Event{Type: "pause", Nick: "ada"}) // our own action
+	sys = strings.Join(m.renderSysLines(), "\n")
+	if strings.Count(sys, "pause") != 2 {
+		t.Fatalf("two different actors collapsed into one line: %q", sys)
+	}
+}
+
+// C-G: the server's hello carries the address to invite people to.
+func TestInviteFromHello(t *testing.T) {
+	m := New("ada", nil, nil, false, nil)
+	m = upd(t, m, room.Event{Type: "hello", Invite: "http://100.64.1.2:8090"})
+	m = m.syncViewport()
+	if !strings.Contains(m.vp.View(), "100.64.1.2:8090") {
+		t.Fatalf("the invite address is missing: %q", m.vp.View())
 	}
 }

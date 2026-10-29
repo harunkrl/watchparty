@@ -134,6 +134,7 @@ type Model struct {
 	log        []entry
 	peers      map[string]bool
 	now        string
+	invite     string   // address to invite people to (server hello "invite")
 	queue      []string // server queue state (hello/queue events)
 	files      []string // last known video list (typo guard, any filesMsg)
 	st         *sync.UiState
@@ -407,7 +408,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			m.acceptMenu()
-			return m, nil
+			return m.syncLayout(), nil
 		case "up":
 			m.compCursor = max(0, m.compCursor-1)
 			return m, nil
@@ -418,20 +419,22 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		case "esc":
 			m.compOpen = false
-			return m, nil
+			return m.syncLayout(), nil
 		}
 	}
 	switch msg.String() {
 	case "enter":
 		m.compOpen = false
-		return m.submit()
+		m, c := m.submit()
+		return m.syncLayout(), c
 	case "esc":
 		m.input.SetValue("")
 		m.vp.GotoBottom()
 	case "ctrl+c":
 		return m, tea.Quit
 	case "tab":
-		return m.complete()
+		m, c := m.complete()
+		return m.syncLayout(), c
 	case "ctrl+@": // ctrl+space sends NUL: play/pause without leaving the chat
 		if m.engine != nil {
 			m.engine.PauseToggle()
@@ -492,7 +495,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.compOpen { // live refilter while the menu is up
 			m = m.openMenu()
 		}
-		return m, c
+		return m.syncLayout(), c
 	}
 	return m, nil
 }
@@ -742,6 +745,9 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		}
 		return m.enqueue(c.Arg)
 	case cmd.Skip:
+		if len(m.queue) == 0 { // nothing to skip to: say so instead of no-op
+			return m.failf("queue is empty — nothing to skip to (use /pick)")
+		}
 		return m, postEvent(m.api, room.Event{Type: "skip"})
 	}
 	return m, nil
@@ -758,7 +764,7 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 	var c tea.Cmd
 	if ev.Type == "chat" {
 		m = m.logChat(ev.Nick, ev.Text)
-	} else if line := RenderEvent(ev); line != "" {
+	} else if line := RenderEvent(ev, m.nick); line != "" {
 		m = m.logEvent(line)
 	}
 	switch ev.Type {
@@ -774,6 +780,7 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 			m, c = m.setFile(ev.Now)
 		}
 		m.queue = ev.Queue
+		m.invite = ev.Invite // the server knows its own reachable address
 		// roster replaces guesswork: a late joiner sees everyone already in
 		// the room, not only the joins that happened after them
 		m.peers = map[string]bool{}
@@ -817,7 +824,10 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 
 // RenderEvent formats one room event as a log line shared by the TUI and
 // the headless adapter (client.py log parity). Empty = not rendered.
-func RenderEvent(ev room.Event) string {
+// self is our own nick: an event the room stamped with someone else's
+// nick names its actor, our own (or an unstamped) event keeps the bare
+// format.
+func RenderEvent(ev room.Event, self string) string {
 	switch ev.Type {
 	case "hello":
 		return fmt.Sprintf("> room: now=%s queue=%s", orDash(ev.Now), queueStr(ev.Queue))
@@ -832,13 +842,22 @@ func RenderEvent(ev room.Event) string {
 	case "load":
 		return fmt.Sprintf("> load %s", ev.Name)
 	case "play", "pause":
-		return "> " + ev.Type
+		return "> " + ev.Type + actor(ev.Nick, self)
 	case "notice":
 		return "> " + ev.Text
 	case "seek":
-		return fmt.Sprintf("> seek @%.1fs", ev.T)
+		return fmt.Sprintf("> seek @%.1fs%s", ev.T, actor(ev.Nick, self))
 	}
 	return ""
+}
+
+// actor names who changed the state (" by bo") when the room stamped
+// someone else's nick on the event.
+func actor(nick, self string) string {
+	if nick == "" || nick == self {
+		return ""
+	}
+	return " by " + nick
 }
 
 // syncLayout applies the derived geometry (viewport size, input width) to
@@ -868,7 +887,7 @@ func (m Model) syncViewport() Model {
 		if !m.hasChat() {
 			content = m.inviteLines() // empty room: show what to send the other side
 		} else {
-			content = strings.Join(m.renderChatLines(), "\n")
+			content = m.padChatBottom(strings.Join(m.renderChatLines(), "\n"))
 		}
 		m.vp.SetContent(content)
 		if atBottom {
@@ -886,10 +905,12 @@ func (m Model) syncViewport() Model {
 // chat viewport height and which optional rows fit. Below ~20 rows the
 // optional rows degrade first (bar, system strip, footer); chat survives
 // longest — the layout never splits horizontally.
-func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
+// layoutCore derives the geometry WITHOUT the completion menu: the chat
+// height the frame can afford before the menu borrows rows from it.
+func (m Model) layoutCore() (cw, vh int, showBar, showSys, showFooter bool) {
 	if !m.zen && m.dashOn() { // dashboard: the chat box owns the right column
 		_, r := m.dashGeom()
-		return r - 2, m.chatBoxH(), false, false, false
+		return r - 2, m.chatBase(), false, false, false
 	}
 	cw = m.contentWidth()
 	inner := m.height - frame.GetVerticalFrameSize()
@@ -912,11 +933,20 @@ func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
 	if showFooter {
 		fixed++
 	}
-	// the open completion menu floats above the input: its rows come out
-	// of the chat, or the frame grows past the terminal and the header
-	// scrolls off (A3-UI5 follow-up)
-	vh = max(1, inner-fixed-m.menuRows())
-	return cw, vh, showBar, showSys, showFooter
+	return cw, max(1, inner-fixed), showBar, showSys, showFooter
+}
+
+// layout is layoutCore minus the rows the open completion menu borrows:
+// the menu floats above the input, its rows come out of the chat, or
+// the frame grows past the terminal and the header scrolls off
+// (A3-UI5 follow-up).
+func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
+	if !m.zen && m.dashOn() { // dashboard: the chat box lives in the column
+		_, r := m.dashGeom()
+		return r - 2, m.chatBoxH(), false, false, false
+	}
+	cw, vh, showBar, showSys, showFooter = m.layoutCore()
+	return cw, max(1, vh-m.menuRows()), showBar, showSys, showFooter
 }
 
 // contentWidth is the usable width inside the frame.
@@ -965,12 +995,27 @@ func (m Model) hasChat() bool {
 	return false
 }
 
+// padChatBottom pads a short conversation with empty lines ABOVE the
+// content: sparse chat used to sit at the top of the viewport, far from
+// the input row. The viewport still follows the bottom.
+func (m Model) padChatBottom(content string) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) >= m.vp.Height {
+		return content
+	}
+	return strings.Repeat("\n", m.vp.Height-len(lines)) + content
+}
+
 // inviteLines is the empty-chat placeholder: the one thing a first-time
-// host needs is the address to send the other side.
+// host needs is the address to send the other side. The server's hello
+// carries its own reachable address; our API base is the fallback.
 func (m Model) inviteLines() string {
-	base := "http://<server>"
-	if m.api != nil && m.api.Base != "" {
+	base := m.invite
+	if base == "" && m.api != nil && m.api.Base != "" {
 		base = m.api.Base
+	}
+	if base == "" {
+		base = "http://<server>"
 	}
 	return dim.Render("no messages yet — invite them:") + "\n" +
 		title.Render("  "+base) + "\n" +
@@ -1061,15 +1106,15 @@ func (m Model) vibePanel(w int) []string {
 		m = m.stepEq()
 	}
 	const rows = 8
-	cols := max(4, (w-2)/3)                          // "██ " per column
-	pad := strings.Repeat(" ", max(0, (w-cols*3)/2)) // center: no dead gap on the right
+	cols := max(4, (w+1)/3)                              // "██ " per column
+	pad := strings.Repeat(" ", max(0, (w-(cols*3-1))/2)) // center: no dead gap on the right
 	heights := make([]int, cols)
 	for i := range heights {
 		v := 0.04
 		if i < len(m.eq) {
 			v = m.eq[i]
 		}
-		heights[i] = int(v * float64(rows) * 0.99)
+		heights[i] = max(1, int(v*float64(rows)*0.99)) // never an empty column: a flatline must still be visible
 	}
 	lines := make([]string, rows) // top row first
 	for lvl := rows; lvl >= 1; lvl-- {
@@ -1164,13 +1209,27 @@ func (m Model) sortedPeers() []string {
 	return out
 }
 
-func (m Model) queueLines() []string {
+// queueLines renders the queue box contents, at most n rows: a long queue
+// is truncated and the last row says how many files are hidden (the box
+// must never grow past its row budget — the whole dashboard would scroll
+// the header off the terminal).
+func (m Model) queueLines(n int) []string {
 	if len(m.queue) == 0 {
 		return []string{dim.Render("empty — ") + keyStyle.Render("/queue <file>") + dim.Render(" to add")}
 	}
-	out := make([]string, len(m.queue))
-	for i, q := range m.queue {
-		out[i] = fmt.Sprintf("%d. %s", i+1, q)
+	if n <= 0 {
+		return nil
+	}
+	shown := len(m.queue)
+	if shown > n {
+		shown = n - 1 // the last row carries the overflow hint
+	}
+	out := make([]string, 0, n)
+	for i := 0; i < shown; i++ {
+		out = append(out, fmt.Sprintf("%d. %s", i+1, m.queue[i]))
+	}
+	if shown < len(m.queue) {
+		out = append(out, dim.Render(fmt.Sprintf("… +%d more", len(m.queue)-shown)))
 	}
 	return out
 }
@@ -1186,11 +1245,16 @@ func padLines(lines []string, n int) []string {
 // dashView assembles the two-column dashboard: a full-width NOW PLAYING
 // band under the header, then WATCHERS/QUEUE/SYSTEM on the left and the
 // conversation with the input box on the right. A hotkey bar closes.
+// chatBase is the dashboard chat box height without the menu: the rows
+// the left column leaves to the conversation.
+func (m Model) chatBase() int {
+	return max(4, m.height-3-7-m.vibeH()-3-2)
+}
+
+// chatBoxH is the dashboard chat box height: the base minus the rows
+// the open menu borrows (the chat never drops below 4 rows).
 func (m Model) chatBoxH() int {
-	// header, gap, hotbar, now band (7 with the bar's breathing rows),
-	// equalizer (short screens drop it), message box, chat borders; the open
-	// menu borrows from chat but never below the 4-row floor (menuBudget)
-	return max(4, m.height-3-7-m.vibeH()-3-2-m.menuBudget())
+	return max(4, m.chatBase()-m.menuBudget())
 }
 
 func (m Model) dashView() string {
@@ -1242,7 +1306,7 @@ func (m Model) dashView() string {
 	if len(m.queue) == 0 {
 		qBord = bordQueueIdle // muted orchid: same family, quieter than grey
 	}
-	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(), queueH-2), qBord)...)
+	left = append(left, box(leftW, "QUEUE", padLines(m.queueLines(queueH-2), queueH-2), qBord)...)
 	if sysH > 0 {
 		sys := m.renderSysLinesAt(leftW - 4)
 		if len(sys) > sysH-2 {
@@ -1263,7 +1327,7 @@ func (m Model) dashView() string {
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
 	right := box(rightW, "CHAT", strings.Split(vp.View(), "\n"), bordChat)
 	if m.vibeH() > 0 {
-		right = append(box(rightW, "EQUALIZER", m.vibePanel(rightW-6), bordVibe), right...)
+		right = append(box(rightW, "EQUALIZER", m.vibePanel(rightW-4), bordVibe), right...)
 	}
 	right = append(right, box(rightW, "MESSAGE", msg, bordMsg)...)
 
@@ -1279,7 +1343,7 @@ func (m Model) dashView() string {
 	hotbar := dim.Render(" ") +
 		keyStyle.Render("[ctrl+space]") + hue("2").Render(" play/pause · ") +
 		keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
-		keyStyle.Render("[tab]") + hue("141").Render(" commands · ") +
+		keyStyle.Render("[ctrl+p]") + hue("141").Render(" files · ") +
 		keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
 		keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
 
@@ -1354,10 +1418,14 @@ func (m Model) menuRows() int {
 	return min(len(m.compItems), menuMax)
 }
 
-// menuBudget caps what the menu may borrow: chat never drops below 4 rows.
+// menuBudget caps what the menu may borrow: the chat never drops below
+// 4 rows. The budget comes from the CURRENT layout — the stacked and zen
+// layouts have no equalizer, so their chat is far taller than the
+// dashboard formula assumed (the candidates used to be squeezed into a
+// single row and never shown).
 func (m Model) menuBudget() int {
-	chat := m.height - 3 - 7 - m.vibeH() - 3 - 2
-	return min(m.menuRows(), max(0, chat-4))
+	_, vh, _, _, _ := m.layoutCore()
+	return min(m.menuRows(), max(0, vh-4))
 }
 
 func (m Model) View() string {
@@ -1563,12 +1631,17 @@ func (m Model) renderEntry(e entry, cw int, cont bool) []string {
 // engineKind is the collapse key: the first token after the ">" prompt, so
 // "> pause" and "> play" never merge (the last real state must stay visible)
 // while repeats like "> seek @1.0s", "> seek @2.0s" collapse to the newest.
+// An actor is part of the fact: "pause by bo" must not collapse into "pause".
 func engineKind(text string) string {
 	t := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), ">"))
-	if i := strings.IndexAny(t, " \t"); i >= 0 {
-		t = t[:i]
+	f := strings.Fields(t)
+	if len(f) == 0 {
+		return ""
 	}
-	return t
+	if len(f) >= 3 && f[1] == "by" {
+		return f[0] + " by " + f[2]
+	}
+	return f[0]
 }
 
 // wrapIndented word-wraps plain text to width; continuation lines get
@@ -1847,6 +1920,12 @@ func orDash(s string) string {
 	return s
 }
 
+// queueStr renders a queue list for a log line: the first three names
+// plus a count. A 25-file queue would otherwise wrap over a dozen lines
+// and swallow the whole system tail.
 func queueStr(q []string) string {
-	return "[" + strings.Join(q, ", ") + "]"
+	if len(q) <= 3 {
+		return "[" + strings.Join(q, ", ") + "]"
+	}
+	return "[" + strings.Join(q[:3], ", ") + fmt.Sprintf(" (+%d)", len(q)-3) + "]"
 }

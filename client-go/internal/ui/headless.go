@@ -22,7 +22,7 @@ func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine,
 	fmt.Fprintln(out, cmd.Usage)
 	go func() { // room events -> log + engine (TUI dispatcher parity)
 		for ev := range roomCh {
-			if line := RenderEvent(ev); line != "" {
+			if line := RenderEvent(ev, nick); line != "" {
 				fmt.Fprintln(out, line)
 			}
 			engine.OnRoom(ev)

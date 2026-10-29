@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	gosync "sync"
 	"testing"
+	"time"
 
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
@@ -64,5 +66,57 @@ func TestHeadlessBareTextIsChat(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "[ada] hello there") {
 		t.Fatalf("local echo missing: %q", out.String())
+	}
+}
+
+// syncBuffer is a bytes.Buffer that survives the headless printer goroutine.
+type syncBuffer struct {
+	mu  gosync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// C-F parity: the headless adapter prints the same actor line as the TUI
+// ("> pause by bo"), and our own action stays bare.
+func TestHeadlessPrintsActorLines(t *testing.T) {
+	api := room.New("http://127.0.0.1:1", "ada-1")
+	engine := &sync.Engine{
+		Player: stubPlayer{},
+		Post:   func(ev room.Event) error { return nil },
+		Clock:  sync.RealClock{},
+	}
+	out := &syncBuffer{}
+	ch := make(chan room.Event, 2)
+	ch <- room.Event{Type: "pause", Nick: "bo"}
+	ch <- room.Event{Type: "pause", Nick: "ada"}
+	close(ch)
+	if err := Run("ada", api, nil, engine, ch, strings.NewReader(""), out); err != nil {
+		t.Fatal(err)
+	}
+	// the room printer runs in its own goroutine: wait for it
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), "> pause by bo") && strings.Contains(out.String(), "> pause\n") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := out.String()
+	if !strings.Contains(got, "> pause by bo") {
+		t.Fatalf("headless lost the actor: %q", got)
+	}
+	if !strings.Contains(got, "> pause\n") {
+		t.Fatalf("our own action must stay bare: %q", got)
 	}
 }

@@ -67,6 +67,7 @@ on the left; chat and input on the right):
 |---|---|
 | `↑` / `↓` | recall what you typed before (input history) |
 | `Tab` | complete `/commands` and file names |
+| `ctrl+p` | pick a film: browse and play/queue with the arrow keys |
 | `ctrl+space` | play/pause for the whole room |
 | `ctrl+←` / `ctrl+→` | seek everyone ∓5 s / ±5 s |
 | `ctrl+z` | movie mode: collapse to one status line + chat + input |
@@ -77,7 +78,8 @@ on the left; chat and input on the right):
 Note: with mouse on, terminal text selection needs `shift` held.
 
 You get a notice in the terminal when the other side joins or leaves.
-`/skip` is a silent no-op when the queue is empty (use `/list` to see what is queued).
+`/skip` with an empty queue says so in the input row instead of doing
+nothing (use `/list` to see what is queued).
 
 Controls are shared: **either side** can pause (space in the mpv window),
 seek and pick a new file — the master's heartbeat keeps everyone converged.
