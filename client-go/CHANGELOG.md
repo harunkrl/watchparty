@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.3.1 — named actors, honest meters
 
 - client + server: every room action names its actor — system lines read
   "pause by bo", the NOW PLAYING stat row says "⏸ paused by bo", and your
