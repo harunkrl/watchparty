@@ -1,14 +1,15 @@
 # Changelog
 
-## Unreleased
+## v1.3.2 — friendlier start
 
 - client (windows friend flow): errors no longer vanish with the console
   (the window waits for Enter); a missing mpv says where it looked, and
   the client now finds mpv both beside the exe and in an mpv*/ subfolder
   — a fresh extraction of the release bundle starts as-is
-- client: the startup prompt accepts a bare host ("100.101.102.103" or
-  "host:9000" — http:// is optional, :8090 is the default) and remembers
-  the last server + nick: the next launch is Enter, Enter
+- client: the startup prompt asks for the bare address
+  ("192.168.1.181:8090" — no scheme, the port defaults to 8090, a full
+  http:// URL still works) and remembers the last server + nick: the
+  next launch is Enter, Enter
 - ci: the Windows bundle flattens the mpv archive when it extracts into
   a subfolder (mpv.exe belongs beside watchparty.exe)
 
