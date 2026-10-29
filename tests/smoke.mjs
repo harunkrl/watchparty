@@ -102,6 +102,9 @@ try {
   const b = sse('bob', 'Bob'); // sender
   await sleep(200);
   assert.equal(a.events[0].type, 'hello');
+  // S-A: hello carries a dialable invite URL — the server is the only party
+  // that knows its reachable address (the client may be off-host)
+  assert.match(a.events[0].invite, /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/, `invite: ${a.events[0].invite}`);
   await waitUntil(() => a.events.some((e) => e.type === 'join' && e.nick === 'Bob'));
 
   // S5: health endpoint for watchdog/manual liveness checks
@@ -245,6 +248,20 @@ try {
     assert.ok(a.events.some((ev) => ev.type === t), `missing ${t}`);
   }
 
+  // S-B pin: play/pause/seek relays carry the actor's room nick (the client
+  // renders "> pause by <nick>"); the server's roster wins over any
+  // client-supplied nick, and the actor is echo-filtered
+  await post({ type: 'pause', from: 'bob', nick: 'spoofed' });
+  await waitUntil(() => a.events.some((e) => e.type === 'pause' && e.nick === 'Bob'));
+  assert.ok(!b.events.some((e) => e.type === 'pause'), 'sender must not hear his own pause');
+
+  // B3 pin: a poster with no roster entry (never opened SSE) must relay
+  // with NO nick at all — a client-supplied fallback would fake "> pause by ada"
+  await post({ type: 'pause', from: 'ghost', nick: 'spoofed' });
+  await waitUntil(() => a.events.some((e) => e.type === 'pause' && e.from === 'ghost'));
+  const ghost = a.events.find((e) => e.type === 'pause' && e.from === 'ghost');
+  assert.ok(!('nick' in ghost), `ghost pause must carry no nick, got ${JSON.stringify(ghost)}`);
+
   // S6 pin: the server relays zero/false wire values verbatim (the C7
   // client fix relies on this) and the gates type-check junk away
   await post({ type: 'seek', from: 'bob', t: 0 });
@@ -318,6 +335,22 @@ try {
   await sleep(300);
   assert.equal(a.events.filter((e) => e.type === 'notice').length, noticesBefore + 1);
   assert.equal(a.events.filter((e) => e.type === 'position').length, posBefore);
+
+  // B2 pin: loading a queued file rebroadcasts the queue — every client
+  // must see the playing file leave it (QUEUE box, /skip guard, /queue).
+  // Uses a fresh file so state.now cannot shadow later scenarios' names.
+  writeFileSync(join(dir, 'movie three.mkv'), Buffer.alloc(1000, 1));
+  await post({ type: 'enqueue', from: 'bob', name: 'movie three.mkv' });
+  await waitUntil(() => a.events.some((e) => e.type === 'queue' && e.queue.includes('movie three.mkv')));
+  const qA = a.events.filter((e) => e.type === 'queue').length;
+  const qB = b.events.filter((e) => e.type === 'queue').length;
+  await post({ type: 'load', from: 'bob', name: 'movie three.mkv' });
+  await waitUntil(() => a.events.filter((e) => e.type === 'queue').length > qA
+    && b.events.filter((e) => e.type === 'queue').length > qB, 3000);
+  const lastA = [...a.events].reverse().find((e) => e.type === 'queue');
+  const lastB = [...b.events].reverse().find((e) => e.type === 'queue');
+  assert.ok(!lastA.queue.includes('movie three.mkv'), 'playing file must leave the queue for alice');
+  assert.ok(!lastB.queue.includes('movie three.mkv'), 'playing file must leave the queue for bob');
 
   // the claim dies with the owner's connection: the next poster takes over
   b.close();

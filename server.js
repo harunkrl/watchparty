@@ -6,6 +6,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PORT = Number(process.env.PORT) || 8090;
@@ -36,6 +37,30 @@ const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort(n
 // locally — subtitle choice never enters the sync layer
 const SUB_RE = /\.(srt|ass|ssa|vtt)$/i;
 const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort(natural);
+
+// S-A: the invite URL only the server can know — a client may sit on another
+// host, so hello points at a dialable IPv4 instead of localhost. Preference:
+// tailscale (100.64/10), then RFC1918 private, then any non-internal v4;
+// loopback only as the last resort.
+function inviteHost() {
+  const rank = (a) => {
+    const [o1, o2] = a.split('.').map(Number);
+    if (o1 === 100 && o2 >= 64 && o2 <= 127) return 0; // CGNAT / tailscale
+    if (o1 === 10 || (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168)) return 1;
+    return 2;
+  };
+  let best = '127.0.0.1';
+  let bestRank = 3;
+  for (const ifs of Object.values(os.networkInterfaces())) {
+    // some platforms return undefined entries (H): never crash the /events handler
+    for (const it of ifs || []) {
+      if (it.family !== 'IPv4' || it.internal) continue;
+      const r = rank(it.address);
+      if (r < bestRank) [best, bestRank] = [it.address, r];
+    }
+  }
+  return best;
+}
 
 // R9: recent chat replayed once to each NEW connection id — a joiner sees
 // what they missed; an SSE blip reconnect (same id) does not re-receive it.
@@ -182,6 +207,14 @@ function handleCmd(cmd) {
     cmd.nick = clean(cmd.nick || '', 32);
     cmd.text = clean(cmd.text || '', 500); // mirrors client ChatMaxLen
   }
+  // S-B: play/pause/seek relays name the actor (client renders
+  // "> pause by <nick>"). cmd.from is client-supplied so attribution is
+  // spoofable — tailnet-trusted; but the nick itself comes ONLY from the
+  // roster (join-time cleaned): a never-connected poster has no entry, so
+  // the relay carries no nick instead of a client-supplied fake (B3).
+  if (cmd.type === 'play' || cmd.type === 'pause' || cmd.type === 'seek') {
+    cmd.nick = nickById.get(cmd.from); // undefined => field drops off the wire
+  }
   switch (cmd.type) {
     case 'chat':
       chatLog.push({ type: 'chat', nick: cmd.nick, text: cmd.text, from: cmd.from });
@@ -220,6 +253,9 @@ function handleCmd(cmd) {
       state.dur = null; // so is its duration
       state.queue = state.queue.filter((n) => n !== cmd.name);
       broadcast(cmd, cmd.from);
+      // B2: same rebroadcast as advanceQueue — clients must see the playing
+      // file leave the queue or their QUEUE box / skip guard go stale
+      broadcast({ type: 'queue', queue: state.queue });
       saveState();
       break;
     case 'enqueue':
@@ -341,7 +377,11 @@ const server = http.createServer((req, res) => {
     nickById.set(id, nick);
     // roster rides hello: late joiners must see everyone already in the
     // room, not only the joins that happen after them
-    const hello = { type: 'hello', now: state.now, queue: state.queue, roster: [...new Set(nickById.values())] };
+    const hello = {
+      type: 'hello', now: state.now, queue: state.queue,
+      roster: [...new Set(nickById.values())],
+      invite: `http://${inviteHost()}:${PORT}`,
+    };
     if (state.now && state.pos != null) {
       // age-adjusted: where the master is right now, not at heartbeat time
       hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
