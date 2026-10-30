@@ -71,6 +71,9 @@ export class Proxy {
     client.on('close', () => { up.destroy(); }); up.on('close', () => { client.destroy(); });
   }
   deliver(entry, data) {
+    // C-prep silence mode (see silenceEvents): black-hole server->client SSE
+    // data instead of writing it
+    if (this.eventsSilent && entry.kind === 'events') return;
     if (entry.kind !== 'video' || this.cap <= 0) { entry.client.write(data); return; }
     entry.queue.push(data); entry.queued += data.length;
     if (!this.videoConns.includes(entry)) this.videoConns.push(entry);
@@ -82,6 +85,14 @@ export class Proxy {
     this.events = [];
     return n;
   }
+  // C-prep "silence mode" knob: black-hole server->client data on /events
+  // connections WITHOUT destroying the sockets — unlike killEvents()' RST
+  // blip, the TCP links stay healthy, so the client's reconnect/backoff
+  // logic never fires and a master can be held silent (no heartbeats, no
+  // pings) for N seconds while the room stays connected. Harness for the
+  // Batch-C stall-family silent-master tests; dropped events are lost, not
+  // delayed.
+  silenceEvents(on) { this.eventsSilent = !!on; }
   listen() { return new Promise((res) => this.server.listen(this.port, '127.0.0.1', res)); }
   close() { try { this.server.close(); } catch {} }
 }
