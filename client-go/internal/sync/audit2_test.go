@@ -19,8 +19,8 @@ func TestLoadDuringPlaybackDoesNotEndTheRoom(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(10)})                 // playing: the old file is active
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"}) // the user starts another file
 	e.OnMpvp(mpv.State{Idle: true})                   // the poll lands in the load window
-	if n := countType(t, po.events, "ended"); n != 0 {
-		t.Fatalf("load posted %d ended events: %v", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "ended"); n != 0 {
+		t.Fatalf("load posted %d ended events: %v", n, evType(t, po.all(t)))
 	}
 
 	// our own /play takes the same path
@@ -28,8 +28,8 @@ func TestLoadDuringPlaybackDoesNotEndTheRoom(t *testing.T) {
 	e2.OnMpvp(mpv.State{Pos: ptr(10)})
 	e2.OwnLoad("c.mkv")
 	e2.OnMpvp(mpv.State{Idle: true})
-	if n := countType(t, po2.events, "ended"); n != 0 {
-		t.Fatalf("own load posted %d ended events: %v", n, evType(t, po2.events))
+	if n := countType(t, po2.all(t), "ended"); n != 0 {
+		t.Fatalf("own load posted %d ended events: %v", n, evType(t, po2.all(t)))
 	}
 }
 
@@ -40,7 +40,7 @@ func TestEndedAfterLoadStillFires(t *testing.T) {
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"})
 	e.OnMpvp(mpv.State{Pos: ptr(0.5)}) // the new file is live
 	e.OnMpvp(mpv.State{Idle: true})    // its EOF
-	if n := countType(t, po.events, "ended"); n != 1 {
-		t.Fatalf("ended posted %d times after a load, want 1: %v", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "ended"); n != 1 {
+		t.Fatalf("ended posted %d times after a load, want 1: %v", n, evType(t, po.all(t)))
 	}
 }

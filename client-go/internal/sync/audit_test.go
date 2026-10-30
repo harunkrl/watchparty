@@ -26,8 +26,8 @@ func TestMasterDoesNotRepostAppliedSeek(t *testing.T) {
 	}
 	pl.pos = ptr(60)                  // our player is now at the target
 	e.OnMpvp(mpv.State{Pos: ptr(60)}) // the poll must not call this a local scrub
-	if n := countType(t, po.events, "seek"); n != 0 {
-		t.Fatalf("applied seek re-posted %d times: %v", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "seek"); n != 0 {
+		t.Fatalf("applied seek re-posted %d times: %v", n, evType(t, po.all(t)))
 	}
 }
 
@@ -40,8 +40,8 @@ func TestMasterDoesNotPostPhantomSeekAfterLoad(t *testing.T) {
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"}) // the room moves on
 	pl.pos = ptr(0.2)
 	e.OnMpvp(mpv.State{Pos: ptr(0.2)}) // the new file starts at the head
-	if n := countType(t, po.events, "seek"); n != 0 {
-		t.Fatalf("phantom seek after load: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "seek"); n != 0 {
+		t.Fatalf("phantom seek after load: %v", evType(t, po.all(t)))
 	}
 
 	// our own /play (OwnLoad) takes the same path
@@ -50,8 +50,8 @@ func TestMasterDoesNotPostPhantomSeekAfterLoad(t *testing.T) {
 	e2.OwnLoad("c.mkv")
 	pl2.pos = ptr(0.2)
 	e2.OnMpvp(mpv.State{Pos: ptr(0.2)})
-	if n := countType(t, po2.events, "seek"); n != 0 {
-		t.Fatalf("phantom seek after own load: %v", evType(t, po2.events))
+	if n := countType(t, po2.all(t), "seek"); n != 0 {
+		t.Fatalf("phantom seek after own load: %v", evType(t, po2.all(t)))
 	}
 }
 
@@ -67,8 +67,8 @@ func TestFollowerDoesNotDoublePostOwnPause(t *testing.T) {
 	e.PauseToggle()                                                      // user pauses: post + mirror
 	e.OnRoom(masterAt(10, false))                                        // in-flight heartbeat: the mirror is lost
 	e.OnMpvEvent("pause")                                                // the late echo of our own apply
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("pause posted %d times, want 1: %v", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("pause posted %d times, want 1: %v", n, evType(t, po.all(t)))
 	}
 }
 
@@ -82,8 +82,8 @@ func TestFollowerToggleUsesPendingPost(t *testing.T) {
 	e.PauseToggle()               // user pauses: posts "pause"
 	e.OnRoom(masterAt(10, false)) // in-flight heartbeat: the mirror is lost
 	e.PauseToggle()               // user presses space again: must resume
-	if n := countType(t, po.events, "play"); n != 1 {
-		t.Fatalf("play posted %d times, want 1: %v", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "play"); n != 1 {
+		t.Fatalf("play posted %d times, want 1: %v", n, evType(t, po.all(t)))
 	}
 }
 
@@ -98,7 +98,7 @@ func TestReconnectResetsStallCounter(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})     // 5s behind: one behind-tick
 	e.OnRoom(room.Event{Type: "hello", Now: "vid.mp4"}) // reconnect: same file -> no reload
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})     // still behind: the window must have restarted
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("stall paused the room after a reconnect: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("stall paused the room after a reconnect: %v", evType(t, po.all(t)))
 	}
 }

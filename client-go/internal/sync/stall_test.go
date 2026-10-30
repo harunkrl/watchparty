@@ -36,23 +36,23 @@ func TestStallNoSeekStorm(t *testing.T) {
 
 	liveTick(e, t0, 12, 12, false)                    // on live
 	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // behind 1: probe seek, no pause
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("paused before stallTicks: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("paused before stallTicks: %v", evType(t, po.all(t)))
 	}
 	if len(pl.seeks) != 1 {
 		t.Fatalf("probe seek: got %v, want exactly 1", pl.seeks)
 	}
 
 	liveTick(e, t0.Add(8*time.Second), 20, 12, false) // behind 2: stall -> one pause, no seek
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("pause posted %d times, want 1 (events: %v)", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("pause posted %d times, want 1 (events: %v)", n, evType(t, po.all(t)))
 	}
 
 	// further frozen ticks: no repeat pause, no more seeks
 	liveTick(e, t0.Add(12*time.Second), 24, 12, false)
 	liveTick(e, t0.Add(16*time.Second), 28, 12, false)
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("auto-pause repeated: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("auto-pause repeated: %v", evType(t, po.all(t)))
 	}
 	if len(pl.seeks) != 1 {
 		t.Fatalf("seek-storm during stall: %v", pl.seeks)
@@ -82,8 +82,8 @@ func TestResumeDoesNotJump(t *testing.T) {
 	if len(pl.seeks) != 0 {
 		t.Fatalf("resume raced into a seek (jump): %v", pl.seeks)
 	}
-	if len(po.events) != 0 {
-		t.Fatalf("unexpected posts on resume: %v", evType(t, po.events))
+	if len(po.all(t)) != 0 {
+		t.Fatalf("unexpected posts on resume: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -96,12 +96,12 @@ func TestBufferingCountsTowardStall(t *testing.T) {
 
 	liveTick(e, t0, 12, 12, false)                   // on live
 	liveTick(e, t0.Add(4*time.Second), 16, 12, true) // behind 1
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("paused on the first buffering tick: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("paused on the first buffering tick: %v", evType(t, po.all(t)))
 	}
 	liveTick(e, t0.Add(8*time.Second), 20, 12, true) // behind 2 -> stall
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("buffering did not stall after the runway: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("buffering did not stall after the runway: %v", evType(t, po.all(t)))
 	}
 	if len(pl.seeks) != 0 {
 		t.Fatalf("seek while buffering: %v", pl.seeks)
@@ -116,14 +116,14 @@ func TestShortStallNoPause(t *testing.T) {
 
 	liveTick(e, t0, 12, 12, false)                    // baseline
 	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // hiccup: behind 1 -> probe seek
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("pause on a short hiccup: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("pause on a short hiccup: %v", evType(t, po.all(t)))
 	}
 
 	// recovers to within the smooth band -> speed nudge, behind reset
 	liveTick(e, t0.Add(8*time.Second), 16, 15.5, false)
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("pause after short stall: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("pause after short stall: %v", evType(t, po.all(t)))
 	}
 	if len(pl.speeds) == 0 {
 		t.Fatalf("normal drift handling did not resume: speeds=%v seeks=%v", pl.speeds, pl.seeks)
@@ -189,8 +189,8 @@ func TestStallPauseResetsOnPlay(t *testing.T) {
 	liveTick(e, t0, 12, 12, false)                    // baseline
 	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // behind 1 -> probe seek
 	liveTick(e, t0.Add(8*time.Second), 20, 12, false) // behind 2 -> pause #1
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("first stall pause missing: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("first stall pause missing: %v", evType(t, po.all(t)))
 	}
 
 	e.OnRoom(room.Event{Type: "play"}) // room resumed: stall-pause is spent
@@ -198,16 +198,16 @@ func TestStallPauseResetsOnPlay(t *testing.T) {
 	// resume straight into a dry cache: play reset the window, so the
 	// follower needs the full runway again (no instant re-pause)
 	liveTick(e, t0.Add(12*time.Second), 24, 24, false) // window reset
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("instant re-pause after play: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("instant re-pause after play: %v", evType(t, po.all(t)))
 	}
 	liveTick(e, t0.Add(16*time.Second), 28, 24, false) // behind 1 -> probe seek #2
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("re-pause before stallTicks: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("re-pause before stallTicks: %v", evType(t, po.all(t)))
 	}
 	liveTick(e, t0.Add(20*time.Second), 32, 24, false) // behind 2 -> pause #2
-	if n := countType(t, po.events, "pause"); n != 2 {
-		t.Fatalf("stall pause did not reset on play: %d pauses (events: %v)", n, evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 2 {
+		t.Fatalf("stall pause did not reset on play: %d pauses (events: %v)", n, evType(t, po.all(t)))
 	}
 	if len(pl.seeks) != 2 {
 		t.Fatalf("expected exactly the two probe seeks: %v", pl.seeks)
@@ -242,13 +242,13 @@ func TestLoadQuietSuppressesSeekPost(t *testing.T) {
 	e.OwnLoad("x.mkv")
 	pl.pos = ptr(1.4)
 	e.OnMpvEvent("seek") // load echo: suppressed
-	if len(po.events) != 0 {
-		t.Fatalf("post-load head seek reached the room: %v", evType(t, po.events))
+	if len(po.all(t)) != 0 {
+		t.Fatalf("post-load head seek reached the room: %v", evType(t, po.all(t)))
 	}
 	e.Clock = fakeClock{since: 6 * time.Second}
 	e.OnMpvEvent("seek") // genuine scrub past the window: posted
-	if n := countType(t, po.events, "seek"); n != 1 {
-		t.Fatalf("scrub after the window must post: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "seek"); n != 1 {
+		t.Fatalf("scrub after the window must post: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -264,15 +264,15 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 	e.OnRoom(room.Event{Type: "seek", T: 40}) // remote seek applied: echo pending
 	pl.pos = ptr(40)
 	e.OnMpvEvent("seek") // the echo itself: swallowed, never posted
-	if len(po.events) != 0 {
-		t.Fatalf("echo reached the room: %v", evType(t, po.events))
+	if len(po.all(t)) != 0 {
+		t.Fatalf("echo reached the room: %v", evType(t, po.all(t)))
 	}
 
 	pl.pos = ptr(20)                                  // user scrub
 	e.Clock = stepClock{now: t0.Add(4 * time.Second)} // soak timing: past actuateQuiet, inside the echo window
 	e.OnMpvEvent("seek")
-	if n := countType(t, po.events, "seek"); n != 1 {
-		t.Fatalf("user scrub eaten by the echo gate: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "seek"); n != 1 {
+		t.Fatalf("user scrub eaten by the echo gate: %v", evType(t, po.all(t)))
 	}
 
 	// expiry: a pending echo that never arrives must not eat a later scrub
@@ -280,8 +280,8 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)} // 6s past the fresh pending echo
 	pl.pos = ptr(25)
 	e.OnMpvEvent("seek")
-	if n := countType(t, po.events, "seek"); n != 2 {
-		t.Fatalf("expired pending echo ate a scrub: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "seek"); n != 2 {
+		t.Fatalf("expired pending echo ate a scrub: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -296,12 +296,12 @@ func TestStalePollNoPlayFlap(t *testing.T) {
 
 	// the in-flight poll arrives after the apply, still saying "playing"
 	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false})
-	if n := countType(t, po.events, "play"); n != 0 {
-		t.Fatalf("stale poll posted play: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "play"); n != 0 {
+		t.Fatalf("stale poll posted play: %v", evType(t, po.all(t)))
 	}
 	// the next poll agrees with the applied pause: heartbeats only, no play/pause flap
 	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: true})
-	if got := evType(t, po.events); len(got) != 2 || got[0] != "position" || got[1] != "position" {
+	if got := evType(t, po.all(t)); len(got) != 2 || got[0] != "position" || got[1] != "position" {
 		t.Fatalf("expected two heartbeats, got %v", got)
 	}
 
@@ -309,8 +309,8 @@ func TestStalePollNoPlayFlap(t *testing.T) {
 	// expires, a real user unpause (push event missed) still posts play
 	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 10 * time.Second}
 	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false})
-	if n := countType(t, po.events, "play"); n != 1 {
-		t.Fatalf("poll fallback for a real user unpause: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "play"); n != 1 {
+		t.Fatalf("poll fallback for a real user unpause: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -325,15 +325,15 @@ func TestPauseToggleAndSeekBy(t *testing.T) {
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("master PauseToggle did not pause locally: %v", pl.pauses)
 	}
-	if countType(t, po.events, "pause") != 1 {
-		t.Fatalf("master PauseToggle did not post: %v", evType(t, po.events))
+	if countType(t, po.all(t), "pause") != 1 {
+		t.Fatalf("master PauseToggle did not post: %v", evType(t, po.all(t)))
 	}
 	e.PauseToggle()
-	if countType(t, po.events, "play") != 1 {
-		t.Fatalf("resume post missing: %v", evType(t, po.events))
+	if countType(t, po.all(t), "play") != 1 {
+		t.Fatalf("resume post missing: %v", evType(t, po.all(t)))
 	}
 	e.SeekBy(-30) // below zero: clamp to 0
-	last := po.events[len(po.events)-1]
+	last := po.all(t)[len(po.all(t))-1]
 	if last.Type != "seek" || last.T != 0 {
 		t.Fatalf("seek clamp: %+v", last)
 	}
@@ -345,8 +345,8 @@ func TestPauseToggleAndSeekBy(t *testing.T) {
 	f, fpl, fpo := newEngine(false)
 	f.OnRoom(masterAt(20, false))
 	f.PauseToggle()
-	if countType(t, fpo.events, "pause") != 1 {
-		t.Fatalf("follower PauseToggle post missing: %v", evType(t, fpo.events))
+	if countType(t, fpo.all(t), "pause") != 1 {
+		t.Fatalf("follower PauseToggle post missing: %v", evType(t, fpo.all(t)))
 	}
 	if len(fpl.pauses) != 1 || !fpl.pauses[0] {
 		t.Fatalf("follower local pause missing: %v", fpl.pauses)

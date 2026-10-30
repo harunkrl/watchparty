@@ -378,3 +378,17 @@ func TestPipeCloseDoesNotReportDeadIPC(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+// A wedged mpv (a SIGSTOP'd player, say) must not block the pause: the
+// command is written without waiting for mpv's reply (a tell), so a dead
+// player cannot freeze the interface.
+func TestPipeSetPauseDoesNotWaitForTheReply(t *testing.T) {
+	p, _ := newFakePlayer(t, nil) // wedged: it never answers
+	start := time.Now()
+	if err := p.SetPause(true); err != nil {
+		t.Fatalf("the pause command failed: %v", err)
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("the pause waited %s for mpv's reply", el)
+	}
+}

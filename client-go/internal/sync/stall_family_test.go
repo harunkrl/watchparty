@@ -26,8 +26,8 @@ func TestSilentMasterDoesNotPauseTheRoom(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the follower paused the room for a silent master: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the follower paused the room for a silent master: %v", evType(t, po.all(t)))
 	}
 	if len(pl.seeks) != 0 {
 		t.Fatalf("the follower chased a stale snapshot: %v", pl.seeks)
@@ -48,8 +48,8 @@ func TestSilentMasterThenHeartbeatRecovers(t *testing.T) {
 	e.OnRoom(masterAt(21, false))
 	e.Clock = stepClock{now: t0.Add(12 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(21), Pause: false}) // expected 22: on live
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the room was paused during the outage: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the room was paused during the outage: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -68,8 +68,8 @@ func TestResumeDriftSeeksWithoutPausing(t *testing.T) {
 	if pl.seeks[0] < 100 || pl.seeks[0] > 103 {
 		t.Fatalf("re-seek to %v, want the live position (~102)", pl.seeks[0])
 	}
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the resume paused the room: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the resume paused the room: %v", evType(t, po.all(t)))
 	}
 	// the settle window: no seek storm, no pause
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false})
@@ -77,8 +77,8 @@ func TestResumeDriftSeeksWithoutPausing(t *testing.T) {
 	if len(pl.seeks) != 1 {
 		t.Fatalf("seek storm after the resume: %v", pl.seeks)
 	}
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the resume paused the room: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the resume paused the room: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -92,8 +92,8 @@ func TestRealStallStillPausesTheRoom(t *testing.T) {
 	e.Clock = stepClock{now: t0.Add(2 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false}) // 7s behind: not a resume jump
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false})
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("the honest stall did not pause the room: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("the honest stall did not pause the room: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -107,7 +107,7 @@ func TestStallPauseIsMechanical(t *testing.T) {
 	e.Clock = stepClock{now: t0.Add(2 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false})
-	for _, ev := range po.events {
+	for _, ev := range po.all(t) {
 		if ev.Type == "pause" && !ev.Mechanical {
 			t.Fatalf("the stall pause is not marked mechanical: %+v", ev)
 		}
@@ -171,8 +171,8 @@ func TestSilentMasterPausedRoomStillConverges(t *testing.T) {
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("the follower did not converge to the pause: %v", pl.pauses)
 	}
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the follower posted to the wire: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the follower posted to the wire: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -193,7 +193,7 @@ func TestResumeSettleDoesNotSurviveANewFile(t *testing.T) {
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)}
 	e.OnRoom(masterAt(14, false))
 	e.OnMpvp(mpv.State{Pos: ptr(2), Pause: false}) // still behind -> stall
-	if n := countType(t, po.events, "pause"); n != 1 {
-		t.Fatalf("the new file's stall was swallowed by the stale settle window: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 1 {
+		t.Fatalf("the new file's stall was swallowed by the stale settle window: %v", evType(t, po.all(t)))
 	}
 }

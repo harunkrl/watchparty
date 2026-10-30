@@ -127,6 +127,9 @@ type Engine struct {
 	Ui     chan<- UiState
 	Logf   func(format string, args ...any) // nil = discard
 
+	postOnce sync.Once  // the post worker starts with the first event
+	posts    *postQueue // the events waiting for the network (ISSUE-6)
+
 	lastPos   *float64
 	lastPause bool
 	wasActive bool
@@ -180,18 +183,151 @@ func (e *Engine) logf(format string, args ...any) {
 	}
 }
 
-// post1 posts one event and reports the outcome: a failed post must be
-// visible to the caller (the stall pause rides the same starving link
-// that caused the stall — W3).
+// post1 hands the event to the post worker: the CALLER must never wait
+// for the network. The UI thread called the engine synchronously, and a
+// dead server froze the whole interface for the 5s POST timeout
+// (ISSUE-6, F4). The worker keeps the order (one queue, one worker) and
+// the room's state never waits for us.
 func (e *Engine) post1(ev room.Event) error {
 	if e.Post == nil {
 		return nil
 	}
-	err := e.Post(ev)
-	if err != nil {
-		e.logf("post: %s", err)
+	e.postOnce.Do(func() {
+		e.posts = newPostQueue()
+		go e.postLoop()
+	})
+	e.posts.push(ev)
+	return nil
+}
+
+// postLoop is the post worker: it owns the network for the engine.
+func (e *Engine) postLoop() {
+	for {
+		ev, ok := e.posts.pop()
+		if !ok {
+			return
+		}
+		if err := e.Post(ev); err != nil {
+			e.logf("post: %s", err)
+			e.onPostFailed(ev)
+		}
+		e.posts.done()
 	}
-	return err
+}
+
+// onPostFailed reacts to an event that did not land. The stall pause
+// rides the same starving link that caused the stall — so a failure is
+// the EXPECTED one there: re-arm, or the follower never seeks again and
+// never pauses the room: it would stay behind forever while the room
+// plays on (W3).
+func (e *Engine) onPostFailed(ev room.Event) {
+	if ev.Type != "pause" || !ev.Mechanical {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.autoPaused {
+		return // already re-armed or superseded: the state is not ours
+	}
+	if e.snap != nil && !e.snap.paused {
+		return // the room moved on: do not clear a newer state
+	}
+	e.autoPaused = false
+	if e.snap != nil {
+		e.snap.paused = false
+	}
+	e.mechPause = false
+}
+
+// postQueue is an unbounded FIFO of events waiting for the network. It
+// never blocks its producer: the room's events must not be dropped (a
+// lost pause is a lost room state), and the queue only grows while the
+// server is unreachable.
+type postQueue struct {
+	mu    sync.Mutex
+	items []room.Event
+	busy  bool // a post is in flight
+	sig   chan struct{}
+}
+
+func newPostQueue() *postQueue {
+	return &postQueue{sig: make(chan struct{}, 1)}
+}
+
+// push appends an event and wakes the worker.
+func (q *postQueue) push(ev room.Event) {
+	q.mu.Lock()
+	q.items = append(q.items, ev)
+	q.mu.Unlock()
+	select {
+	case q.sig <- struct{}{}:
+	default:
+	}
+}
+
+// pop takes the next event, waiting for one to arrive.
+func (q *postQueue) pop() (room.Event, bool) {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			ev := q.items[0]
+			q.items = q.items[1:]
+			q.busy = true
+			q.mu.Unlock()
+			return ev, true
+		}
+		q.mu.Unlock()
+		<-q.sig
+	}
+}
+
+// done marks the in-flight post as finished.
+func (q *postQueue) done() {
+	q.mu.Lock()
+	q.busy = false
+	q.mu.Unlock()
+}
+
+// idle reports that nothing is queued and nothing is in flight.
+func (q *postQueue) idle() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items) == 0 && !q.busy
+}
+
+// pending counts the events that are queued or in flight.
+func (q *postQueue) pending() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := len(q.items)
+	if q.busy {
+		n++
+	}
+	return n
+}
+
+// Drain waits until the queued events are on the wire, bounded by the
+// timeout: a hung network must not lock the exit. It reports whether the
+// queue drained; a lost event is logged — the human must know that the
+// last action did not reach the room (the master ruling: DRAIN).
+func (e *Engine) Drain(timeout time.Duration) bool {
+	// the Once gives the happens-before: the queue is created (and the
+	// worker started) exactly once, whoever gets here first
+	e.postOnce.Do(func() {
+		e.posts = newPostQueue()
+		go e.postLoop()
+	})
+	deadline := time.Now().Add(timeout)
+	for {
+		if e.posts.idle() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			e.logf("post: %d event(s) lost — the room did not answer", e.posts.pending())
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // setPause/seekTo mark lastActuate so the mpv events they trigger are
@@ -839,18 +975,11 @@ func (e *Engine) stallBlock(s mpv.State) {
 		e.lastPost = e.Clock.Now()
 		// the marker travels on the wire: the other side must not blame a
 		// human for a pause the room asked for by itself (m2-S2)
-		if err := e.postDiscrete(room.Event{Type: "pause", Mechanical: true}); err != nil {
-			// W3: the pause did not land. The post rides the same starving
-			// link that caused the stall — so this is the EXPECTED failure
-			// there. Re-arm: without it the follower never seeks again and
-			// never pauses the room: it would stay behind forever while
-			// the room plays on. The room is not paused, so the chip must
-			// not claim a mechanical pause either.
-			e.autoPaused = false
-			e.snap.paused = false
-			e.mechPause = false
-			return
-		}
+		// W3: the post rides the same starving link that caused the stall
+		// — so a failure is the EXPECTED one there. The re-arm happens in
+		// onPostFailed (the post is asynchronous: the caller must not wait
+		// for the network, ISSUE-6).
+		e.postDiscrete(room.Event{Type: "pause", Mechanical: true})
 		e.mechPause = true // mechanical: nobody pressed anything (m2-S2)
 		_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
 	}

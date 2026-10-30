@@ -116,7 +116,7 @@ func TestAudit3SeekTargetIsNeverNegative(t *testing.T) {
 	e, pl, po := newEngine(false)
 	pl.pos = ptr(0)
 	e.SeekBy(-5) // ctrl+left at the very head
-	for _, ev := range po.events {
+	for _, ev := range po.all(t) {
 		if ev.T < 0 {
 			t.Fatalf("a negative seek target was posted: %+v", ev)
 		}
@@ -137,10 +137,10 @@ func TestAudit3SeekTargetIsNeverNegative(t *testing.T) {
 func TestAudit3StaleSampleDoesNotPoisonTheHeartbeat(t *testing.T) {
 	e, _, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10), Dur: 120}) // file A: the heartbeat carries A's duration
-	before := len(po.events)
+	before := len(po.all(t))
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"})                  // the room advances to file B
 	e.OnMpvp(mpv.State{Pos: ptr(10), Dur: 120, At: time.Unix(999, 0)}) // the poll's stale sample of file A
-	for _, ev := range po.events[before:] {
+	for _, ev := range po.all(t)[before:] {
 		if ev.Type == "position" && ev.Dur != 0 {
 			t.Fatalf("a heartbeat after the load carries the previous file's duration: %+v", ev)
 		}

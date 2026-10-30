@@ -20,10 +20,10 @@ func TestMasterHeartbeatCarriesTheFile(t *testing.T) {
 	e, _, po := newEngine(true)
 	e.loaded = "movie.mkv"
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
-	if len(po.events) != 1 {
-		t.Fatalf("events = %v, want one heartbeat", evType(t, po.events))
+	if len(po.all(t)) != 1 {
+		t.Fatalf("events = %v, want one heartbeat", evType(t, po.all(t)))
 	}
-	ev := po.events[0]
+	ev := po.all(t)[0]
 	if ev.Type != "position" || ev.File != "movie.mkv" {
 		t.Fatalf("the heartbeat did not carry the file: %+v", ev)
 	}
@@ -37,13 +37,13 @@ func TestParkedHeartbeatCarriesTheFile(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // the last position
 	e.OnMpvp(mpv.State{Idle: true})                 // the film ended
 	var parked *room.Event
-	for i := range po.events {
-		if po.events[i].Type == "position" {
-			parked = &po.events[i]
+	for i := range po.all(t) {
+		if po.all(t)[i].Type == "position" {
+			parked = &po.all(t)[i]
 		}
 	}
 	if parked == nil {
-		t.Fatalf("the parked master did not heartbeat: %v", evType(t, po.events))
+		t.Fatalf("the parked master did not heartbeat: %v", evType(t, po.all(t)))
 	}
 	if parked.File != "movie.mkv" {
 		t.Fatalf("the parked heartbeat did not carry the file: %+v", *parked)
@@ -55,7 +55,7 @@ func TestFollowerPostsNoPosition(t *testing.T) {
 	e, _, po := newEngine(false)
 	e.loaded = "movie.mkv"
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
-	for _, ev := range po.events {
+	for _, ev := range po.all(t) {
 		if ev.Type == "position" {
 			t.Fatalf("a follower posted a position: %+v", ev)
 		}

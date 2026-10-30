@@ -45,6 +45,11 @@ func backoff(attempt int) int {
 // maxBackoff is the plan's cap: the reconnect delay never grows past it.
 const maxBackoff = 30 * time.Second
 
+// drainBudget bounds the quit-time flush of the queued posts: the last
+// pause/seek must reach the room, but a hung network must not keep the
+// program alive (the master ruling: DRAIN).
+const drainBudget = 2 * time.Second
+
 // backoffDelay is the frozen curve plus a ±20% jitter (G2): when the
 // server goes down, every client must not come back in the same second —
 // a thundering herd re-runs the same request against the same server.
@@ -137,6 +142,16 @@ func main() {
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigc)
 	gate := &exitGate{}
+	// The engine exists before the signal goroutine: every exit path must
+	// be able to flush the queued posts (the master ruling: DRAIN).
+	engine := &sync.Engine{
+		Master: *master,
+		ID:     id,
+		Player: player,
+		Post:   func(ev room.Event) error { return api.Post(ev) },
+		Clock:  sync.RealClock{},
+		Ui:     chUi,
+	}
 	go func() { // SIGTERM while headless blocks in the stdin scanner:
 		// without this the client dies and leaves its mpv orphaned (153 of
 		// them piled up on the test box in one day)
@@ -147,18 +162,11 @@ func main() {
 			// next signal wins.
 			<-sigc
 		}
+		_ = engine.Drain(drainBudget) // the last action must reach the room
 		player.Close()
 		os.Exit(1)
 	}()
 
-	engine := &sync.Engine{
-		Master: *master,
-		ID:     id,
-		Player: player,
-		Post:   func(ev room.Event) error { return api.Post(ev) },
-		Clock:  sync.RealClock{},
-		Ui:     chUi,
-	}
 	var mpvExited atomic.Bool
 	var p *tea.Program
 	if *headless {
@@ -232,6 +240,7 @@ func main() {
 	if *headless {
 		err := ui.Run(*name, api, player, engine, chRoom, os.Stdin, os.Stdout)
 		gate.beginClean()
+		_ = engine.Drain(drainBudget) // the last action must reach the room
 		cancel()
 		player.Close()
 		if err != nil {
@@ -273,6 +282,7 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		gate.beginClean() // this path owns the exit from here
+		_ = engine.Drain(drainBudget)
 		cancel()
 		player.Close()
 		if friendFlow {
@@ -280,9 +290,10 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	gate.beginClean() // from here on the clean path owns the exit
-	cancel()          // risk H: cancel ctx first, ...
-	player.Close()    // ...then reap mpv (TERM -> 2s -> Kill, risk C)
+	gate.beginClean()             // from here on the clean path owns the exit
+	_ = engine.Drain(drainBudget) // the last action must reach the room
+	cancel()                      // risk H: cancel ctx first, ...
+	player.Close()                // ...then reap mpv (TERM -> 2s -> Kill, risk C)
 	if note := mpvExitNotice(friendFlow, mpvExited.Load()); note != "" {
 		// the console closes with the process: the reason must be read
 		fmt.Fprintln(os.Stderr, note)

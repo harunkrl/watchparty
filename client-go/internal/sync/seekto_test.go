@@ -11,8 +11,8 @@ func TestSeekToSeeksLocalAndPosts(t *testing.T) {
 	if len(pl.seeks) != 1 || pl.seeks[0] != 42 {
 		t.Fatalf("local seek = %v, want [42]", pl.seeks)
 	}
-	if len(po.events) != 1 || po.events[0].Type != "seek" || po.events[0].T != 42 {
-		t.Fatalf("posted = %v, want one seek at 42s", po.events)
+	if len(po.all(t)) != 1 || po.all(t)[0].Type != "seek" || po.all(t)[0].T != 42 {
+		t.Fatalf("posted = %v, want one seek at 42s", po.all(t))
 	}
 }
 
@@ -23,7 +23,7 @@ func TestSeekToClampsNegative(t *testing.T) {
 	if len(pl.seeks) != 1 || pl.seeks[0] != 0 {
 		t.Fatalf("local seek = %v, want [0]", pl.seeks)
 	}
-	if len(po.events) != 1 || po.events[0].T != 0 {
-		t.Fatalf("posted = %v, want a seek at 0s", po.events)
+	if len(po.all(t)) != 1 || po.all(t)[0].T != 0 {
+		t.Fatalf("posted = %v, want a seek at 0s", po.all(t))
 	}
 }

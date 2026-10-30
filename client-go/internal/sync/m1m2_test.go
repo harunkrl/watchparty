@@ -6,6 +6,7 @@ package sync
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestIdleMasterKeepsHeartbeating(t *testing.T) {
 	}
 	// the parked master must keep posting the room's clock
 	pos := 0
-	for i, ev := range po.events {
+	for i, ev := range po.all(t) {
 		if ev.Type != "position" {
 			continue
 		}
@@ -46,7 +47,7 @@ func TestIdleMasterKeepsHeartbeating(t *testing.T) {
 		}
 	}
 	if pos < 4 {
-		t.Fatalf("the parked master posted %d heartbeats, want the idle ones too: %v", pos, evType(t, po.events))
+		t.Fatalf("the parked master posted %d heartbeats, want the idle ones too: %v", pos, evType(t, po.all(t)))
 	}
 }
 
@@ -107,14 +108,14 @@ func TestReconnectStormDoesNotExtendTheDeadline(t *testing.T) {
 		t.Fatalf("the hellos moved the resume deadline: %v > %v", e.resumeTil, deadline)
 	}
 	// the backstop must still fire the stall
-	for i := 0; i < 20 && countType(t, po.events, "pause") == 0; i++ {
+	for i := 0; i < 20 && countType(t, po.all(t), "pause") == 0; i++ {
 		clock = clock.Add(5 * time.Second)
 		e.Clock = stepClock{now: clock}
 		e.OnRoom(masterAt(100+clock.Sub(t0).Seconds(), false))
 		e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false})
 	}
-	if n := countType(t, po.events, "pause"); n == 0 {
-		t.Fatalf("the reconnect storm held the room hostage: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n == 0 {
+		t.Fatalf("the reconnect storm held the room hostage: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -129,8 +130,8 @@ func TestFollowerPostsEndedWhenTheMasterIsDead(t *testing.T) {
 	// our file is over (mpv idle) and the master's heartbeat is stale
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)}
 	e.OnMpvp(mpv.State{Idle: true})
-	if n := countType(t, po.events, "ended"); n != 1 {
-		t.Fatalf("the dead room was not advanced: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "ended"); n != 1 {
+		t.Fatalf("the dead room was not advanced: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -143,8 +144,8 @@ func TestNothingPlayingFollowerDoesNotPostEnded(t *testing.T) {
 	e.OnRoom(masterAt(100, false))
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)}
 	e.OnMpvp(mpv.State{Idle: true})
-	if n := countType(t, po.events, "ended"); n != 0 {
-		t.Fatalf("a follower with no file posted 'ended': %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "ended"); n != 0 {
+		t.Fatalf("a follower with no file posted 'ended': %v", evType(t, po.all(t)))
 	}
 }
 
@@ -161,8 +162,8 @@ func TestFollowerDoesNotEndALiveRoom(t *testing.T) {
 		e.OnRoom(masterAt(100, true)) // the parked master still heartbeats
 		e.OnMpvp(mpv.State{Idle: true})
 	}
-	if n := countType(t, po.events, "ended"); n != 0 {
-		t.Fatalf("a live room must not be ended: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "ended"); n != 0 {
+		t.Fatalf("a live room must not be ended: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -188,8 +189,8 @@ func TestHelloMidResumeDoesNotPauseTheRoom(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false, Buffering: true})
 	e.Clock = stepClock{now: t0.Add(8 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false, Buffering: true})
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the reconnect paused the room: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the reconnect paused the room: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -209,8 +210,8 @@ func TestResumeStaysOpenWhileTheCacheFills(t *testing.T) {
 		e.OnRoom(masterAt(100+float64(2+i*4), false)) // the master plays on
 		e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false, Buffering: true})
 	}
-	if n := countType(t, po.events, "pause"); n != 0 {
-		t.Fatalf("the filling cache was treated as starvation: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n != 0 {
+		t.Fatalf("the filling cache was treated as starvation: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -233,8 +234,8 @@ func TestResumeThatNeverConvergesStillStalls(t *testing.T) {
 		e.OnRoom(masterAt(100+clock.Sub(t0).Seconds(), false))
 		e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false})
 	}
-	if n := countType(t, po.events, "pause"); n == 0 {
-		t.Fatalf("a resume that never converged never stalled: %v", evType(t, po.events))
+	if n := countType(t, po.all(t), "pause"); n == 0 {
+		t.Fatalf("a resume that never converged never stalled: %v", evType(t, po.all(t)))
 	}
 }
 
@@ -244,11 +245,14 @@ func TestResumeThatNeverConvergesStillStalls(t *testing.T) {
 // would stay behind forever while the room plays on.
 func TestFailedStallPostIsRearmed(t *testing.T) {
 	pl := &fakePlayer{}
+	var mu sync.Mutex
 	var posted []room.Event
 	fail := true
 	e := &Engine{
 		Master: false, Player: pl, Clock: stepClock{now: time.Unix(5000, 0)},
 		Post: func(ev room.Event) error {
+			mu.Lock()
+			defer mu.Unlock()
 			posted = append(posted, ev)
 			if fail {
 				fail = false
@@ -257,24 +261,68 @@ func TestFailedStallPostIsRearmed(t *testing.T) {
 			return nil
 		},
 	}
+	stallPosts := func() []room.Event {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]room.Event(nil), posted...)
+	}
 	t0 := time.Unix(5000, 0)
 	e.OnRoom(masterAt(100, false))
 	e.Clock = stepClock{now: t0.Add(2 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false}) // 7s behind
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false}) // stall -> the post fails
-	if e.autoPaused {
-		t.Fatal("a failed post must not leave the stall disarmed")
-	}
+	// the post is asynchronous (the caller must not wait for the
+	// network — ISSUE-6): the failure is reported by the post worker
+	waitStallDisarmed(t, e)
 	e.Clock = stepClock{now: t0.Add(4 * time.Second)}
 	e.OnRoom(masterAt(102, false))
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false}) // the stall is detected again
 	e.Clock = stepClock{now: t0.Add(6 * time.Second)}
 	e.OnRoom(masterAt(104, false))
 	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false}) // and the pause lands
-	if n := countType(t, posted, "pause"); n != 2 {
-		t.Fatalf("the stall pause was not retried: %v", posted)
-	}
-	if !e.autoPaused {
+	waitStallPosts(t, stallPosts, 2)
+	e.Clock = stepClock{now: t0.Add(8 * time.Second)}
+	e.OnRoom(masterAt(106, false))
+	e.OnMpvp(mpv.State{Pos: ptr(95), Pause: false})
+	e.mu.Lock()
+	armed := e.autoPaused
+	e.mu.Unlock()
+	if !armed {
 		t.Fatal("the retry did not arm the stall again")
+	}
+}
+
+// waitStallDisarmed waits until the engine re-armed the stall: the post
+// worker reports the failed post (the post itself is asynchronous).
+func waitStallDisarmed(t *testing.T, e *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		e.mu.Lock()
+		armed := e.autoPaused
+		e.mu.Unlock()
+		if !armed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a failed post must not leave the stall disarmed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitStallPosts waits until the engine posted n events.
+func waitStallPosts(t *testing.T, posts func() []room.Event, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := posts()
+		if countType(t, got, "pause") >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stall pause was not retried: %v", got)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
