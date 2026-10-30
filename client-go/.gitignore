@@ -1,3 +1,5 @@
 /watchparty
 /watchparty.exe
 /client-go
+# the friend flow writes the remembered server next to the executable
+/last-server.txt

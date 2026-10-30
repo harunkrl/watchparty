@@ -41,6 +41,7 @@ func backoff(attempt int) int {
 }
 
 func main() {
+	setConsoleUTF8() // the console must speak UTF-8 (Windows): box drawing, Turkish nicks
 	name := flag.String("name", defaultNick(), "nickname shown to the room")
 	master := flag.Bool("master", false, "run on the host side; this player is the clock authority")
 	headless := flag.Bool("headless", false, "stdin/stdout mode (test harness)")
@@ -66,10 +67,13 @@ func main() {
 		if nick := askLine(fmt.Sprintf("your name [%s]: ", def)); nick != "" {
 			*name = nick
 		}
-		saveLastServer(base, *name)
+		// the address is remembered only after it worked (see the hello)
 	} else {
 		if len(args) != 1 { // url-first ordering would silently drop later flags
 			fmt.Fprintln(os.Stderr, usage)
+			if usageExitHold(len(args)) {
+				waitForEnter() // the console closes with the process: let the user read it
+			}
 			os.Exit(2)
 		}
 		base = args[0]
@@ -125,7 +129,7 @@ func main() {
 			tea.WithMouseCellMotion()) // wheel scrolls chat; clicks on the bar seek
 	}
 	// the player's diagnostics go the same way: stderr would corrupt the frame
-	player.Logf = engine.Logf
+	player.SetLogf(engine.Logf)
 
 	go player.Poll(ctx, sync.PollSecs*time.Second, chMpv)
 	go func() { // pushed mpv events -> instant discrete posts (master only)
@@ -204,9 +208,17 @@ func main() {
 		}
 	}()
 	go func() { // dispatcher: one chRoom consumer fans out to ui + engine
+		saved := false
 		for ev := range chRoom {
 			p.Send(ev) // ui first: stays live while OnRoom blocks on loadfile (tea.Program.Send is goroutine-safe)
 			engine.OnRoom(ev)
+			if ev.Type == "hello" && !saved {
+				// the server answered: the address works, remember it
+				saved = true
+				if err := saveLastServer(base, *name); err != nil {
+					p.Send(ui.EngineLogMsg{Line: "> could not remember the server: " + err.Error()})
+				}
+			}
 		}
 		p.Send(ui.StreamClosedMsg{})
 	}()
@@ -222,10 +234,30 @@ func main() {
 	}
 	stop()         // risk H: cancel ctx first, ...
 	player.Close() // ...then reap mpv (TERM -> 2s -> Kill, risk C)
+	if note := mpvExitNotice(friendFlow, mpvExited.Load()); note != "" {
+		// the console closes with the process: the reason must be read
+		fmt.Fprintln(os.Stderr, note)
+		waitForEnter()
+	}
 	if mpvExited.Load() {
 		os.Exit(1) // python parity: mpv-exited clients exit nonzero
 	}
 }
+
+// mpvExitNotice is the reason the client is closing, in the friend flow.
+// The console window closes with the process: a message that is not
+// printed is lost, and "mpv exited" is the one the friend must read.
+func mpvExitNotice(friendFlow, mpvExited bool) string {
+	if !friendFlow || !mpvExited {
+		return ""
+	}
+	return "mpv exited or stopped talking - restart the client"
+}
+
+// usageExitHold: a double-clicked console closes with the process, so
+// the usage hint waits for a keypress there; a terminal user reads it
+// as it scrolls by.
+func usageExitHold(argc int) bool { return argc == 0 }
 
 func defaultNick() string {
 	if n := os.Getenv("USER"); n != "" {
@@ -296,12 +328,21 @@ func normalizeServerURL(s string) string {
 	if s == "" {
 		return ""
 	}
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-		return strings.TrimRight(s, "/")
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme := strings.ToLower(s[:i])
+		if i == 0 || (scheme != "http" && scheme != "https") {
+			return "" // not an address we can talk to
+		}
+		rest := strings.TrimRight(s[i+3:], "/")
+		if rest == "" {
+			return "" // "http://" alone is not an address
+		}
+		return scheme + "://" + rest
 	}
 	if strings.ContainsAny(s, " \t") {
 		return "" // a host has no spaces
 	}
+	s = strings.TrimRight(s, "/") // "1.2.3.4:8090/" is still an address
 	host, port := s, ""
 	if h, p, err := net.SplitHostPort(s); err == nil {
 		host, port = h, p
@@ -347,22 +388,24 @@ func loadLastServer() lastServer {
 	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
 	ls := lastServer{}
 	if len(lines) > 0 {
-		ls.URL = strings.TrimSpace(lines[0])
+		// a UTF-8 BOM (older Notepad writes one) must not end up in the URL
+		ls.URL = strings.TrimSpace(strings.TrimPrefix(lines[0], "\ufeff"))
 	}
 	if len(lines) > 1 {
-		ls.Nick = strings.TrimSpace(lines[1])
+		ls.Nick = strings.TrimSpace(strings.TrimPrefix(lines[1], "\ufeff"))
 	}
 	return ls
 }
 
 // saveLastServer remembers the server and the nick for the next start
-// (best effort: a read-only folder must not break the run).
-func saveLastServer(url, nick string) {
+// (best effort: a read-only folder must not break the run — the caller
+// warns and continues).
+func saveLastServer(url, nick string) error {
 	path := lastServerPath()
 	if path == "" {
-		return
+		return nil
 	}
-	_ = os.WriteFile(path, []byte(url+"\n"+nick+"\n"), 0o644)
+	return os.WriteFile(path, []byte(url+"\n"+nick+"\n"), 0o644)
 }
 
 // buildVersion reports the git commit this binary was built from
