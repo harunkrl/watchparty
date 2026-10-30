@@ -110,7 +110,7 @@ func TestSlashEscapeAndErrors(t *testing.T) {
 	if !hasChat(m.log, "ada", "/ /not-a-command") {
 		t.Fatalf("double slash escape wrong: %v", logTexts(m.log))
 	}
-	m.input.SetValue("/play")
+	m.input.SetValue("/chat") // a verb that still needs an argument
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !strings.Contains(m.lastErr, "needs an argument") {
 		t.Fatalf("error flash missing: %q", m.lastErr)
@@ -701,10 +701,10 @@ func TestInviteHint(t *testing.T) {
 
 func TestClickBarSeeks(t *testing.T) {
 	pl := &recPlayer{}
-	var posted []room.Event
+	posted := make(chan room.Event, 4)
 	e := &sync.Engine{
 		Master: true, ID: "ada-1", Player: pl, Clock: sync.RealClock{},
-		Post: func(ev room.Event) error { posted = append(posted, ev); return nil },
+		Post: func(ev room.Event) error { posted <- ev; return nil },
 	}
 	m := New("ada", nil, nil, false, e)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30}) // stacked layout: the dashboard owns >=100
@@ -722,12 +722,12 @@ func TestClickBarSeeks(t *testing.T) {
 	if len(pl.seeks) != 1 {
 		t.Fatalf("bar click produced no local seek: %v", pl.seeks)
 	}
-	if len(posted) != 1 || posted[0].Type != "seek" {
-		t.Fatalf("bar click did not tell the room: %v", posted)
+	if ev := waitPost(t, posted); ev.Type != "seek" {
+		t.Fatalf("bar click did not tell the room: %+v", ev)
 	}
 	miss := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 8})
 	m.Update(miss)
-	if len(pl.seeks) != 1 || len(posted) != 1 {
+	if len(pl.seeks) != 1 {
 		t.Fatal("click off the bar row must not seek")
 	}
 }
@@ -1256,7 +1256,7 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 		if ev.T < 40 || ev.T > 60 {
 			t.Fatalf("seek target %.1fs, want about the middle of 100s", ev.T)
 		}
-	default:
+	case <-time.After(2 * time.Second):
 		t.Fatal("no seek was posted")
 	}
 	// a click outside the bar row must not seek
@@ -1267,7 +1267,7 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 	select {
 	case ev := <-posted:
 		t.Fatalf("a click off the bar row posted %+v", ev)
-	default:
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

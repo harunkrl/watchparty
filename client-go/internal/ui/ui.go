@@ -47,6 +47,17 @@ const (
 	modePick
 )
 
+// pickAction is what the picker's enter key does: play the file or add
+// it to the room queue. Bare /play opens the picker in play mode, bare
+// /queue in queue mode (F4): the queue action must be reachable without
+// knowing the hidden q shortcut.
+type pickAction int
+
+const (
+	pickActPlay pickAction = iota
+	pickActQueue
+)
+
 // entryKind separates human messages from machine chatter: chat renders
 // bright, engine/event lines render dim and collapse while consecutive.
 type entryKind int
@@ -112,7 +123,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play <file> · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -151,14 +162,15 @@ type Model struct {
 	mode       mode
 	pickItems  []string
 	pickCursor int
-	hist       []string  // input history, newest last
-	histIdx    int       // -1 = live editing
-	draft      string    // saved while browsing history
-	zen        bool      // movie-night mode: one status line + input only
-	sysOff     bool      // ctrl+g: system pane hidden
-	gone       []string  // departed nicks, shown offline (cap 5)
-	eq         []float64 // vibe equalizer bar heights 0..1
-	compOpen   bool      // Tab menu of command/file completions
+	pickAct    pickAction // what enter does in the picker: play or enqueue
+	hist       []string   // input history, newest last
+	histIdx    int        // -1 = live editing
+	draft      string     // saved while browsing history
+	zen        bool       // movie-night mode: one status line + input only
+	sysOff     bool       // ctrl+g: system pane hidden
+	gone       []string   // departed nicks, shown offline (cap 5)
+	eq         []float64  // vibe equalizer bar heights 0..1
+	compOpen   bool       // Tab menu of command/file completions
 	compItems  []compItem
 	compCursor int
 	compFile   bool // completing a file argument (vs a verb)
@@ -489,10 +501,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "end":
 		m.vp.GotoBottom()
 	case "ctrl+p":
-		m.mode = modePick
-		m.pickCursor = 0
-		m.pickItems = nil
-		return m, fetchFiles(m.api)
+		return m.openPicker(pickActPlay)
 	default:
 		m.lastErr = "" // fresh keystroke: the old feedback is obsolete
 		var c tea.Cmd
@@ -505,7 +514,18 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// pickKeys handles the cursor list: arrows/j/k move, enter plays, esc backs.
+// openPicker opens the file browser: enter plays the file in play mode
+// and enqueues it in queue mode (F4).
+func (m Model) openPicker(act pickAction) (Model, tea.Cmd) {
+	m.mode = modePick
+	m.pickAct = act
+	m.pickCursor = 0
+	m.pickItems = nil
+	return m, fetchFiles(m.api)
+}
+
+// pickKeys handles the cursor list: arrows/j/k move, enter does what the
+// picker was opened for (play or queue), esc backs.
 func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c": // the picker owns the keys, but ctrl+c must always quit
@@ -520,10 +540,13 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.pickCursor < len(m.pickItems) {
 			name := m.pickItems[m.pickCursor]
 			m.mode = modeInput
+			if m.pickAct == pickActQueue {
+				return m.enqueue(name)
+			}
 			m = m.logf("> playing %s", name)
 			return m, playFile(m.player, m.api, m.engine, name)
 		}
-	case "q":
+	case "q": // the queue shortcut: it enqueues in both modes
 		if m.pickCursor < len(m.pickItems) {
 			m.mode = modeInput
 			return m.enqueue(m.pickItems[m.pickCursor])
@@ -761,6 +784,21 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		m = m.logChat(m.nick, body)
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: body})
 	}
+	// Bare /play and bare /queue open the picker in the matching mode
+	// (F4): the queue action must be discoverable without knowing the
+	// hidden q shortcut. With an argument they keep their direct
+	// behaviour (play it / enqueue it).
+	verb, arg, _ := strings.Cut(body, " ")
+	switch verb {
+	case cmd.Play:
+		if strings.TrimSpace(arg) == "" {
+			return m.openPicker(pickActPlay)
+		}
+	case cmd.Queue:
+		if strings.TrimSpace(arg) == "" {
+			return m.openPicker(pickActQueue)
+		}
+	}
 	c, err := cmd.Parse(body)
 	if err != nil {
 		return m.failf("%s", firstLine(err))
@@ -775,10 +813,7 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		m = m.logChat(m.nick, c.Arg)
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: c.Arg})
 	case cmd.List, cmd.Pick: // /list opens the picker too: a 2-line system strip is no place for a file dump
-		m.mode = modePick
-		m.pickCursor = 0
-		m.pickItems = nil
-		return m, fetchFiles(m.api)
+		return m.openPicker(pickActPlay)
 	case cmd.Play:
 		if !m.knownFile(c.Arg) {
 			return m.failf("no such file: %s (try /list)", c.Arg)
@@ -786,15 +821,6 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		m = m.logf("> playing %s", c.Arg) // local; own load broadcast is echo-filtered
 		return m, playFile(m.player, m.api, m.engine, c.Arg)
 	case cmd.Queue:
-		if c.Arg == "" { // bare queue: show the room queue
-			if len(m.queue) == 0 {
-				return m.logEngine("> queue empty (/queue <file> to add)"), nil
-			}
-			for i, n := range m.queue {
-				m = m.logf("> %d. %s", i+1, n)
-			}
-			return m, nil
-		}
 		return m.enqueue(c.Arg)
 	case cmd.Skip:
 		if len(m.queue) == 0 { // nothing to skip to: say so instead of no-op
@@ -1499,7 +1525,9 @@ func (m Model) dashView() string {
 		bandTitle += " · PAUSED"
 	}
 	bandHint := ""
-	if m.duration > 0 && m.st != nil && m.st.Pos != nil {
+	if m.duration > 0 && m.st != nil && m.st.Pos != nil && m.mode != modePick {
+		// the picker owns the keys: the bar cannot be clicked and the
+		// ctrl nudge is dead there, so the hint must not promise them (F4)
 		bandHint = "click bar or ctrl+←/→ to seek" // there is a bar to click
 	}
 	band := box(m.width, bandTitle, bandHint, m.nowPlayingLines(m.width-4), bord)
@@ -1572,6 +1600,11 @@ func (m Model) dashView() string {
 			keyStyle.Render("[tab]") + hue("141").Render(" menu · ") +
 			keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
 			keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
+	if m.mode == modePick {
+		// the picker owns the keys: the hotbar's shortcuts are dead
+		// there, so the row must tell the truth instead (F4)
+		hotbar = dim.Render(m.pickControls())
+	}
 
 	var b strings.Builder
 	b.WriteString(header + "\n\n") // gap row: the header reads calmer off the band
@@ -1945,8 +1978,25 @@ func wrapIndented(text string, width, indent int, first string) []string {
 	return out
 }
 
+// pickControls is the picker's honest control line: what the keys DO in
+// the current mode (F4). The dashboard hotbar shows it while the picker
+// is open — the hotbar's shortcuts are dead there.
+func (m Model) pickControls() string {
+	enter := "enter play"
+	if m.pickAct == pickActQueue {
+		enter = "enter enqueue"
+	}
+	return "up/down move · " + enter + " · q queue · esc cancel"
+}
+
 func (m Model) pickLines() []string {
-	out := []string{title.Render("pick a film") + dim.Render("  up/down move · enter play · q queue · esc cancel")}
+	// The footer must say what the keys DO in this mode: the picker is
+	// honest about its controls (F4).
+	head := "pick a film"
+	if m.pickAct == pickActQueue {
+		head = "queue a film"
+	}
+	out := []string{title.Render(head) + dim.Render("  "+m.pickControls())}
 	if len(m.pickItems) == 0 {
 		out = append(out, dim.Render("(no files / loading…)"))
 	}

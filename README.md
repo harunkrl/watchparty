@@ -54,7 +54,9 @@ Everything you type goes to the room as chat. Commands start with `/`:
 |---|---|
 | `/list` | list videos on the server |
 | `/pick` | cursor list: browse and play/queue with the arrow keys |
+| `/play` | open the cursor list in play mode (enter plays, `q` queues) |
 | `/play <file>` | start playing a file for everyone (anyone can call it) |
+| `/queue` | open the cursor list in queue mode (enter queues) |
 | `/queue <file>` | append to the shared queue; auto-plays when the current file ends |
 | `/skip` | jump to the next file in the queue (same as the current file ending) |
 | `/quit` | exit |
@@ -74,6 +76,17 @@ on the left; chat and input on the right):
 | `ctrl+g` | hide/show the system pane (join/leave/sync chatter) |
 | mouse wheel | scroll the chat |
 | click on the bar | seek everyone there (stacked layout) |
+
+While the file list is open it owns the keys: `↑`/`↓` move, `enter` does
+what the list was opened for (play or queue), `q` queues, `esc` closes it.
+The `ctrl+` shortcuts above are inert until it closes.
+
+Two terminals eat shortcuts before the app sees them: tmux uses `ctrl+z`
+for suspend (so movie mode is unreachable there without rebinding it),
+and the old Windows console may not deliver `ctrl+space` as a control
+key — there is no room-wide pause shortcut there, so use Windows
+Terminal. (The space bar in the mpv window toggles your own player, not
+the room.)
 
 Note: with mouse on, terminal text selection needs `shift` held.
 

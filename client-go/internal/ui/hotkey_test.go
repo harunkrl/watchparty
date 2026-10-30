@@ -49,11 +49,11 @@ func TestNulRuneTogglesPause(t *testing.T) {
 // does nothing for the master and snaps back for a follower.
 func TestBarClickSeeksTheLocalPlayer(t *testing.T) {
 	pl := &recPlayer{}
-	var posted []room.Event
+	posted := make(chan room.Event, 4)
 	e := &sync.Engine{
 		Master: true, ID: "ada-1", Player: pl,
 		Clock: sync.RealClock{},
-		Post:  func(ev room.Event) error { posted = append(posted, ev); return nil },
+		Post:  func(ev room.Event) error { posted <- ev; return nil },
 	}
 	m := New("ada", nil, nil, true, e)
 	pos := 10.0
@@ -67,8 +67,8 @@ func TestBarClickSeeksTheLocalPlayer(t *testing.T) {
 	if pl.seeks[0] < 49 || pl.seeks[0] > 51 {
 		t.Fatalf("the click seeked to %v, want ~50 (half of 100s)", pl.seeks[0])
 	}
-	if len(posted) != 1 || posted[0].Type != "seek" {
-		t.Fatalf("the click did not tell the room: %v", posted)
+	if ev := waitPost(t, posted); ev.Type != "seek" {
+		t.Fatalf("the click did not tell the room: %+v", ev)
 	}
 }
 
@@ -77,11 +77,11 @@ func TestBarClickSeeksTheLocalPlayer(t *testing.T) {
 // arithmetic was one column short (the comment claimed otherwise).
 func TestDashBarClickMapsToTheClickedCell(t *testing.T) {
 	pl := &recPlayer{}
-	var posted []room.Event
+	posted := make(chan room.Event, 4)
 	e := &sync.Engine{
 		Master: true, ID: "ada-1", Player: pl,
 		Clock: sync.RealClock{},
-		Post:  func(ev room.Event) error { posted = append(posted, ev); return nil },
+		Post:  func(ev room.Event) error { posted <- ev; return nil },
 	}
 	m := New("ada", nil, nil, true, e)
 	m.width, m.height = 120, 40 // the dashboard layout
