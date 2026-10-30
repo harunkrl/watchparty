@@ -677,7 +677,10 @@ func (m Model) dashBarClick(msg tea.MouseMsg) tea.Cmd {
 	}
 	cw := m.width - 4 // the band's content width
 	elapsed, total := clockStr(*m.st.Pos), clockStr(m.duration)
-	left := 3 + lipgloss.Width(elapsed) // border + padding + the label + a space
+	// the bar starts after the border, the padding, the elapsed label AND
+	// the space that follows it (progressBar lays it out that way — the
+	// comment claimed that before the arithmetic did, A5 W7)
+	left := 3 + lipgloss.Width(elapsed) + 1
 	barW := cw - lipgloss.Width(elapsed) - lipgloss.Width(total) - 4
 	if barW < 1 || msg.X < left || msg.X > left+barW {
 		return nil
@@ -892,6 +895,11 @@ func RenderEvent(ev room.Event, self string) string {
 	case "load":
 		return fmt.Sprintf("> load %s", ev.Name) + actor(ev.Nick, self)
 	case "play", "pause":
+		if ev.Mechanical {
+			// a stall on the other side's link: nobody pressed anything, so
+			// the log must not blame a human either (m2-S2, A5 W4)
+			return "> " + ev.Type + " " + stallMark
+		}
 		return "> " + ev.Type + actor(ev.Nick, self)
 	case "notice":
 		return "> " + ev.Text
@@ -900,6 +908,10 @@ func RenderEvent(ev room.Event, self string) string {
 	}
 	return ""
 }
+
+// stallMark marks a mechanical pause in the log: the room paused itself
+// (a stall on somebody's link), nobody pressed anything.
+const stallMark = "(stall)"
 
 // actor names who changed the state (" by bo") when the room stamped
 // someone else's nick on the event.
@@ -1303,7 +1315,7 @@ func (m Model) nowPlayingLines(w int) []string {
 		name = "— nothing playing"
 	}
 	icon, style := "▶", playingStyle
-	if m.st != nil && m.st.Paused {
+	if m.roomPaused() {
 		icon, style = "⏸", pausedStyle
 	}
 	bar := m.progressBar(w)
@@ -1335,13 +1347,13 @@ func (m Model) nowPlayingLines(w int) []string {
 		if m.st.Muted { // mpv reports the mute flag: the volume number alone would lie
 			stats = append(stats, pausedStyle.Render("♪ muted"))
 		}
-		if m.st.Paused {
+		if m.roomPaused() {
 			chip := "⏸ paused"
 			switch {
 			case m.st.Mechanical:
 				// a stall on the other side's link: nobody pressed
 				// anything, so the chip must not blame a human (m2-S2)
-				chip += " (stall)"
+				chip += " " + stallMark
 			case m.st.PausedBy != "":
 				chip += " by " + m.st.PausedBy // the room named the actor
 			}
@@ -1355,12 +1367,22 @@ func (m Model) nowPlayingLines(w int) []string {
 			ss := lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
 			stats = append(stats, ss.Render(fmt.Sprintf("⊞ you: sub %s [j in mpv]", m.st.Sub)))
 		}
-		if m.st.Stale { // the master's heartbeat stopped: say so instead of pretending
-			stats = append(stats, pausedStyle.Render("⚠ master heartbeat stale"))
+		if m.st.Stale { // no heartbeat from the room: say so instead of pretending
+			// (neutral wording: our own link may be the broken one — A5 W9)
+			stats = append(stats, pausedStyle.Render("⚠ no room heartbeat"))
 		}
 	}
 	// a blank row above and below the bar: the position reads calmer
 	return []string{style.Render(icon) + " " + name, "", bar, "", strings.Join(stats, statLbl.Render(" · "))}
+}
+
+// roomPaused: the ROOM is paused — by a human, or by a stall we detected
+// (the mechanical flag). Our own player can still be running for a tick
+// (a stall pause reaches us a moment later), so the state chips follow
+// the ROOM, not our local player (A5 W10: the UI claimed "playing" for
+// two seconds while the room was already paused).
+func (m Model) roomPaused() bool {
+	return m.st != nil && (m.st.Paused || m.st.Mechanical)
 }
 
 func (m Model) watcherLines() []string {
@@ -1466,14 +1488,14 @@ func (m Model) dashView() string {
 	// the band's border breathes with playback: green, amber, idle grey
 	bord := bordIdle
 	if m.st != nil && m.st.Pos != nil {
-		if m.st.Paused {
+		if m.roomPaused() {
 			bord = bordPause
 		} else {
 			bord = bordPlay
 		}
 	}
 	bandTitle := "NOW PLAYING"
-	if m.st != nil && m.st.Pos != nil && m.st.Paused {
+	if m.st != nil && m.st.Pos != nil && m.roomPaused() {
 		bandTitle += " · PAUSED"
 	}
 	bandHint := ""
@@ -1865,6 +1887,9 @@ func engineKind(text string) string {
 	if len(f) == 0 {
 		return ""
 	}
+	if len(f) >= 2 && f[1] == stallMark {
+		return f[0] + " " + stallMark // a stall pause is its own fact
+	}
 	if len(f) >= 3 && f[1] == "by" {
 		return f[0] + " by " + f[2]
 	}
@@ -1994,7 +2019,7 @@ func (m Model) nowChip(budget int) string {
 		return dim.Render("— nothing playing")
 	}
 	icon, style := "▶", playingStyle
-	if m.st != nil && m.st.Paused {
+	if m.roomPaused() {
 		icon, style = "⏸", pausedStyle
 	}
 	// the title must never grow the row past the frame: a long file name

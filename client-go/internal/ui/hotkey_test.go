@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"math"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
@@ -67,5 +69,35 @@ func TestBarClickSeeksTheLocalPlayer(t *testing.T) {
 	}
 	if len(posted) != 1 || posted[0].Type != "seek" {
 		t.Fatalf("the click did not tell the room: %v", posted)
+	}
+}
+
+// A5 W7: the dashboard bar click must land on the cell it points at. The
+// bar starts after the elapsed label AND the space that follows it — the
+// arithmetic was one column short (the comment claimed otherwise).
+func TestDashBarClickMapsToTheClickedCell(t *testing.T) {
+	pl := &recPlayer{}
+	var posted []room.Event
+	e := &sync.Engine{
+		Master: true, ID: "ada-1", Player: pl,
+		Clock: sync.RealClock{},
+		Post:  func(ev room.Event) error { posted = append(posted, ev); return nil },
+	}
+	m := New("ada", nil, nil, true, e)
+	m.width, m.height = 120, 40 // the dashboard layout
+	pos := 10.0
+	m.duration = 100
+	m.st = &sync.UiState{Pos: &pos}
+	elapsed, total := clockStr(pos), clockStr(m.duration)
+	left := 3 + lipgloss.Width(elapsed) + 1 // border + padding + label + space
+	barW := m.width - 4 - lipgloss.Width(elapsed) - lipgloss.Width(total) - 4
+	x := left + barW/2
+	m.dashBarClick(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: x, Y: 5})
+	if len(pl.seeks) != 1 {
+		t.Fatalf("the click did not seek the local player: %v", pl.seeks)
+	}
+	want := float64(x-left) / float64(barW) * m.duration
+	if math.Abs(pl.seeks[0]-want) > 0.5 {
+		t.Fatalf("the click seeked to %v, want ~%v (the bar mapping is off by a column)", pl.seeks[0], want)
 	}
 }

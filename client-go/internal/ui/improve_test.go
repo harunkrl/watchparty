@@ -72,14 +72,18 @@ func TestStatRowShowsMuted(t *testing.T) {
 	}
 }
 
-// C5: a follower whose heartbeat went quiet says so.
+// C5: a follower whose heartbeat went quiet says so — with wording that
+// does not blame the master (our own link may be the broken one, A5 W9).
 func TestStatRowShowsStaleHeartbeat(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	p := 10.0
 	m = upd(t, m, sync.UiState{Pos: &p, Stale: true})
 	row := strings.Join(m.nowPlayingLines(60), "\n")
-	if !strings.Contains(row, "heartbeat stale") {
+	if !strings.Contains(row, "no room heartbeat") {
 		t.Fatalf("stat row missing the stale hint: %q", row)
+	}
+	if strings.Contains(row, "master heartbeat") {
+		t.Fatalf("the stale hint blames the master: %q", row)
 	}
 }
 
