@@ -42,6 +42,31 @@ func backoff(attempt int) int {
 	return d
 }
 
+// maxBackoff is the plan's cap: the reconnect delay never grows past it.
+const maxBackoff = 30 * time.Second
+
+// backoffDelay is the frozen curve plus a ±20% jitter (G2): when the
+// server goes down, every client must not come back in the same second —
+// a thundering herd re-runs the same request against the same server.
+// The jitter never pushes the delay past the plan's cap, so the bound
+// impact stays inside the frozen curve.
+//
+// shortcut: the jitter breaks the curve's monotonicity on purpose (a
+// later step may be shorter than the one before). Revisit only if a
+// strictly monotonic curve is ever needed.
+func backoffDelay(attempt int, r *rand.Rand) time.Duration {
+	d := time.Duration(backoff(attempt)) * time.Second
+	span := d / 5 // ±20%
+	d += time.Duration(r.Int63n(int64(2*span)+1)) - span
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	if d < time.Second {
+		d = time.Second
+	}
+	return d
+}
+
 func main() {
 	setConsoleUTF8() // the console must speak UTF-8 (Windows): box drawing, Turkish nicks
 	name := flag.String("name", defaultNick(), "nickname shown to the room")
@@ -181,22 +206,24 @@ func main() {
 
 	go func() { // SSE with reconnect backoff (client.py sse_loop parity)
 		attempt := 0
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano())) // G2: the jitter is seeded per run
 		for {
 			err := api.Stream(ctx, *name, chRoom, func() { attempt = 0 })
 			if ctx.Err() != nil {
 				break
 			}
-			delay := backoff(attempt)
+			delay := backoffDelay(attempt, rnd)
 			attempt++
-			note := fmt.Sprintf("> [conn] lost (%v), retrying in %ds", err, delay)
+			secs := int(delay.Round(time.Second).Seconds())
+			note := fmt.Sprintf("> [conn] lost (%v), retrying in %ds", err, secs)
 			if *headless {
 				fmt.Println(note)
 			} else {
-				p.Send(ui.ReconnectingMsg{Note: note, Try: attempt, Delay: delay})
+				p.Send(ui.ReconnectingMsg{Note: note, Try: attempt, Delay: secs})
 			}
 			select {
 			case <-ctx.Done():
-			case <-time.After(time.Duration(delay) * time.Second):
+			case <-time.After(delay):
 			}
 		}
 		close(chRoom)

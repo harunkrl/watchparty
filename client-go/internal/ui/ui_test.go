@@ -196,6 +196,8 @@ func TestRenderEventTable(t *testing.T) {
 		{room.Event{Type: "pause"}, "ada", "> pause"},
 		{room.Event{Type: "seek", T: 59.96}, "ada", "> seek @60.0s"},
 		{room.Event{Type: "position"}, "ada", ""}, // heartbeats are never rendered
+		// F3: the room's notice is information, not an order — it renders
+		{room.Event{Type: "notice", Text: "the room moved on"}, "ada", "> the room moved on"},
 		{room.Event{Type: "unknown"}, "ada", ""},
 		// C-F: the room stamps the actor on a state change
 		{room.Event{Type: "pause", Nick: "bo"}, "ada", "> pause by bo"},

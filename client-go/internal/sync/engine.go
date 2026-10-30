@@ -687,7 +687,7 @@ func (e *Engine) masterTick(s mpv.State) {
 		// clamp a long-downtime join before EOF. Dur stays off the wire
 		// while unknown (omitempty): an old server ignores it, and the
 		// server keeps its last known value.
-		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause, Dur: s.Dur})
+		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause, Dur: s.Dur, File: e.loaded})
 		e.lastPos = s.Pos
 		e.emitUi(s, 0) // master: no drift, but the status bar wants pos/paused
 		return
@@ -699,7 +699,7 @@ func (e *Engine) masterTick(s mpv.State) {
 	// they keep the followers from showing a false "stale" chip. The room
 	// is at the end (p=true), so the server ages the position no further.
 	if e.lastPos != nil {
-		e.post1(room.Event{Type: "position", T: *e.lastPos, P: true, Dur: e.dur})
+		e.post1(room.Event{Type: "position", T: *e.lastPos, P: true, Dur: e.dur, File: e.loaded})
 	}
 }
 

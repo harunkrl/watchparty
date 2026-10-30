@@ -37,8 +37,14 @@ type Event struct {
 	T         float64  `json:"t"`
 	P         bool     `json:"p"`
 	Dur       float64  `json:"dur,omitempty"`
-	From      string   `json:"from,omitempty"`
-	Pos       *float64 `json:"pos,omitempty"`
+	// File names the file a position belongs to (faz-3 gate, #49a): the
+	// server drops a position whose file is not the room's, so a master
+	// that still plays the old file cannot overwrite the new one's
+	// position. It stays off the wire while unknown (omitempty): an old
+	// client keeps the old behaviour.
+	File string   `json:"file,omitempty"`
+	From string   `json:"from,omitempty"`
+	Pos  *float64 `json:"pos,omitempty"`
 	// Mechanical marks a pause the room did not ask for: a stall the
 	// follower detected on its own link. It names no human (m2-S2).
 	Mechanical bool `json:"mechanical,omitempty"`

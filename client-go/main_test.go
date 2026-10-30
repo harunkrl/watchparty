@@ -1,14 +1,61 @@
 package main
 
 import (
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
+
+// G2: the reconnect steps get a ±20% jitter, and the jitter never
+// leaves the plan's cap (the delay stays inside the frozen curve).
+func TestBackoffJitterStaysInBounds(t *testing.T) {
+	r := rand.New(rand.NewSource(7))
+	for attempt := 0; attempt < 8; attempt++ {
+		base := time.Duration(backoff(attempt)) * time.Second
+		for i := 0; i < 200; i++ {
+			d := backoffDelay(attempt, r)
+			if d < base*4/5 || d > base*6/5 {
+				t.Fatalf("attempt %d: delay %v is outside ±20%% of %v", attempt, d, base)
+			}
+			if d > maxBackoff {
+				t.Fatalf("attempt %d: delay %v is past the cap", attempt, d)
+			}
+			if d < time.Second {
+				t.Fatalf("attempt %d: delay %v is under a second", attempt, d)
+			}
+		}
+	}
+}
+
+// The jitter must really spread the reconnects (a server that dies must
+// not get every client back in the same second) and it must be
+// reproducible from its seed (the tests need determinism).
+func TestBackoffJitterIsSeededAndSpread(t *testing.T) {
+	first := jittered(rand.New(rand.NewSource(1)))
+	again := jittered(rand.New(rand.NewSource(1)))
+	other := jittered(rand.New(rand.NewSource(2)))
+	if !reflect.DeepEqual(first, again) {
+		t.Fatalf("the same seed must produce the same delays: %v vs %v", first, again)
+	}
+	if reflect.DeepEqual(first, other) {
+		t.Fatalf("different seeds must spread the delays: %v", first)
+	}
+}
+
+func jittered(r *rand.Rand) []time.Duration {
+	out := make([]time.Duration, 0, 20)
+	for i := 0; i < 20; i++ {
+		out = append(out, backoffDelay(2, r))
+	}
+	return out
+}
 
 // W3: a friend types the host, not a URL.
 func TestNormalizeServerURL(t *testing.T) {
