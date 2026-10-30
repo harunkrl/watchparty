@@ -195,9 +195,10 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
   labeled "paused (stall)" so nobody gets blamed — so the cache can
   refill. Press play when ready. This only fires while the master's
   heartbeat is fresh: a silent master never pauses the room. A resume
-  jump re-seeks once with a settle window when the connection survives;
-  after a full reconnect (typical for sleep/laptop lid) the room may
-  still pause once — press play when it does.
+  jump (sleep, laptop lid, an outage — reconnect or not) re-seeks once
+  with a settle window that follows the cache instead of pausing; a
+  link that is genuinely starving still stalls, bounded by a ~2-minute
+  backstop.
 - Prefer MKV, or faststart MP4s (`ffmpeg -i in.mp4 -c copy -movflags
   +faststart out.mp4`): an MP4 with its index (moov) at the end must be
   fetched from the far end of the file before playback starts, which can
@@ -210,7 +211,12 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
   A second `--master` cannot duel for the clock: the server keeps the first
   heartbeat sender, drops the other's heartbeats and warns the room; the
   claim dies with the master's connection — or after 45 s without a
-  heartbeat post — so restarts succeed cleanly.
+  heartbeat post — so restarts succeed cleanly. A master that dies
+  silently no longer freezes the room: once the claim goes stale
+  (~45 s after the last heartbeat) — or the master leaves cleanly —
+  a follower whose file ended advances the queue; late joiners after
+  the master dies or leaves land where the film actually stopped (in
+  the room's own paused state), not extrapolated to its end.
 - Chat history is in-memory only: the last 50 messages replay to each new
   joiner; a server restart clears it.
 - Windows client (named-pipe IPC) is supported; use the release bundle

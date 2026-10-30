@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.5.0 — the room outlives its master
+
+- client (sync): the master keeps heartbeating while parked at EOF —
+  the clock claim survives an end-of-film idle park and followers no
+  longer show a false "master heartbeat stale" chip after the film
+  ends (and a second master can no longer silently steal the clock
+  from a parked one)
+- client (sync): a follower whose file ended advances the room when
+  the master is really dead: the client posts "ended" while its master
+  snapshot is stale, the server accepts it once the claim is stale
+  (~45 s after the last heartbeat) — the queue moves instead of
+  freezing until someone skips. A live master is never second-guessed
+  (double gate: local snapshot age + server-side ownerless check)
+- client (sync): a resume is a resume even across a reconnect: the
+  settle window survives hello, follows the cache instead of a fixed
+  30 s clock, and is bounded by an absolute 120 s deadline that
+  reconnect storms cannot extend — sleep/resume no longer pauses the
+  room, while a genuinely starving link still does (bounded, honest)
+- client (sync): a failed stall-pause post is re-armed and retried —
+  the starving link that caused the stall used to also swallow the
+  room pause, leaving the follower desynced forever
+- server: "ended" treats a stale clock claim as ownerless (a dead
+  master's room can advance; a returning master is never demoted by
+  it); hello stops extrapolating a dead or gone master's clock — late
+  joiners land where the film actually stopped, in the room's own
+  paused state, instead of being dragged to EOF
+- tests: dead-master aftermath, ownerless/stale frozen hello,
+  reconnect-resume e2e over a real connection drop (wanlink drop
+  mode), reconnect-storm deadline pins, failed-stall-post re-arm,
+  idle-heartbeat freshness, and the claim-freeze baselines — all
+  failing-first
+
 ## v1.4.1 — quiet exits, honest dashboards
 
 - client: a clean quit exits 0 again — a signal goroutine raced the
