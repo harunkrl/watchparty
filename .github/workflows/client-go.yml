@@ -119,5 +119,6 @@ jobs:
       - run: |
           node tests/integration.mjs
           node tests/pause_sync.mjs
+          node tests/stall_family.mjs
           node tests/master_restart.mjs
           node tests/soak.mjs

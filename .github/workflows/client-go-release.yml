@@ -48,6 +48,7 @@ jobs:
           node tests/f1_server.mjs
           node tests/integration.mjs
           node tests/pause_sync.mjs
+          node tests/stall_family.mjs
           node tests/master_restart.mjs
           node tests/soak.mjs
         # the job default (client-go) does not contain tests/: run the
