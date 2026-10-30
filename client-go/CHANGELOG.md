@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.3.3 — windows works, honest controls
+
+- client (windows): ctrl+space play/pause actually works on Windows
+  (unix-only key mapping) and no longer leaks a NUL into the chat input;
+  the console switches itself to UTF-8, so the dashboard and Turkish
+  nicknames survive legacy consoles
+- client: closing the mpv window shows "mpv exited" and waits for Enter
+  in the friend flow — the console no longer vanishes mid-sentence
+- client: clicking the dashboard progress bar seeks YOUR player too
+  (your own click used to do nothing locally, and a master's click made
+  followers jump twice)
+- client: the bundled mpv always wins over an mpv found in PATH; the
+  last server is remembered only after a successful join; a bare start
+  holds the usage hints on screen
+- client: mpv's own error output reaches the system pane (bounded), so
+  "why did this not open" has an answer on the friend's machine
+- client: reconnect backoff resets only when the server re-admits you
+  (hello), not on any HTTP reply, and a dead stream is noticed at 25s
+  instead of 45s
+- client: invite address labels tell the truth — only tailscale and
+  real private ranges say so; the docker range and public IPs stay
+  unlabeled
+- client: the mpv IPC pipe name gets a random suffix (PID-reuse could
+  collide it with a leftover player)
+- server: a vanished or unreadable videos folder returns empty lists
+  instead of crashing the whole room (and recovers when the folder
+  returns); a transient read error keeps the queue instead of wiping it
+- server: reaching the end of the queue broadcasts it — no more ghost
+  queue entries or silently dead /skip
+- server: impostor notices are sanitized (raw client-supplied names
+  could inject terminal escape sequences into every client)
+- server: room state also persists on Ctrl-C, not just SIGTERM
+- ci: releases gate on the full battery (race, adversarial audit pins,
+  node e2e) before anything ships; Windows gets a native test job — the
+  named-pipe IPC code executes in CI for the first time; the mpv-less
+  Windows zip is gone (only the bundle ships), closing the "mpv not
+  found" trap for friends who picked the wrong zip
+- docs: README windows claims match reality (supported, bundle-first)
+
 ## v1.3.2 — friendlier start
 
 - client (windows friend flow): errors no longer vanish with the console
