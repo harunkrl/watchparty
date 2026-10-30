@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.5.2 — a picker for the queue, a UI that never freezes
+
+- client: bare /queue and /play open the file picker in the matching
+  mode (enter enqueues/plays, q queues in both, esc backs — the
+  picker footer says what the keys do). /queue with no argument used
+  to print the queue: it opens the picker now (the queue lives in the
+  QUEUE box and the footer)
+- client: the dashboard hotbar and the band hint stop advertising
+  shortcuts that are dead while the picker owns the keys — they show
+  the picker's own controls instead
+- client: a hung server (connects, never answers) used to freeze the
+  TUI for exactly 5s on ctrl+space/seek/any wire action — the post
+  now rides a single ordered worker and the UI returns in
+  microseconds (measured 5.004s → 36µs); a failed post reports back
+  and the stall-pause re-arm rides the same path
+- client: quitting drains pending posts (≤2s) so the last
+  pause/play/seek still reaches the room; a network that never
+  answers logs how many events were lost instead of hanging the exit
+- docs: the ctrl-shortcut reality — every advertised shortcut works
+  in the input modes (41-cell matrix, effect-tested); legacy conhost
+  delivers ctrl+space without the ctrl bit (unfixable at the app
+  layer — use Windows Terminal; the mpv window's space toggles your
+  OWN player, not the room); tmux eats ctrl+z as suspend
+
 ## v1.5.1 — the room cannot be steered from the wrong file
 
 - server: position heartbeats carry the file they belong to (additive
