@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.5.1 — the room cannot be steered from the wrong file
+
+- server: position heartbeats carry the file they belong to (additive
+  wire field); a post from a different file than the room is playing
+  is dropped entirely — it no longer overwrites the room position nor
+  refreshes the clock claim — and the old master's human sees a
+  rate-limited "the room moved on" notice (sanitized; the client
+  renders it but never auto-reloads)
+- server: the impostor notice set is bounded (clears at 64 ids — the
+  65th second master still gets its notice and can self-demote)
+- server: room state persists are atomic AND durable (fsync before
+  rename, including the exit-time write)
+- client: the reconnect backoff gets ±20% jitter (spread within the
+  curve, capped at 30s; non-monotonic on purpose)
+- tests: the remaining IPC logic pins run on every platform (unix-only
+  IPC tests went from 7 to 1 — only the real-socket transport test
+  stays unix-only); f2 grows the wrong-file gate pins
+
 ## v1.5.0 — the room outlives its master
 
 - client (sync): the master keeps heartbeating while parked at EOF —
