@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.4.0 — the room does not blame the innocent
+
+- client (sync): a follower may only pause the room when the master is
+  really heartbeating. A silent master (net flap, a dead SSE, a laptop
+  that slept) no longer gets the room paused by the follower that
+  happened to notice first — the follower waits for the clock instead
+- client (sync): a big jump (>30s) is treated as a RESUME, not as
+  starvation: the follower re-seeks once, gives the cache time to refill
+  and never pauses the room for it (sleep/resume/outage no longer stop
+  the film for both sides)
+- client (sync): the resume settle window can delay a real starvation by
+  ~30s — nothing is lost (the drift shows it and the stall self-corrects
+  once the window closes)
+- client (sync): the stall pause is marked MECHANICAL on the wire — the
+  chip says "paused (stall)" instead of blaming a human who never
+  touched anything
+- client: the stall family gets an end-to-end test (the room must stay
+  unpaused while a master is silent, and must re-converge afterwards)
+- server: a master that dies silently (socket open, nothing posted)
+  releases the clock after ~45s (CLAIM_FRESH_MS) instead of freezing
+  sync until the TCP stack gives up minutes later — a restarted master
+  takes the room back cleanly
+
 ## v1.3.3 — windows works, honest controls
 
 - client (windows): ctrl+space play/pause actually works on Windows
