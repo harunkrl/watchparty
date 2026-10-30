@@ -175,14 +175,27 @@ function clean(s, max) {
 // owns the room clock (a master announces itself exactly that way); a
 // second master's heartbeats are dropped with a one-time room notice.
 // Only position/ended are master-exclusive — pause/seek/load/skip stay
-// dual-control. The claim dies with the owner's SSE connection, so a
-// restarted or failed master is succeeded cleanly.
+// dual-control. The claim dies with the owner's SSE connection (a restarted
+// or failed master is succeeded cleanly) — AND with the owner's silence
+// (w1-3): a half-open death (laptop sleep, RST-less drop) never fires close,
+// so a claim that gets no position heartbeat for CLAIM_FRESH_MS is released
+// silently and the next poster takes over. Only the OWNER's own posts count:
+// the stall-family follower posts nothing while the master is silent, so
+// follower silence must never drop the claim. A paused master keeps
+// heartbeating, so paused rooms are unaffected. 45s ≈ 20 missed 2s
+// heartbeats; CLAIM_FRESH_MS shortens it for tests.
+const CLAIM_FRESH_MS = Number(process.env.CLAIM_FRESH_MS) || 45000;
 let clockOwner = null; // client id of the current master
+let claimAt = -Infinity; // mono() of the owner's last position post
 const impostorSeen = new Set();
 function isClockOwner(from) {
-  if (from === clockOwner) return true;
+  if (from === clockOwner) { claimAt = mono(); return true; }
+  if (clockOwner !== null && mono() - claimAt > CLAIM_FRESH_MS) {
+    clockOwner = null; // stale claim (w1-3): released silently, no notice
+  }
   if (clockOwner === null) {
     clockOwner = from; // first heartbeat wins: followers never post positions
+    claimAt = mono();
     impostorSeen.delete(from);
     return true;
   }
