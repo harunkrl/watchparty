@@ -58,11 +58,25 @@ const staleAge = 6 * time.Second
 //   - resumeJump: a drift this big means we were away (sleep, suspend, a
 //     long outage), not that the room is starving. The follower re-seeks
 //     once and never pauses the room for it.
-//   - resumeSettle: how long the cache may take to refill after that
-//     re-seek. Inside the window there is no seek storm and no pause.
+//   - resumeBound: how long the resume episode may last. The episode
+//     follows the CACHE (M2-b): while mpv is still filling there is no
+//     seek storm and no room pause, and it ends as soon as the follower
+//     converges. The bound is the honest backstop: a resume that never
+//     converges must still reach the normal stall logic, or a broken link
+//     would be pause-proof forever.
+//     shortcut: a fixed 2 minutes — a refill slower than that is treated
+//     as real starvation (raise it if the WAN baseline says otherwise).
 const (
-	resumeJump   = 30.0
-	resumeSettle = 30 * time.Second
+	resumeJump = 30.0
+	// resumeBound: the honest backstop for a resume episode (M2-b).
+	resumeBound = 120 * time.Second
+	// endedRetry: how many polls between two 'ended' posts from a
+	// follower whose master is dead. The server accepts the post only
+	// for an ownerless room and releases the dead master's claim on its
+	// own schedule (CLAIM_FRESH_MS) — the client learns of the death
+	// earlier (staleAge) — so the post is repeated until the room takes
+	// it. The episode ends when the room answers.
+	endedRetry = 5
 )
 
 // Clock is the engine's time source; fake it in tests.
@@ -123,9 +137,11 @@ type Engine struct {
 	loadedAt   time.Time // when mpv took the file: post-load seek posts are noise
 	behind     int       // follower: consecutive polls behind live (starvation signal)
 	autoPaused bool      // follower: WE paused the room over a stall
-	resumed    bool      // follower: a resume jump was handled (one re-seek, no storm)
-	resumeTil  time.Time // follower: the settle window after that re-seek
+	resumed    bool      // follower: a resume episode is OPEN (the cache is refilling)
+	resumeSeen bool      // follower: a resume-sized jump is still unresolved (no NEW episode until it converges)
+	resumeTil  time.Time // follower: the resume episode ends here (the honest bound)
 	mechPause  bool      // the room is paused for a MECHANICAL reason (a stall), not a human's
+	endedAt    time.Time // follower: when we last posted 'ended' for the current file
 
 	dur          float64  // the locally known media duration (0 = unknown yet)
 	pendingPos   *float64 // a hello position waiting for the duration to clamp it
@@ -164,13 +180,18 @@ func (e *Engine) logf(format string, args ...any) {
 	}
 }
 
-func (e *Engine) post1(ev room.Event) {
+// post1 posts one event and reports the outcome: a failed post must be
+// visible to the caller (the stall pause rides the same starving link
+// that caused the stall — W3).
+func (e *Engine) post1(ev room.Event) error {
 	if e.Post == nil {
-		return
+		return nil
 	}
-	if err := e.Post(ev); err != nil {
+	err := e.Post(ev)
+	if err != nil {
 		e.logf("post: %s", err)
 	}
+	return err
 }
 
 // setPause/seekTo mark lastActuate so the mpv events they trigger are
@@ -229,9 +250,18 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// a reconnect is a fresh stall window: a behind-tick from before
 		// the outage must not trip the stall counter on the first tick
 		// after it (the room would be paused for a stall that is over)
-		e.behind, e.autoPaused = 0, false
-		e.resumed = false // the outage is over: the next jump is a new resume
-		e.resumeTil = time.Time{}
+		e.autoPaused = false
+		// M2-a: the resume episode SURVIVES the reconnect. A sleep/resume
+		// with an SSE drop (the common path — readIdle 25s) must not
+		// replay the old stall: the hello-driven seek flushes the cache
+		// and the refill is not starvation (m2-501). The episode ends when
+		// the follower converges (M2-b), not because a hello arrived.
+		// An UNRESOLVED resume keeps the behind-counter: the follower is
+		// still behind, and a reconnect storm must not reset the counter
+		// forever — the backstop would never fire (master-2 P2-1).
+		if !e.resumeSeen {
+			e.behind = 0 // a reconnect is a fresh stall window
+		}
 		// Server may carry an age-adjusted media position + paused flag
 		// from the room's live snapshot (set after every position relay,
 		// cleared by load/ended/skip). When present, snap now and seek
@@ -308,7 +338,9 @@ func (e *Engine) load(name string) {
 	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
 	e.behind, e.autoPaused = 0, false
 	e.resumed = false            // a new file: the next jump is a new resume
-	e.resumeTil = time.Time{}    // the settle window must not outlive the file
+	e.resumeSeen = false         // a new file: no unresolved jump
+	e.resumeTil = time.Time{}    // the resume episode must not outlive the file
+	e.endedAt = time.Time{}      // the 'ended' post belongs to the old file
 	e.mechPause = false          // the room plays a new file: no mechanical pause
 	e.wasActive = false          // the new file gets its own EOF: the old one is over
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
@@ -339,7 +371,8 @@ func (e *Engine) OwnLoad(name string) {
 	e.wasActive = false // same as load(): the new file owns the next EOF
 	e.lastPos = nil     // same as load(): the position jumped, the baseline is stale
 	e.dur = 0           // same as load(): the new duration is unknown yet
-	e.snap = nil        // same as load(): the old snapshot belongs to the old file
+	e.endedAt = time.Time{}
+	e.snap = nil // same as load(): the old snapshot belongs to the old file
 	e.pendingPos = nil
 }
 
@@ -352,6 +385,19 @@ func (e *Engine) applySnapshot(pos float64, paused bool) {
 	}
 	now := e.Clock.Now()
 	e.snap = &snapshot{t: pos, paused: paused, at: now, beat: now}
+	// M2-a: a hello-driven jump that is resume-sized starts the resume
+	// episode: the seek flushes the cache and the refill must not be
+	// mistaken for starvation (m2-501). The deadline is seeded ONLY when
+	// no episode is open AND the jump is unresolved: an open episode's
+	// deadline must not be moved by a hello — a reconnect storm would
+	// keep it alive forever and the room could never pause (master-2
+	// P2-1). The unresolved jump is the per-file cap: no new episode
+	// until the follower converges.
+	if t, ok := e.Player.Pos(); ok && pos-t > resumeJump && !e.resumed && !e.resumeSeen {
+		e.resumed = true
+		e.resumeSeen = true
+		e.resumeTil = now.Add(resumeBound)
+	}
 	// skip the seek when already there: on an SSE blip this is a
 	// sub-second rewind that would flash the same frame (F3)
 	if t, ok := e.Player.Pos(); !ok || abs(t-pos) > Tolerance {
@@ -456,6 +502,20 @@ func (e *Engine) OnMpvp(s mpv.State) {
 		}
 	} else if !s.Idle && s.Pos != nil {
 		e.wasActive = true
+	}
+	// M1-A: our file is over and the room's master is really dead (its
+	// heartbeat went stale — with M1-B a parked master keeps heartbeating,
+	// so a stale snapshot means dead, not parked). Nobody else will ever
+	// advance the queue, so we do it. The server accepts a follower's
+	// 'ended' only for an ownerless room and releases the dead master's
+	// claim on its own schedule — the client learns of the death earlier —
+	// so the post is repeated until the room takes it. The episode ends
+	// when the room answers (a new file resets the stamp).
+	if !e.Master && s.Idle && e.loaded != "" && e.snap != nil && e.Clock.Since(e.snap.beat) > staleAge {
+		if e.endedAt.IsZero() || e.Clock.Since(e.endedAt) >= time.Duration(endedRetry)*PollSecs*time.Second {
+			e.endedAt = e.Clock.Now()
+			e.post1(room.Event{Type: "ended"})
+		}
 	}
 	// F1: the hello position waited for the duration — now it can be
 	// clamped and applied.
@@ -574,8 +634,8 @@ func (e *Engine) OnMpvEvent(name string) {
 // postDiscrete posts one discrete event and mirrors it in the local log:
 // own SSE events are echo-filtered, so without this the actor's own
 // terminal would never show their pause/play/seek.
-func (e *Engine) postDiscrete(ev room.Event) {
-	e.post1(ev)
+func (e *Engine) postDiscrete(ev room.Event) error {
+	err := e.post1(ev)
 	switch ev.Type {
 	case "pause":
 		// our own pause: nobody else holds it. Without this the actor of
@@ -590,6 +650,7 @@ func (e *Engine) postDiscrete(ev room.Event) {
 	case "seek":
 		e.logf("> seek @%.1fs", ev.T)
 	}
+	return err
 }
 
 func (e *Engine) masterTick(s mpv.State) {
@@ -629,6 +690,16 @@ func (e *Engine) masterTick(s mpv.State) {
 		e.post1(room.Event{Type: "position", T: *s.Pos, P: s.Pause, Dur: s.Dur})
 		e.lastPos = s.Pos
 		e.emitUi(s, 0) // master: no drift, but the status bar wants pos/paused
+		return
+	}
+	// M1-B: the master is parked at EOF (the film ended, the queue may be
+	// empty). It must keep heartbeating: these posts HOLD the room's
+	// clock claim — a parked master used to lose it after 45s, and a
+	// second --master could then steal the clock silently (M1-B) — and
+	// they keep the followers from showing a false "stale" chip. The room
+	// is at the end (p=true), so the server ages the position no further.
+	if e.lastPos != nil {
+		e.post1(room.Event{Type: "position", T: *e.lastPos, P: true, Dur: e.dur})
 	}
 }
 
@@ -672,19 +743,39 @@ func (e *Engine) followerTick(s mpv.State) {
 	// m2-S2: a resume (sleep, suspend, a long outage) is a jump, not
 	// starvation: re-seek once, give the cache time to refill, and never
 	// pause the room for it.
-	if drift < -resumeJump && !e.resumed {
+	if drift < -resumeJump && !e.resumeSeen {
 		e.resumed = true
+		e.resumeSeen = true
 		e.behind = 0
-		e.resumeTil = e.Clock.Now().Add(resumeSettle)
+		e.resumeTil = e.Clock.Now().Add(resumeBound)
 		e.seekTo(expected)
 		e.emitUi(s, drift)
 		return
 	}
-	if e.Clock.Now().Before(e.resumeTil) {
-		// settling after the resume: no seek storm, no room pause
-		e.behind = 0
-		e.emitUi(s, drift)
-		return
+	// M2-b: the resume episode follows the CACHE, not the clock. While
+	// mpv is still filling there is no seek storm and no room pause (a
+	// slow link needs more than the old fixed 30s — W5); the episode ends
+	// as soon as the follower converges. The bound is the honest backstop:
+	// a resume that never converges must still reach the normal stall
+	// logic (a broken link must not be pause-proof forever).
+	if e.resumed {
+		switch {
+		case !e.Clock.Now().Before(e.resumeTil):
+			// the bound expired: the episode is over (the flag is cleared —
+			// P3-3) but the jump stays unresolved, so the SAME jump is not
+			// mistaken for a new resume (which would move the deadline
+			// forever — master-2 P2-1)
+			e.resumed = false
+			e.resumeTil = time.Time{}
+		case !s.Buffering && abs(drift) <= Tolerance:
+			e.resumed = false // converged: the episode is over
+			e.resumeSeen = false
+			e.resumeTil = time.Time{}
+		default:
+			e.behind = 0
+			e.emitUi(s, drift)
+			return
+		}
 	}
 	if s.Buffering {
 		// mpv says the cache is dry. Feed the same stall counter as the
@@ -715,16 +806,19 @@ func (e *Engine) followerTick(s mpv.State) {
 		e.seekTo(expected) // probe seek: one chance to converge before stalling
 	case abs(drift) > Tolerance:
 		e.behind = 0
-		e.resumed = false  // we caught up: the next jump is a new resume
+		e.resumed = false // we caught up: the next jump is a new resume
+		e.resumeSeen = false
 		e.seekTo(expected) // ahead of live: clock jump or a lagging master
 	case abs(drift) > speedBand:
 		e.behind = 0
 		e.resumed = false
+		e.resumeSeen = false
 		// smooth converge: a small tempo nudge instead of a visible seek
 		e.setSpeed(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
 	default:
 		e.behind = 0
 		e.resumed = false
+		e.resumeSeen = false
 		e.setSpeed(1) // inside the dead zone: plain 1x
 	}
 }
@@ -738,19 +832,29 @@ func (e *Engine) followerTick(s mpv.State) {
 func (e *Engine) stallBlock(s mpv.State) {
 	e.setSpeed(1)
 	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
-	e.mechPause = true // mechanical: nobody pressed anything (m2-S2)
-	e.emitUi(s, *s.Pos-expected)
-	if e.autoPaused {
-		return // we already paused the room for this stall episode
+	if !e.autoPaused {
+		e.autoPaused = true
+		e.snap.paused = true // mirror our post: heartbeats carry the pre-post state briefly
+		e.pausedBy = ""      // our own stall pause: no actor
+		e.lastPost = e.Clock.Now()
+		// the marker travels on the wire: the other side must not blame a
+		// human for a pause the room asked for by itself (m2-S2)
+		if err := e.postDiscrete(room.Event{Type: "pause", Mechanical: true}); err != nil {
+			// W3: the pause did not land. The post rides the same starving
+			// link that caused the stall — so this is the EXPECTED failure
+			// there. Re-arm: without it the follower never seeks again and
+			// never pauses the room: it would stay behind forever while
+			// the room plays on. The room is not paused, so the chip must
+			// not claim a mechanical pause either.
+			e.autoPaused = false
+			e.snap.paused = false
+			e.mechPause = false
+			return
+		}
+		e.mechPause = true // mechanical: nobody pressed anything (m2-S2)
+		_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
 	}
-	e.autoPaused = true
-	e.snap.paused = true // mirror our post: heartbeats carry the pre-post state briefly
-	e.pausedBy = ""      // our own stall pause: no actor
-	e.lastPost = e.Clock.Now()
-	// the marker travels on the wire: the other side must not blame a
-	// human for a pause the room asked for by itself (m2-S2)
-	e.postDiscrete(room.Event{Type: "pause", Mechanical: true})
-	_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
+	e.emitUi(s, *s.Pos-expected)
 }
 
 func (e *Engine) emitUi(s mpv.State, drift float64) {
