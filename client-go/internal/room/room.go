@@ -42,9 +42,11 @@ type Event struct {
 }
 
 // readIdle bounds the SSE read silence before we declare the connection
-// dead and let the outer reconnect loop take over. 3× the server ping
-// interval so a single missed ping does not flap.
-var readIdle = 45 * time.Second
+// dead and let the outer reconnect loop take over. The server pings
+// every 15s: 25s covers one missed ping plus slack, so a single dropped
+// ping does not flap — but a laptop that slept does not stare at a stale
+// room for 45s.
+var readIdle = 25 * time.Second
 
 // Client is one room connection. The two http.Clients split timeouts:
 // SSE must live forever (ctx cancels it), calls are capped like client.py.
@@ -74,8 +76,10 @@ func New(base, id string) *Client {
 // Stream connects to /events and forwards decoded events to out until ctx
 // is cancelled. Own echoes (From == ID, except hello) are dropped and
 // malformed lines skipped, matching client.py's on_event / sse_loop.
-// onConnect (optional) fires once the HTTP stream is up — the reconnect
-// loop resets its backoff counter there (client.py parity).
+// onConnect (optional) fires when the server admits us with a hello —
+// not on the HTTP 200: a 200 with a dead SSE (POSTs still answer) proves
+// nothing, and resetting the reconnect backoff there would hammer the
+// server (m2-S4).
 func (c *Client) Stream(ctx context.Context, nick string, out chan<- Event, onConnect ...func()) error {
 	u := fmt.Sprintf("%s/events?id=%s&nick=%s", c.Base, url.QueryEscape(c.ID), url.QueryEscape(nick))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -87,9 +91,7 @@ func (c *Client) Stream(ctx context.Context, nick string, out chan<- Event, onCo
 		return err
 	}
 	defer resp.Body.Close()
-	if len(onConnect) > 0 {
-		onConnect[0]()
-	}
+	connected := false
 	// Watchdog: closes the body if no scanner progress for readIdle, so
 	// the scanner errors out and the outer reconnect backoff takes over.
 	// Go's stdlib has no client-side per-read deadline API (NewResponseController
@@ -144,6 +146,10 @@ func (c *Client) Stream(ctx context.Context, nick string, out chan<- Event, onCo
 		var ev Event
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(payload, " ")), &ev); err != nil {
 			continue
+		}
+		if ev.Type == "hello" && !connected && len(onConnect) > 0 {
+			connected = true
+			onConnect[0]() // the server admitted us: the backoff starts over
 		}
 		// hello carries no from; a notice deliberately names its subject
 		// with from (the impostor's id) — both must pass the own-echo filter
