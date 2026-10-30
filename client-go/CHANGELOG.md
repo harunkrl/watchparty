@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.4.1 — quiet exits, honest dashboards
+
+- client: a clean quit exits 0 again — a signal goroutine raced the
+  clean shutdown and usually won (4 of 5 runs exited 1), which could
+  also swallow the friend-flow "mpv exited — press Enter" notice; the
+  signal path still exits 1 and a second ctrl+c always wins
+- client: mpv is never left behind on a double-close — Close waits for
+  the reap (pinned on unix and as a platform-neutral test)
+- client: a mechanical stall pause is labeled "(stall)" in the system
+  log too — the chip and the log no longer disagree about who paused
+- client: the dashboard bar click maps to the cell you clicked (was
+  one column off); the stale-heartbeat chip says "no room heartbeat"
+  instead of blaming the master; NOW PLAYING shows the ROOM's state at
+  a stall (no 2s "playing" lie)
+- client: last-server.txt is written atomically and a UTF-16 copy
+  (old Notepad) is decoded instead of read as garbage
+- client (tests): the named-pipe IPC layer gets platform-neutral pins
+  (batch round-trip, timeouts, dead-IPC, event drop) that also run in
+  the windows CI job
+- server: an unreadable videos dir at startup no longer wipes the
+  restored room — same "cannot read ≠ empty" rule as runtime listings
+- server: CLAIM_FRESH_MS=0 is expressible ("always stale" for tests);
+  whitespace/garbage values fall back to the default
+- ci: the release gate runs the windows tests before a tag ships, has
+  per-job timeouts, validates itself on PRs, and the go test jobs
+  install mpv so the exit-code contract is measured in CI; the
+  linux/macOS zips carry a one-line usage note instead of the Windows
+  README
+- docs: README catches up with v1.4.0 semantics (mechanical stall,
+  claim freshness, the current test list) and notes the unix terminal
+  background-color query
+
 ## v1.4.0 — the room does not blame the innocent
 
 - client (sync): a follower may only pause the room when the master is
