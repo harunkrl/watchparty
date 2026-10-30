@@ -31,12 +31,24 @@ const state = { now: null, queue: [], pos: null, paused: false, posAt: 0, dur: n
 // S1: natural sort — "movie2" lists before "movie10" (numeric collation,
 // locale pinned to 'en' so a host locale change cannot reorder listings)
 const natural = new Intl.Collator('en', { numeric: true }).compare;
-const list = () => fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort(natural);
+// w1-1: the videos dir can vanish/unmount at runtime; an unguarded readdir
+// here would crash the process from EVERY listing path (/files /subs /library,
+// load/enqueue gates, advanceQueue) — same crash class the /v stat guard covers
+// null (NOT []) on failure: callers distinguish "empty dir" from "cannot
+// read" (I-3) — the HTTP listings map null to [], advanceQueue keeps the
+// queue on a transient read failure instead of wiping it
+const list = () => {
+  try { return fs.readdirSync(VIDEOS).filter((f) => VIDEO_RE.test(f)).sort(natural); }
+  catch (e) { console.error(`watchparty: videos dir unreadable (${e.message})`); return null; }
+};
 // R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) live next to the
 // videos; the client lists them per load and lets each user pick a track
 // locally — subtitle choice never enters the sync layer
 const SUB_RE = /\.(srt|ass|ssa|vtt)$/i;
-const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort(natural);
+const listSubs = () => {
+  try { return fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort(natural); }
+  catch { return []; } // same dir condition as list(); its warning covers both
+};
 
 // S-A/S-C: the invite URLs only the server can know — a client may sit on
 // another host, so hello points at dialable IPv4s instead of localhost.
@@ -46,16 +58,19 @@ const listSubs = () => fs.readdirSync(VIDEOS).filter((f) => SUB_RE.test(f)).sort
 // goal). shortcut: docker's 172.16/12 ranks below the other RFC1918 ranges
 // (bridges are rarely the address a friend can reach) — it is only picked
 // when no other private address exists. Loopback only as the last resort.
-function inviteHosts() {
+// gap#5: the interfaces parameter makes the ranking unit-testable; production
+// code always calls it without arguments.
+function inviteHosts(interfaces = os.networkInterfaces()) {
   const oct = (a) => a.split('.').map(Number);
   const isCgnat = ([o1, o2]) => o1 === 100 && o2 >= 64 && o2 <= 127;
   const isDocker = ([o1, o2]) => o1 === 172 && o2 >= 16 && o2 <= 31;
   const isPrivate = ([o1, o2]) => o1 === 10 || (o1 === 192 && o2 === 168) || isDocker([o1, o2]);
   const cands = [];
-  for (const ifs of Object.values(os.networkInterfaces())) {
+  for (const ifs of Object.values(interfaces)) {
     // some platforms return undefined entries (H): never crash the /events handler
     for (const it of ifs || []) {
-      if (it.family !== 'IPv4' || it.internal) continue;
+      // an entry itself can be undefined on some platforms (H): skip it
+      if (!it || it.family !== 'IPv4' || it.internal) continue;
       const o = oct(it.address);
       // 0 CGNAT/tailscale · 1 RFC1918 · 2 docker 172.16/12 · 3 other non-internal
       const r = isCgnat(o) ? 0 : isPrivate(o) && !isDocker(o) ? 1 : isDocker(o) ? 2 : 3;
@@ -115,12 +130,12 @@ function flushState() {
     fs.rename(tmp, STATE_FILE, (e) => { if (e) persistFail(e); }); // atomic: no torn state.json
   });
 }
-process.on('SIGTERM', () => {
+const persistAndExit = () => {
   if (persistOK && stateDirty) {
     try { fs.writeFileSync(STATE_FILE, stateSnapshot()); } catch { /* best effort */ }
   }
   process.exit(0);
-});
+};
 (function restoreState() {
   let saved;
   try {
@@ -129,7 +144,7 @@ process.on('SIGTERM', () => {
     if (e.code !== 'ENOENT') console.error(`watchparty: state restore failed (${e.message})`);
     return;
   }
-  const files = list();
+  const files = list() || []; // restore on an unreadable dir starts empty
   state.queue = Array.isArray(saved.queue) ? saved.queue.filter((n) => files.includes(n)) : [];
   if (saved.now && files.includes(saved.now)) {
     state.now = saved.now;
@@ -175,16 +190,20 @@ function isClockOwner(from) {
     impostorSeen.add(from);
     broadcast({
       type: 'notice',
-      from, // the impostor's id: named clients demote themselves to follower
-      text: `two masters: ${nickById.get(clockOwner) || clockOwner} owns the clock; ignoring ${nickById.get(from) || from}`,
+      // raw ids: named clients demote themselves to follower on this field
+      // (never clean it — the client compares it to its own id)
+      from,
+      // w1-2: the text fallbacks embed client-supplied ids — same trust
+      // boundary as the cmd trace, no raw ANSI/OSC may reach a TUI
+      text: `two masters: ${nickById.get(clockOwner) || clean(clockOwner, 32)} owns the clock; ignoring ${nickById.get(from) || clean(from, 32)}`,
     });
   }
   return false;
 }
 
-// A2: room-wide cooldown — the idle notice explains a no-op, it must not
+// A2: room-wide cooldown — the queue notices explain a no-op, they must not
 // become an amplifier for a stuck key or a hostile loop
-let lastIdleNotice = -Infinity;
+let lastQueueNotice = -Infinity;
 
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
@@ -192,15 +211,35 @@ function advanceQueue(byNick) {
   if (!state.now) {
     // S2: idle skip/ended stays a no-op, but explains itself (every client
     // renders notices; the queue keeps waiting)
-    if (mono() - lastIdleNotice > 2000) {
-      lastIdleNotice = mono();
+    if (mono() - lastQueueNotice > 2000) {
+      lastQueueNotice = mono();
       broadcast({ type: 'notice', from: null, text: 'nothing playing; queue keeps waiting' });
     }
     return;
   }
   // enqueue checked the disk, but a file may have vanished since; never
-  // auto-advance into a 404 that would hijack state.now
-  state.queue = state.queue.filter((n) => list().includes(n));
+  // auto-advance into a 404 that would hijack state.now. A null listing
+  // (I-3: transient readdir failure) skips the filter — one bad read must
+  // not wipe the queue or announce end of queue; the next turn re-checks.
+  const files = list();
+  if (files) {
+    const hadQueue = state.queue.length > 0;
+    state.queue = state.queue.filter((n) => files.includes(n));
+    if (!state.queue.length) {
+      // I2/w1-4: the queue emptying must be visible — a vanished last file
+      // would otherwise leave a ghost queue on connected clients. The notice
+      // rides the same transition (I-4): a skip on an ALREADY empty queue
+      // stays quiet — repeating it explains nothing new.
+      if (hadQueue) {
+        broadcast({ type: 'queue', queue: state.queue });
+        if (mono() - lastQueueNotice > 2000) {
+          lastQueueNotice = mono();
+          broadcast({ type: 'notice', from: null, text: 'end of queue' });
+        }
+      }
+      return;
+    }
+  }
   if (state.queue.length) {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
@@ -258,7 +297,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'load':
-      if (!list().includes(cmd.name)) break;
+      if (!(list() || []).includes(cmd.name)) break; // null listing (w1-1): cannot verify, no-op
       state.now = cmd.name;
       state.pos = null; // old file's position is meaningless now
       state.dur = null; // so is its duration
@@ -270,7 +309,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'enqueue':
-      if (list().includes(cmd.name) && !state.queue.includes(cmd.name) && cmd.name !== state.now) {
+      if ((list() || []).includes(cmd.name) && !state.queue.includes(cmd.name) && cmd.name !== state.now) {
         state.queue.push(cmd.name);
         const ev = { type: 'queue', queue: state.queue };
         const enqNick = nickById.get(cmd.from);
@@ -353,7 +392,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && u.pathname === '/files') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify(list()));
+    return res.end(JSON.stringify(list() || [])); // null on readdir failure (w1-1)
   }
 
   if (req.method === 'GET' && u.pathname === '/subs') {
@@ -365,7 +404,7 @@ const server = http.createServer((req, res) => {
   // belongs to a video when its name starts with <video stem + ".">
   if (req.method === 'GET' && u.pathname === '/library') {
     const subs = listSubs();
-    const library = list().map((f) => {
+    const library = (list() || []).map((f) => {
       const stem = f.slice(0, f.length - path.extname(f).length);
       return { name: f, subs: subs.filter((s) => s.startsWith(`${stem}.`)) };
     });
@@ -497,6 +536,14 @@ const server = http.createServer((req, res) => {
   res.end();
 });
 
-server.listen(PORT, () =>
-  console.log(`watchparty: serving ${VIDEOS} on http://0.0.0.0:${PORT} (tailnet only, no auth)`)
-);
+// gap#5: tests require() this file for inviteHosts; only the real entry
+// point listens and registers signal handlers (I-2: a leaked persistAndExit
+// would exit(0) the REQUIRING process on its own SIGINT/SIGTERM)
+module.exports = { inviteHosts };
+if (require.main === module) {
+  process.on('SIGTERM', persistAndExit);
+  process.on('SIGINT', persistAndExit); // m2-S6: Ctrl-C on a manual run must persist too
+  server.listen(PORT, () =>
+    console.log(`watchparty: serving ${VIDEOS} on http://0.0.0.0:${PORT} (tailnet only, no auth)`)
+  );
+}
