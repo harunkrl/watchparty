@@ -94,6 +94,11 @@ type Player struct {
 	pend     map[int]chan ipcMsg
 	seq      int
 	stderrCh chan string // mpv's stderr lines, bounded (the ring)
+	// closeOnce makes Close idempotent; closeDone makes a second caller
+	// WAIT for the first one: the process must not exit while mpv is
+	// still being reaped (an orphan mpv is worse than a slow exit).
+	closeOnce sync.Once
+	closeDone chan struct{}
 }
 
 // stderrRingMax is how many mpv stderr lines we keep: mpv must never
@@ -789,22 +794,32 @@ func (p *Player) Poll(ctx context.Context, period time.Duration, out chan<- Stat
 }
 
 // Close reaps mpv: SIGTERM, 2s grace, then Kill — orphaned mpv must be
-// impossible (risk C) — and removes the temp socket dir.
+// impossible (risk C) — and removes the temp socket dir. It is safe to
+// call twice (the clean path and the signal path can both reach it) and
+// a second caller WAITS for the first one to finish: the process must
+// not exit while mpv is still being reaped (master-2 P2-1).
 func (p *Player) Close() {
-	p.mu.Lock()
-	p.closed = true // from here on a dead conn is expected, not a crash
-	p.mu.Unlock()
-	if p.conn != nil {
-		p.conn.Close() // unblocks the reader and any pending cmd
-	}
-	if p.proc != nil && p.proc.Process != nil {
-		_ = terminate(p.proc.Process)
-		select {
-		case <-p.exited:
-		case <-time.After(2 * time.Second):
-			_ = p.proc.Process.Kill()
-			<-p.exited
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		if p.closeDone == nil {
+			p.closeDone = make(chan struct{})
 		}
-	}
-	os.RemoveAll(p.dir)
+		p.closed = true // from here on a dead conn is expected, not a crash
+		p.mu.Unlock()
+		defer close(p.closeDone)
+		if p.conn != nil {
+			p.conn.Close() // unblocks the reader and any pending cmd
+		}
+		if p.proc != nil && p.proc.Process != nil {
+			_ = terminate(p.proc.Process)
+			select {
+			case <-p.exited:
+			case <-time.After(2 * time.Second):
+				_ = p.proc.Process.Kill()
+				<-p.exited
+			}
+		}
+		os.RemoveAll(p.dir)
+	})
+	<-p.closeDone
 }

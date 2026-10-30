@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -98,12 +100,28 @@ func main() {
 	chRoom := make(chan room.Event, 16) // SSE -> dispatcher/engine + ui
 	chMpv := make(chan mpv.State, 8)    // mpv poller -> sync engine
 	chUi := make(chan sync.UiState, 8)  // sync -> ui status bar
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The signal path is SEPARATE from the context. With
+	// signal.NotifyContext the clean shutdown's cancel() looked like a
+	// signal: the goroutine below woke up and its os.Exit(1) usually won
+	// the race -> clean runs exited 1 and the friend-flow notice was
+	// skipped (A5 W1). Now only a REAL signal reaches the goroutine, and
+	// the exit gate keeps a late signal from stealing the clean exit.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigc)
+	gate := &exitGate{}
 	go func() { // SIGTERM while headless blocks in the stdin scanner:
 		// without this the client dies and leaves its mpv orphaned (153 of
 		// them piled up on the test box in one day)
-		<-ctx.Done()
+		first := <-sigc
+		if swallowSignal(gate.cleanOwnsExit(), first) {
+			// The clean shutdown owns the exit: the friend-flow notice
+			// must be printed and read. The first ctrl+c is swallowed, the
+			// next signal wins.
+			<-sigc
+		}
 		player.Close()
 		os.Exit(1)
 	}()
@@ -149,7 +167,8 @@ func main() {
 				mpvExited.Store(true)
 				if *headless {
 					fmt.Fprintln(os.Stderr, "> mpv exited or stopped talking - restart the client")
-					stop()
+					gate.beginClean() // this path owns the exit from here
+					cancel()
 					player.Close()
 					os.Exit(1)
 				}
@@ -185,7 +204,8 @@ func main() {
 
 	if *headless {
 		err := ui.Run(*name, api, player, engine, chRoom, os.Stdin, os.Stdout)
-		stop()
+		gate.beginClean()
+		cancel()
 		player.Close()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -225,15 +245,17 @@ func main() {
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		stop()
+		gate.beginClean() // this path owns the exit from here
+		cancel()
 		player.Close()
 		if friendFlow {
 			waitForEnter()
 		}
 		os.Exit(1)
 	}
-	stop()         // risk H: cancel ctx first, ...
-	player.Close() // ...then reap mpv (TERM -> 2s -> Kill, risk C)
+	gate.beginClean() // from here on the clean path owns the exit
+	cancel()          // risk H: cancel ctx first, ...
+	player.Close()    // ...then reap mpv (TERM -> 2s -> Kill, risk C)
 	if note := mpvExitNotice(friendFlow, mpvExited.Load()); note != "" {
 		// the console closes with the process: the reason must be read
 		fmt.Fprintln(os.Stderr, note)
@@ -374,6 +396,28 @@ func defaultLastServerPath() string {
 // lastServer is the remembered server URL and nick.
 type lastServer struct{ URL, Nick string }
 
+// exitGate decides who owns the process exit. The clean shutdown marks
+// itself first: after that a late signal must not steal the exit — the
+// friend-flow notice still has to be printed and the exit code must stay
+// 0 (A5 W1). Before the gate the signal goroutine's os.Exit(1) usually
+// won the race with the clean path.
+type exitGate struct{ clean atomic.Bool }
+
+// beginClean: the clean shutdown has started — it owns the exit now.
+func (g *exitGate) beginClean() { g.clean.Store(true) }
+
+// cleanOwnsExit: the clean shutdown owns the exit (a late signal must
+// not steal it).
+func (g *exitGate) cleanOwnsExit() bool { return g.clean.Load() }
+
+// swallowSignal: the clean shutdown owns the exit, so a ctrl+c there is
+// swallowed once — the friend may still be reading the notice. The NEXT
+// signal wins. A SIGTERM (the console window closed) always wins: there
+// is no console left to read anything.
+func swallowSignal(cleanOwnsExit bool, first os.Signal) bool {
+	return cleanOwnsExit && first == os.Interrupt
+}
+
 // loadLastServer reads the remembered server file (empty when there is
 // none or it cannot be read).
 func loadLastServer() lastServer {
@@ -385,7 +429,7 @@ func loadLastServer() lastServer {
 	if err != nil {
 		return lastServer{}
 	}
-	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	lines := strings.Split(strings.ReplaceAll(decodeRemembered(b), "\r\n", "\n"), "\n")
 	ls := lastServer{}
 	if len(lines) > 0 {
 		// a UTF-8 BOM (older Notepad writes one) must not end up in the URL
@@ -397,15 +441,48 @@ func loadLastServer() lastServer {
 	return ls
 }
 
+// decodeRemembered decodes the remembered file: the client writes UTF-8,
+// but an older Notepad saves UTF-16 (the BOM says which endianness) —
+// read as UTF-8 the URL would be garbage and the friend would start with
+// a nonsense default address (A5 W11).
+func decodeRemembered(b []byte) string {
+	switch {
+	case len(b) >= 2 && b[0] == 0xff && b[1] == 0xfe:
+		return decodeUTF16(b[2:], binary.LittleEndian)
+	case len(b) >= 2 && b[0] == 0xfe && b[1] == 0xff:
+		return decodeUTF16(b[2:], binary.BigEndian)
+	}
+	return string(b)
+}
+
+// decodeUTF16 turns UTF-16 code units into a Go string.
+func decodeUTF16(b []byte, order binary.ByteOrder) string {
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:i+2]))
+	}
+	return string(utf16.Decode(units))
+}
+
 // saveLastServer remembers the server and the nick for the next start
 // (best effort: a read-only folder must not break the run — the caller
-// warns and continues).
+// warns and continues). The write is atomic: a half-written file would
+// leave the next start with a truncated (garbage) address (A5 W11).
 func saveLastServer(url, nick string) error {
 	path := lastServerPath()
 	if path == "" {
 		return nil
 	}
-	return os.WriteFile(path, []byte(url+"\n"+nick+"\n"), 0o644)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(url+"\n"+nick+"\n"), 0o644); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // buildVersion reports the git commit this binary was built from

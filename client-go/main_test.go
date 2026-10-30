@@ -2,9 +2,12 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"unicode/utf16"
 )
 
 // W3: a friend types the host, not a URL.
@@ -136,4 +139,118 @@ func TestUsageHintIsHeldWithoutArgs(t *testing.T) {
 // build without a console has no code page at all).
 func TestSetConsoleUTF8IsSafe(t *testing.T) {
 	setConsoleUTF8()
+}
+
+// A5 W1: the clean shutdown owns the process exit. A late signal must
+// not steal it — that race made clean runs exit 1 and skipped the
+// friend-flow notice.
+func TestExitGateKeepsTheCleanPath(t *testing.T) {
+	g := &exitGate{}
+	if g.cleanOwnsExit() {
+		t.Fatal("before the clean shutdown the signal path owns the exit")
+	}
+	g.beginClean()
+	if !g.cleanOwnsExit() {
+		t.Fatal("the clean shutdown must own the exit once it started")
+	}
+}
+
+// A5 W1 (master-2 P3-a): during the friend-flow wait a ctrl+c must not
+// be swallowed forever — the next signal wins. A SIGTERM (the console
+// window closed) always wins.
+func TestSwallowSignal(t *testing.T) {
+	if !swallowSignal(true, os.Interrupt) {
+		t.Fatal("a ctrl+c during the clean shutdown must be swallowed once")
+	}
+	if swallowSignal(true, syscall.SIGTERM) {
+		t.Fatal("a closed console (SIGTERM) must always win")
+	}
+	if swallowSignal(false, os.Interrupt) {
+		t.Fatal("outside the clean shutdown a ctrl+c must win at once")
+	}
+}
+
+// A5 W1: a clean quit must leave with 0. The signal goroutine used to
+// win the race with the clean path and exit 1 (python parity: only an
+// mpv exit is nonzero).
+func TestCleanQuitExitsZero(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("no mpv in PATH")
+	}
+	bin := buildClient(t)
+	// headless + an immediate EOF on stdin: the clean path, no server needed
+	cmd := exec.Command(bin, "--headless", "--name", "tester", "http://127.0.0.1:1")
+	cmd.Stdin = strings.NewReader("")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a clean quit must exit 0, got %v:\n%s", err, out)
+	}
+}
+
+// buildClient compiles the client: the exit code is a property of the
+// process, it cannot be observed from inside it.
+func buildClient(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "watchparty")
+	cmd := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// A5 W11: an older Notepad saves the remembered file as UTF-16: the BOM
+// must be decoded, not read as garbage (the friend would start with a
+// nonsense default address).
+func TestLastServerReadsUTF16(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "last-server.txt")
+	var b []byte
+	b = append(b, 0xff, 0xfe) // UTF-16 LE, BOM
+	for _, u := range utf16.Encode([]rune("http://10.0.0.5:8090\r\nada\r\n")) {
+		b = append(b, byte(u), byte(u>>8))
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := lastServerPath
+	lastServerPath = func() string { return path }
+	defer func() { lastServerPath = old }()
+
+	got := loadLastServer()
+	if got.URL != "http://10.0.0.5:8090" {
+		t.Fatalf("the UTF-16 file was not decoded: %q", got.URL)
+	}
+	if got.Nick != "ada" {
+		t.Fatalf("the UTF-16 nick was not decoded: %q", got.Nick)
+	}
+}
+
+// A5 W11: the write is atomic: the temp file must not survive and the
+// target must hold the whole address (a half-written file would leave
+// the next start with a truncated address).
+func TestSaveLastServerLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "last-server.txt")
+	old := lastServerPath
+	lastServerPath = func() string { return path }
+	defer func() { lastServerPath = old }()
+
+	if err := saveLastServer("http://10.0.0.5:8090", "ada"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "last-server.txt" {
+		t.Fatalf("the atomic write left something behind: %v", entries)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "http://10.0.0.5:8090\nada\n" {
+		t.Fatalf("the remembered file is not complete: %q", string(b))
+	}
 }
