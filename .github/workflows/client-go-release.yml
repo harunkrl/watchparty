@@ -45,6 +45,7 @@ jobs:
           node tests/audit_server.mjs
           node tests/audit2_server.mjs
           node tests/audit3_server.mjs
+          node tests/f2_server.mjs
           node tests/f1_server.mjs
           node tests/integration.mjs
           node tests/pause_sync.mjs
