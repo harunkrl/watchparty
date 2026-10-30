@@ -8,7 +8,7 @@
 //                                    [--server server.js] [--silence 12]
 // Needs: node, ffmpeg and the built client binary.
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,17 @@ const OPT = {
   silence: Number(arg('--silence', 12)), // seconds of a silent master (> staleAge 6s)
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A5-5: the f2 guard pattern — this suite needs mpv, ffmpeg and the built
+// client binary; without them it must SKIP, not FAIL (CI installs mpv+ffmpeg
+// before running it, so only local runs take the skip path).
+const has = (bin) => {
+  try { execSync(`command -v ${bin}`, { stdio: 'ignore' }); return true; } catch { return false; }
+};
+if (!(has('mpv') && has('ffmpeg') && existsSync(OPT.bin))) {
+  console.log('SKIP: stall_family needs mpv, ffmpeg and the client binary (--bin)');
+  process.exit(0);
+}
 const children = [];
 const cleanup = () => { for (const c of children) { try { c.kill('SIGKILL'); } catch {} } };
 process.on('SIGINT', () => { cleanup(); process.exit(130); });
