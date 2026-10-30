@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // G2: the reconnect steps get a ±20% jitter, and the jitter never
@@ -301,3 +304,71 @@ func TestSaveLastServerLeavesNoTempFile(t *testing.T) {
 		t.Fatalf("the remembered file is not complete: %q", string(b))
 	}
 }
+
+// --- FREEZE-2: a log must never block the event loop --------------------
+
+// The TUI froze because a log was sent to the program from INSIDE the
+// event loop: bubbletea's message channel is unbuffered, so p.Send from
+// within Update waits for a loop that is itself waiting for the Send.
+// The log path must ride a channel and a drainer goroutine.
+func TestTheProgramSurvivesALogInsideUpdate(t *testing.T) {
+	inR, inW := io.Pipe() // the input stays open: the program must not quit on EOF
+	defer inW.Close()
+	p := tea.NewProgram(&freezeModel{}, tea.WithInput(inR), tea.WithOutput(io.Discard))
+	done := make(chan error, 1)
+	go func() { _, err := p.Run(); done <- err }()
+	logger := programLogger(p) // the production log path
+	p.Send(logMsg{log: logger})
+	go p.Quit() // in a goroutine: a frozen program must not hang the test
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the program froze: a log inside Update blocked the event loop")
+	}
+}
+
+// A full log channel drops the line instead of blocking the caller.
+func TestLogPumpDropsInsteadOfBlocking(t *testing.T) {
+	pump := newLogPump(func(string) { t.Error("the drainer must not run") })
+	for i := 0; i < logPumpSize+10; i++ {
+		pump.logf("> line %d", i)
+	}
+	if len(pump.ch) != logPumpSize {
+		t.Fatalf("the pump holds %d lines, want %d", len(pump.ch), logPumpSize)
+	}
+}
+
+// The drainer delivers the queued lines to the program, in order.
+func TestLogPumpDrainsToTheProgram(t *testing.T) {
+	got := make(chan string, 8)
+	pump := newLogPump(func(line string) { got <- line })
+	go pump.drain()
+	pump.logf("> first")
+	pump.logf("> second")
+	for _, want := range []string{"> first", "> second"} {
+		select {
+		case line := <-got:
+			if line != want {
+				t.Fatalf("the program got %q, want %q", line, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("the program never got %q", want)
+		}
+	}
+}
+
+// logMsg carries the logger into the event loop: the model logs from
+// inside Update, like the engine does on ctrl+space.
+type logMsg struct{ log func(string, ...any) }
+
+// freezeModel is a program that logs from inside its Update.
+type freezeModel struct{}
+
+func (m *freezeModel) Init() tea.Cmd { return nil }
+func (m *freezeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if lm, ok := msg.(logMsg); ok {
+		lm.log("> pause") // the path that froze the TUI
+	}
+	return m, nil
+}
+func (m *freezeModel) View() string { return "freeze" }

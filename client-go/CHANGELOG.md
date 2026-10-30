@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.5.3 — the UI can no longer deadlock on its own logs
+
+- client: ctrl+space/seek could freeze the dashboard forever: a log
+  line sent from inside the key handler (Update → PauseToggle → log)
+  called p.Send on a full program buffer, and the event loop waited
+  for the very Send it had to consume (FREEZE-2, reproduced with a
+  goroutine dump). All engine and mpv logs now ride a pump with its
+  own drainer goroutine: a full pump drops diagnostic lines instead
+  of blocking, and a real-tea.Program pin breaks in 5s on the old
+  wiring (pre-fix binary freezes on the first ctrl+space in the pty
+  harness; post-fix the event loop stays idle-alive)
+- client: a frozen client still exits on ctrl+c — the signal path
+  never needed the event loop (measured: exit within 10s incl. the
+  ≤2s post drain)
+
 ## v1.5.2 — a picker for the queue, a UI that never freezes
 
 - client: bare /queue and /play open the file picker in the matching

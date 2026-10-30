@@ -174,10 +174,10 @@ func main() {
 	} else {
 		// engine logs must go through the program: writing to stderr while
 		// the bubbletea renderer owns the screen corrupts the frame
-		engine.Logf = func(f string, a ...any) { p.Send(ui.EngineLogMsg{Line: fmt.Sprintf(f, a...)}) }
 		p = tea.NewProgram(ui.New(*name, api, player, *master, engine), // set before goroutines: they Send on it
 			tea.WithAltScreen(),       // the dashboard owns the full viewport: the header can never scroll off
 			tea.WithMouseCellMotion()) // wheel scrolls chat; clicks on the bar seek
+		engine.Logf = programLogger(p)
 	}
 	// the player's diagnostics go the same way: stderr would corrupt the frame
 	player.SetLogf(engine.Logf)
@@ -433,6 +433,51 @@ func defaultLastServerPath() string {
 
 // lastServer is the remembered server URL and nick.
 type lastServer struct{ URL, Nick string }
+
+// logPumpSize is the log backlog the program can hold: past that the
+// lines are dropped (the logs are diagnostics, the UI must stay alive).
+const logPumpSize = 256
+
+// logPump hands the engine's logs to the program from its own goroutine.
+// p.Send from inside Update deadlocks when the program's message buffer
+// is full: the event loop waits for the Send to return, the Send waits
+// for the loop to consume (FREEZE-2).
+type logPump struct {
+	ch   chan string
+	send func(string)
+}
+
+func newLogPump(send func(string)) *logPump {
+	return &logPump{ch: make(chan string, logPumpSize), send: send}
+}
+
+// logf never blocks: a full channel drops the line.
+func (l *logPump) logf(f string, a ...any) {
+	select {
+	case l.ch <- fmt.Sprintf(f, a...):
+	default:
+	}
+}
+
+// drain delivers the queued lines to the program (its own goroutine).
+// shortcut: the channel is never closed, so up to logPumpSize lines queued
+// at quit are lost (incl. the "post: N event(s) lost" notice, which rides
+// this pump too); acceptable — logs are diagnostics and p.Send after the
+// program exits returns immediately, so the goroutine cannot hang shutdown.
+func (l *logPump) drain() {
+	for line := range l.ch {
+		l.send(line)
+	}
+}
+
+// programLogger returns the engine's logger for the TUI: the logs ride a
+// channel and a drainer goroutine does the Send, so no log can ever block
+// the event loop (FREEZE-2).
+func programLogger(p *tea.Program) func(string, ...any) {
+	pump := newLogPump(func(line string) { p.Send(ui.EngineLogMsg{Line: line}) })
+	go pump.drain()
+	return pump.logf
+}
 
 // exitGate decides who owns the process exit. The clean shutdown marks
 // itself first: after that a late signal must not steal the exit — the
