@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.6.0 — keys for a whole movie
+
+- client (ui): ctrl+shift+←/→ seek ±30s — the second cadence: ctrl+←/→
+  stays the ±5s nudge, the shift pair jumps whole scenes
+- client (ui): alt+p play/pause and alt+←/→ ±5s — conhost-proof aliases
+  for the ctrl keys Windows terminals mangle (bubbletea parses them as
+  alt+…, ESC[1;3D); they drive the exact same room actions
+- client (ui): ctrl+↑/↓ volume ±5 and alt+m mute — LOCAL audio keys: the
+  room is never told (audio belongs to the viewer's ears; syncing it
+  would fight every other viewer's volume). ctrl+m is impossible by
+  physics — terminals send CR for it (== enter) — so alt carries the
+  mute key
+- client (ui): F1 toggles a passive keys overlay — while it is up every
+  other key keeps working and only F1/esc close it. Plain "?" is banned
+  on purpose: the chat input would eat it ("?merhaba" must stay
+  typeable). F1 works in the picker too; the hotbar grew [ctrl+shift+←/→]
+  and [F1 keys] and shed [tab]/[ctrl+z]/[ctrl+g] to fit the 100-column
+  dashboard (they live in the overlay and /help)
+- client (mpv): volume/mute ride mpv's own add/cycle property commands
+  over the fire-and-forget tell path — no read-first round trip; the 2s
+  poll names the real value in the stats bar while the log line confirms
+  the key instantly
+
 ## v1.5.3 — the UI can no longer deadlock on its own logs
 
 - client: ctrl+space/seek could freeze the dashboard forever: a log

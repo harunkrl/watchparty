@@ -27,6 +27,8 @@ func (stubPlayer) Seek(float64) error         { return nil }
 func (stubPlayer) Speed(float64) error        { return nil }
 func (stubPlayer) ShowText(string, int) error { return nil }
 func (stubPlayer) Pos() (float64, bool)       { return 0, false }
+func (stubPlayer) SetVolume(float64) error    { return nil }
+func (stubPlayer) ToggleMute() error          { return nil }
 
 func TestHeadlessBareTextIsChat(t *testing.T) {
 	posted := make(chan room.Event, 4)

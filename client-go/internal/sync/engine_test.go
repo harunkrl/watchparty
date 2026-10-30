@@ -18,6 +18,8 @@ type fakePlayer struct {
 	seeks    []float64
 	speeds   []float64
 	showText []string
+	vols     []float64 // F5 local volume nudges
+	mutes    int       // F5 mute toggles
 	pos      *float64
 	loadErr  error // returned by Load to simulate a failed loadfile
 }

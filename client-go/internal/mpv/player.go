@@ -646,6 +646,19 @@ func (p *Player) SetPause(paused bool) error {
 	return p.tell("set_property", "pause", paused)
 }
 
+// SetVolume nudges the audio volume by delta percent over mpv's own add
+// property command (clamped by mpv): F5's local audio keys. Tell-only —
+// no round trip; the next poll reports the real value to the stats bar.
+func (p *Player) SetVolume(delta float64) error {
+	return p.tell("add", "volume", delta)
+}
+
+// ToggleMute cycles the mute flag (tell-only, same deal as SetVolume: the
+// next poll names the real state — no read-first round trip).
+func (p *Player) ToggleMute() error {
+	return p.tell("cycle", "mute")
+}
+
 func (p *Player) Seek(t float64) error {
 	return p.tell("seek", t, "absolute")
 }

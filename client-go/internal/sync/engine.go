@@ -16,6 +16,7 @@ const (
 	PollSecs           = 2.0 // mpv poll period (master heartbeat cadence)
 	Tolerance          = 1.0 // follower drift threshold before re-seek
 	SeekScrubThreshold = 3.0 // |pos - last_pos - PollSecs| beyond this = scrub
+	volStep            = 5.0 // F5 local volume nudge (ctrl+up/down), percent
 )
 
 // Smooth-sync band: inside (speedBand, Tolerance] the follower nudges mpv's
@@ -98,6 +99,10 @@ type Player interface {
 	Speed(f float64) error
 	ShowText(text string, ms int) error
 	Pos() (float64, bool)
+	// F5 local audio keys: nudge volume / cycle mute. The engine never
+	// posts these — audio belongs to the viewer's ears, not the room.
+	SetVolume(delta float64) error
+	ToggleMute() error
 }
 
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
@@ -132,6 +137,7 @@ type Engine struct {
 
 	lastPos   *float64
 	lastPause bool
+	muted     bool // last polled mpv mute flag: the mute log names the state we expect
 	wasActive bool
 	pausedBy  string    // who paused the room (the relay's nick); "" = our own action
 	snap      *snapshot // follower: latest master position heartbeat
@@ -613,6 +619,47 @@ func (e *Engine) SeekTo(t float64) {
 	}
 }
 
+// VolumeUp/VolumeDown/VolumeMute are LOCAL audio keys: the volume belongs
+// to the viewer's own machine and ears — the room is never told (F5 "keys
+// for a whole movie": syncing personal audio would fight every other
+// viewer's volume). The fire-and-forget player calls keep the hotkey
+// instant; the next poll names the real value in the stats bar.
+func (e *Engine) VolumeUp()   { e.volumeNudge(volStep) }
+func (e *Engine) VolumeDown() { e.volumeNudge(-volStep) }
+
+func (e *Engine) volumeNudge(delta float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Player == nil {
+		return
+	}
+	if err := e.Player.SetVolume(delta); err != nil {
+		e.logf("> vol: mpv refused (%v)", err)
+		return
+	}
+	e.logf("> vol %+.0f", delta)
+}
+
+// VolumeMute cycles mpv's mute: the log names the state we EXPECT (the
+// last poll's flag flipped); the next poll corrects any staleness.
+func (e *Engine) VolumeMute() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Player == nil {
+		return
+	}
+	if err := e.Player.ToggleMute(); err != nil {
+		e.logf("> mute: mpv refused (%v)", err)
+		return
+	}
+	e.muted = !e.muted
+	if e.muted {
+		e.logf("> muted")
+	} else {
+		e.logf("> unmuted")
+	}
+}
+
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()
@@ -627,6 +674,7 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	if s.Dur > 0 {
 		e.dur = s.Dur // the locally known media duration (F1 clamp)
 	}
+	e.muted = s.Muted // the mute log names the state we expect (F5)
 	// EOF transition (either role): at idle mpv keeps pause=false and drops
 	// time-pos, so without this the UI sits on a stale ▶ forever. Ended
 	// reads as paused until the next load.

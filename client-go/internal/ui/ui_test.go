@@ -98,8 +98,11 @@ func TestSlashCommands(t *testing.T) {
 	}
 	m.input.SetValue("/")
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if !strings.Contains(m.View(), "plain text is chat") {
-		t.Fatalf("lone / did not show usage:\n%s", m.View())
+	// F5: the usage line grew (the new keys) — assert the LOGGED usage, not
+	// the rendered system-tail position: a mid-string fragment scrolls out
+	// of the tail window as the line wraps further.
+	if !strings.Contains(strings.Join(logTexts(m.log), "\n"), "plain text is chat") {
+		t.Fatalf("lone / did not show usage:\n%s", strings.Join(logTexts(m.log), "\n"))
 	}
 }
 
@@ -1330,12 +1333,16 @@ func TestSystemTailHasThirtyLines(t *testing.T) {
 	}
 }
 
-// H8: all six hotbar items fit in the narrowest dashboard (100 columns).
+// H8: the hotbar fits the narrowest dashboard (100 columns). F5 grew the
+// keys (the ±30s cadence + the keys sheet) and the 100-col line cannot
+// carry eight items: the layout toggles (ctrl+z/ctrl+g) and the completion
+// menu (tab) moved to the F1 overlay and /help — the bar keeps the
+// playback/seek/browser/sheet essentials.
 func TestHotbarFitsNarrowDashboard(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 100, Height: 20})
 	v := m.View()
-	for _, want := range []string{"[tab]", "[ctrl+g]", "[ctrl+space]", "[ctrl+p]"} {
+	for _, want := range []string{"[ctrl+space]", "[ctrl+p]", "[ctrl+shift+←/→]", "[F1 keys]"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("the hotbar misses %q:\n%s", want, v)
 		}

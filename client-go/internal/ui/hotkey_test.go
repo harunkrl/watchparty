@@ -15,6 +15,10 @@ import (
 type recPlayer struct {
 	pauses []bool
 	seeks  []float64
+	vols   []float64 // F5 local volume nudges
+	mutes  int       // F5 mute toggles
+	pos    float64
+	hasPos bool
 }
 
 func (p *recPlayer) Load(string) error          { return nil }
@@ -22,7 +26,12 @@ func (p *recPlayer) SetPause(v bool) error      { p.pauses = append(p.pauses, v)
 func (p *recPlayer) Seek(t float64) error       { p.seeks = append(p.seeks, t); return nil }
 func (p *recPlayer) Speed(float64) error        { return nil }
 func (p *recPlayer) ShowText(string, int) error { return nil }
-func (p *recPlayer) Pos() (float64, bool)       { return 0, false }
+func (p *recPlayer) SetVolume(delta float64) error {
+	p.vols = append(p.vols, delta)
+	return nil
+}
+func (p *recPlayer) ToggleMute() error    { p.mutes++; return nil }
+func (p *recPlayer) Pos() (float64, bool) { return p.pos, p.hasPos }
 
 // W1: on Windows bubbletea delivers ctrl+space as a NUL rune (KeyRunes),
 // not as "ctrl+@" — the room play/pause hotkey must work for both, and

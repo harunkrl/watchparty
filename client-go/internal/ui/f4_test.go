@@ -176,6 +176,8 @@ func (p *matrixPlayer) Seek(t float64) error       { p.seeks = append(p.seeks, t
 func (p *matrixPlayer) Speed(float64) error        { return nil }
 func (p *matrixPlayer) ShowText(string, int) error { return nil }
 func (p *matrixPlayer) Pos() (float64, bool)       { return 30, true } // the seek needs a position
+func (p *matrixPlayer) SetVolume(float64) error    { return nil }
+func (p *matrixPlayer) ToggleMute() error          { return nil }
 
 // matrixMode is one context of the matrix: the state the user is in.
 type matrixMode struct {

@@ -30,12 +30,13 @@ import (
 const (
 	logCap      = 500
 	histCap     = 100
-	durProbes   = 20  // duration fetch retries after a load (500ms apart)
-	dashMin     = 100 // two-column dashboard needs this many columns
-	dashMinH    = 20  // ... and this many rows; narrower falls back to the stacked layout
-	seekStep    = 5.0 // ctrl+arrow nudge, seconds
-	sysRows     = 30  // system tail lines in the dashboard
-	eqBars      = 40  // vibe equalizer column budget (widest terminal)
+	durProbes   = 20   // duration fetch retries after a load (500ms apart)
+	dashMin     = 100  // two-column dashboard needs this many columns
+	dashMinH    = 20   // ... and this many rows; narrower falls back to the stacked layout
+	seekStep    = 5.0  // ctrl+arrow nudge, seconds
+	seekStepBig = 30.0 // ctrl+shift+arrow nudge: the whole-movie cadence (F5)
+	sysRows     = 30   // system tail lines in the dashboard
+	eqBars      = 40   // vibe equalizer column budget (widest terminal)
 	eqPeriod    = 150 * time.Millisecond
 	zenDimAfter = 15 * time.Minute // zen only: messages older than this fade out
 )
@@ -123,7 +124,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+m mute · F1 keys · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -168,6 +169,7 @@ type Model struct {
 	draft      string     // saved while browsing history
 	zen        bool       // movie-night mode: one status line + input only
 	sysOff     bool       // ctrl+g: system pane hidden
+	helpOpen   bool       // F1: passive keys overlay (every other key keeps working)
 	gone       []string   // departed nicks, shown offline (cap 5)
 	eq         []float64  // vibe equalizer bar heights 0..1
 	compOpen   bool       // Tab menu of command/file completions
@@ -442,9 +444,6 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.compOpen = false
 		m, c := m.submit()
 		return m.syncLayout(), c
-	case "esc":
-		m.input.SetValue("")
-		m.vp.GotoBottom()
 	case "ctrl+c":
 		return m, tea.Quit
 	case "tab":
@@ -466,13 +465,60 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.engine.SeekBy(dt)
 		}
 		return m, nil
-	case "ctrl+z": // movie-night mode: one status line + chat + input.
-		// ctrl+m is unreachable: terminals send CR for it (== enter)
+	case "ctrl+shift+left", "ctrl+shift+right": // F5: the whole-movie cadence
+		if m.engine != nil {
+			dt := -seekStepBig
+			if msg.String() == "ctrl+shift+right" {
+				dt = seekStepBig
+			}
+			m.engine.SeekBy(dt)
+		}
+		return m, nil
+	case "alt+p": // conhost-proof alias: same toggle as ctrl+space
+		if m.engine != nil {
+			m.engine.PauseToggle()
+		}
+		return m, nil
+	case "alt+left", "alt+right": // conhost-proof alias: same nudges as ctrl+arrows
+		if m.engine != nil {
+			dt := -seekStep
+			if msg.String() == "alt+right" {
+				dt = seekStep
+			}
+			m.engine.SeekBy(dt)
+		}
+		return m, nil
+	case "ctrl+up", "ctrl+down": // F5: LOCAL volume — never posted to the room
+		if m.engine != nil {
+			if msg.String() == "ctrl+up" {
+				m.engine.VolumeUp()
+			} else {
+				m.engine.VolumeDown()
+			}
+		}
+		return m, nil
+	case "alt+m": // mute. NOT ctrl+m: terminals send CR for it (== enter),
+		// so ctrl+m is a dead key by physics — alt carries the mute key instead
+		if m.engine != nil {
+			m.engine.VolumeMute()
+		}
+		return m, nil
+	case "ctrl+z": // movie-night mode: one status line + chat + input
 		m.zen = !m.zen
 		return m.syncLayout(), nil
 	case "ctrl+g": // system pane toggle: hide the machine chatter
 		m.sysOff = !m.sysOff
 		return m.syncLayout(), nil
+	case "f1": // F5: the passive keys overlay — every other key keeps working
+		m.helpOpen = !m.helpOpen
+		return m.syncLayout(), nil
+	case "esc":
+		if m.helpOpen { // the overlay's esc closes the overlay, not the input
+			m.helpOpen = false
+			return m.syncLayout(), nil
+		}
+		m.input.SetValue("")
+		m.vp.GotoBottom()
 	case "up":
 		if len(m.hist) > 0 {
 			if m.histIdx == -1 {
@@ -525,8 +571,18 @@ func (m Model) openPicker(act pickAction) (Model, tea.Cmd) {
 }
 
 // pickKeys handles the cursor list: arrows/j/k move, enter does what the
-// picker was opened for (play or queue), esc backs.
+// picker was opened for (play or queue), esc backs. F1 toggles the help
+// overlay here too (F5): while it is up, esc closes the OVERLAY first —
+// the picker stays open.
 func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if msg.String() == "f1" {
+		m.helpOpen = !m.helpOpen
+		return m.syncLayout(), nil
+	}
+	if m.helpOpen && msg.String() == "esc" {
+		m.helpOpen = false
+		return m.syncLayout(), nil
+	}
 	switch msg.String() {
 	case "ctrl+c": // the picker owns the keys, but ctrl+c must always quit
 		return m, tea.Quit
@@ -962,7 +1018,13 @@ func (m Model) syncLayout() Model {
 // syncViewport rebuilds the viewport content (chat or picker) while keeping
 // follow-bottom: fresh lines stick only when the user is at the bottom.
 func (m Model) syncViewport() Model {
-	if m.mode == modePick {
+	if m.helpOpen {
+		// F5: the passive help overlay — the content box shows the keys while
+		// it is up, but the KEY ROUTING is untouched: every other key keeps
+		// behaving normally (only F1/esc close it).
+		m.vp.SetContent(strings.Join(m.helpLines(), "\n"))
+		m.vp.GotoBottom()
+	} else if m.mode == modePick {
 		m.vp.SetContent(strings.Join(m.pickLines(), "\n"))
 		if m.pickCursor < m.vp.YOffset {
 			m.vp.SetYOffset(m.pickCursor)
@@ -1596,10 +1658,9 @@ func (m Model) dashView() string {
 	hotbar :=
 		keyStyle.Render("[ctrl+space]") + hue("2").Render(" "+verb+" · ") +
 			keyStyle.Render("[ctrl+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStep)) +
+			keyStyle.Render("[ctrl+shift+←/→]") + hue("6").Render(fmt.Sprintf(" ±%.0fs · ", seekStepBig)) +
 			keyStyle.Render("[ctrl+p]") + hue("141").Render(" files · ") +
-			keyStyle.Render("[tab]") + hue("141").Render(" menu · ") +
-			keyStyle.Render("[ctrl+z]") + hue("3").Render(" movie · ") +
-			keyStyle.Render("[ctrl+g]") + hue("208").Render(" system")
+			keyStyle.Render("[F1 keys]") + hue("252").Render("")
 	if m.mode == modePick {
 		// the picker owns the keys: the hotbar's shortcuts are dead
 		// there, so the row must tell the truth instead (F4)
@@ -1986,7 +2047,34 @@ func (m Model) pickControls() string {
 	if m.pickAct == pickActQueue {
 		enter = "enter enqueue"
 	}
-	return "up/down move · " + enter + " · q queue · esc cancel"
+	return "up/down move · " + enter + " · q queue · esc cancel · F1 keys"
+}
+
+// helpLines is the F1 overlay content: the passive keys sheet. It lists
+// every global key (the new F5 ones included) plus the picker's controls;
+// while it is up the TUI keeps working normally.
+func (m Model) helpLines() []string {
+	out := []string{
+		title.Render("KEYS") + dim.Render("  F1/esc closes — every other key keeps working"),
+		"",
+		title.Render("playback"),
+		"ctrl+space or alt+p  play/pause (the room hears it)",
+		"ctrl+←/→            seek ±5s",
+		"ctrl+shift+←/→      seek ±30s",
+		"alt+←/→             seek ±5s (terminal-proof alias)",
+		title.Render("audio (local — the room never hears it)"),
+		"ctrl+↑/↓            volume ±5",
+		"alt+m               mute",
+		title.Render("interface"),
+		"ctrl+p              file browser (pick / queue)",
+		"ctrl+z              movie mode · ctrl+g system pane",
+		"enter send · up/down history · pgup/pgdn scroll · tab complete",
+		"",
+		"commands: /list /pick /play [file] /queue [file] /skip /help /quit",
+		"picker: up/down move · enter play/enqueue · q queue · esc cancel",
+		dim.Render("legacy conhost: ctrl+z / ctrl+g are dead there — alt keys and F1 still work"),
+	}
+	return out
 }
 
 func (m Model) pickLines() []string {
