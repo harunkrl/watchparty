@@ -1337,7 +1337,12 @@ func (m Model) nowPlayingLines(w int) []string {
 		}
 		if m.st.Paused {
 			chip := "⏸ paused"
-			if m.st.PausedBy != "" {
+			switch {
+			case m.st.Mechanical:
+				// a stall on the other side's link: nobody pressed
+				// anything, so the chip must not blame a human (m2-S2)
+				chip += " (stall)"
+			case m.st.PausedBy != "":
 				chip += " by " + m.st.PausedBy // the room named the actor
 			}
 			stats = append(stats, pausedStyle.Render(chip))

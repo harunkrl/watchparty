@@ -16,16 +16,26 @@ import (
 // With masterAt(12, false) the expected live position is 12+10 = 22.
 func pastGrace() fakeClock { return fakeClock{now: time.Unix(2000, 0), since: 10 * time.Second} }
 
+// liveTick models one poll cycle with a LIVE master: the master
+// heartbeats (a position event, the real 2s cadence) and the follower
+// polls. The step is 4s: the heartbeat stays fresh (the stall detector
+// may only fire against a live master — m2-S1) and the grace windows
+// (3s) are over.
+func liveTick(e *Engine, now time.Time, masterPos, myPos float64, buffering bool) {
+	e.Clock = stepClock{now: now}
+	e.OnRoom(masterAt(masterPos, false))
+	e.OnMpvp(mpv.State{Pos: ptr(myPos), Pause: false, Buffering: buffering})
+}
+
 // TestStallNoSeekStorm: a follower persistently behind live gets ONE probe
 // seek; if it lands behind again it stalls — room paused exactly once, no
 // further seeks. (Old behavior: a seek every 2s tick — the seek-storm.)
 func TestStallNoSeekStorm(t *testing.T) {
 	e, pl, po := newEngine(false)
-	e.OnRoom(masterAt(12, false)) // playing master snapshot
-	e.Clock = pastGrace()
+	t0 := time.Unix(5000, 0)
 
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false}) // baseline: on live
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 1: probe seek, no pause
+	liveTick(e, t0, 12, 12, false)                    // on live
+	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // behind 1: probe seek, no pause
 	if n := countType(t, po.events, "pause"); n != 0 {
 		t.Fatalf("paused before stallTicks: %v", evType(t, po.events))
 	}
@@ -33,14 +43,14 @@ func TestStallNoSeekStorm(t *testing.T) {
 		t.Fatalf("probe seek: got %v, want exactly 1", pl.seeks)
 	}
 
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 2: stall -> one pause, no seek
+	liveTick(e, t0.Add(8*time.Second), 20, 12, false) // behind 2: stall -> one pause, no seek
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("pause posted %d times, want 1 (events: %v)", n, evType(t, po.events))
 	}
 
 	// further frozen ticks: no repeat pause, no more seeks
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false})
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false})
+	liveTick(e, t0.Add(12*time.Second), 24, 12, false)
+	liveTick(e, t0.Add(16*time.Second), 28, 12, false)
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("auto-pause repeated: %v", evType(t, po.events))
 	}
@@ -82,14 +92,14 @@ func TestResumeDoesNotJump(t *testing.T) {
 // instant duplicate right after a resume (R-out1).
 func TestBufferingCountsTowardStall(t *testing.T) {
 	e, pl, po := newEngine(false)
-	e.OnRoom(masterAt(12, false))
-	e.Clock = pastGrace()
+	t0 := time.Unix(5000, 0)
 
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false, Buffering: true}) // behind 1
+	liveTick(e, t0, 12, 12, false)                   // on live
+	liveTick(e, t0.Add(4*time.Second), 16, 12, true) // behind 1
 	if n := countType(t, po.events, "pause"); n != 0 {
 		t.Fatalf("paused on the first buffering tick: %v", evType(t, po.events))
 	}
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false, Buffering: true}) // behind 2 -> stall
+	liveTick(e, t0.Add(8*time.Second), 20, 12, true) // behind 2 -> stall
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("buffering did not stall after the runway: %v", evType(t, po.events))
 	}
@@ -102,17 +112,16 @@ func TestBufferingCountsTowardStall(t *testing.T) {
 // recovery — no pause is posted and normal drift handling resumes.
 func TestShortStallNoPause(t *testing.T) {
 	e, pl, po := newEngine(false)
-	e.OnRoom(masterAt(12, false))
-	e.Clock = pastGrace()
+	t0 := time.Unix(5000, 0)
 
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false}) // baseline
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // hiccup: behind 1 -> probe seek
+	liveTick(e, t0, 12, 12, false)                    // baseline
+	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // hiccup: behind 1 -> probe seek
 	if n := countType(t, po.events, "pause"); n != 0 {
 		t.Fatalf("pause on a short hiccup: %v", evType(t, po.events))
 	}
 
 	// recovers to within the smooth band -> speed nudge, behind reset
-	e.OnMpvp(mpv.State{Pos: ptr(21.7), Pause: false})
+	liveTick(e, t0.Add(8*time.Second), 16, 15.5, false)
 	if n := countType(t, po.events, "pause"); n != 0 {
 		t.Fatalf("pause after short stall: %v", evType(t, po.events))
 	}
@@ -175,12 +184,11 @@ func TestOwnLoadPreventsHelloReload(t *testing.T) {
 // only after the full behind-live runway (no instant re-pause).
 func TestStallPauseResetsOnPlay(t *testing.T) {
 	e, pl, po := newEngine(false)
-	e.OnRoom(masterAt(12, false))
-	e.Clock = pastGrace()
+	t0 := time.Unix(5000, 0)
 
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false}) // baseline
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 1 -> probe seek
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 2 -> pause #1
+	liveTick(e, t0, 12, 12, false)                    // baseline
+	liveTick(e, t0.Add(4*time.Second), 16, 12, false) // behind 1 -> probe seek
+	liveTick(e, t0.Add(8*time.Second), 20, 12, false) // behind 2 -> pause #1
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("first stall pause missing: %v", evType(t, po.events))
 	}
@@ -189,15 +197,15 @@ func TestStallPauseResetsOnPlay(t *testing.T) {
 
 	// resume straight into a dry cache: play reset the window, so the
 	// follower needs the full runway again (no instant re-pause)
-	e.OnMpvp(mpv.State{Pos: ptr(22), Pause: false}) // window reset
+	liveTick(e, t0.Add(12*time.Second), 24, 24, false) // window reset
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("instant re-pause after play: %v", evType(t, po.events))
 	}
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 1 -> probe seek #2
+	liveTick(e, t0.Add(16*time.Second), 28, 24, false) // behind 1 -> probe seek #2
 	if n := countType(t, po.events, "pause"); n != 1 {
 		t.Fatalf("re-pause before stallTicks: %v", evType(t, po.events))
 	}
-	e.OnMpvp(mpv.State{Pos: ptr(20), Pause: false}) // behind 2 -> pause #2
+	liveTick(e, t0.Add(20*time.Second), 32, 24, false) // behind 2 -> pause #2
 	if n := countType(t, po.events, "pause"); n != 2 {
 		t.Fatalf("stall pause did not reset on play: %d pauses (events: %v)", n, evType(t, po.events))
 	}

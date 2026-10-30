@@ -39,6 +39,9 @@ type Event struct {
 	Dur       float64  `json:"dur,omitempty"`
 	From      string   `json:"from,omitempty"`
 	Pos       *float64 `json:"pos,omitempty"`
+	// Mechanical marks a pause the room did not ask for: a stall the
+	// follower detected on its own link. It names no human (m2-S2).
+	Mechanical bool `json:"mechanical,omitempty"`
 }
 
 // readIdle bounds the SSE read silence before we declare the connection

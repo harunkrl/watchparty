@@ -53,6 +53,18 @@ const stallTicks = 2 // consecutive behind-live polls before a stall
 // SSE died). The UI says so instead of showing a confident drift.
 const staleAge = 6 * time.Second
 
+// Batch C (m2-S1, m2-S2): the stall detector may only fire against a
+// LIVE master, and a resume is not a starvation.
+//   - resumeJump: a drift this big means we were away (sleep, suspend, a
+//     long outage), not that the room is starving. The follower re-seeks
+//     once and never pauses the room for it.
+//   - resumeSettle: how long the cache may take to refill after that
+//     re-seek. Inside the window there is no seek storm and no pause.
+const (
+	resumeJump   = 30.0
+	resumeSettle = 30 * time.Second
+)
+
 // Clock is the engine's time source; fake it in tests.
 type Clock interface {
 	Now() time.Time
@@ -85,8 +97,11 @@ type UiState struct {
 	Muted    bool    // mpv mute flag (display only)
 	Stale    bool    // follower: the master's heartbeat is older than staleAge
 	PausedBy string  // who paused the room ("" = our own action or unknown)
-	Sub      string  // language of the active subtitle track (personal only)
-	Layout   string  // audio channel layout ("stereo"; "" = unknown)
+	// Mechanical marks a pause the room did not ask for: a stall the
+	// follower detected on its own link. It names no human (m2-S2).
+	Mechanical bool
+	Sub        string // language of the active subtitle track (personal only)
+	Layout     string // audio channel layout ("stereo"; "" = unknown)
 }
 
 type Engine struct {
@@ -108,6 +123,9 @@ type Engine struct {
 	loadedAt   time.Time // when mpv took the file: post-load seek posts are noise
 	behind     int       // follower: consecutive polls behind live (starvation signal)
 	autoPaused bool      // follower: WE paused the room over a stall
+	resumed    bool      // follower: a resume jump was handled (one re-seek, no storm)
+	resumeTil  time.Time // follower: the settle window after that re-seek
+	mechPause  bool      // the room is paused for a MECHANICAL reason (a stall), not a human's
 
 	dur          float64  // the locally known media duration (0 = unknown yet)
 	pendingPos   *float64 // a hello position waiting for the duration to clamp it
@@ -212,6 +230,8 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// the outage must not trip the stall counter on the first tick
 		// after it (the room would be paused for a stall that is over)
 		e.behind, e.autoPaused = 0, false
+		e.resumed = false // the outage is over: the next jump is a new resume
+		e.resumeTil = time.Time{}
 		// Server may carry an age-adjusted media position + paused flag
 		// from the room's live snapshot (set after every position relay,
 		// cleared by load/ended/skip). When present, snap now and seek
@@ -242,12 +262,19 @@ func (e *Engine) OnRoom(ev room.Event) {
 		e.lastPause = true   // master dedup stays consistent with reality
 		e.postedPause = nil  // the room's state supersedes our pending post
 		e.pausedBy = ev.Nick // the relay names the actor ("" = unstamped)
+		// m2-S2: a mechanical pause (a stall on the other side's link)
+		// names no human: the chip must not blame someone for it.
+		e.mechPause = ev.Mechanical
+		if ev.Mechanical {
+			e.pausedBy = ""
+		}
 		if e.snap != nil {
 			e.snap.paused = true // discrete events are room truth; don't wait for the next heartbeat
 		}
 	case "play":
 		e.autoPaused = false // the room resumed: our stall-pause (if any) is spent
 		e.behind = 0         // fresh stall window: resume-into-dry-cache must not re-pause instantly
+		e.mechPause = false  // the room plays again: no mechanical pause any more
 		e.setPause(false)
 		e.lastPause = false
 		e.postedPause = nil // the room's state supersedes our pending post
@@ -280,6 +307,9 @@ func (e *Engine) OnRoom(ev room.Event) {
 func (e *Engine) load(name string) {
 	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
 	e.behind, e.autoPaused = 0, false
+	e.resumed = false            // a new file: the next jump is a new resume
+	e.resumeTil = time.Time{}    // the settle window must not outlive the file
+	e.mechPause = false          // the room plays a new file: no mechanical pause
 	e.wasActive = false          // the new file gets its own EOF: the old one is over
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
 	if err := e.Player.Load(name); err != nil {
@@ -335,6 +365,7 @@ func (e *Engine) applySnapshot(pos float64, paused bool) {
 func (e *Engine) PauseToggle() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.mechPause = false // a human pressed: the pause is not mechanical any more
 	var want bool
 	if e.Master {
 		want = !e.lastPause
@@ -612,7 +643,11 @@ func (e *Engine) followerTick(s mpv.State) {
 		// self-heal: converge to the master's playback state even if the
 		// discrete play/pause event never arrived. Emit with the TARGET state:
 		// s.Pause is pre-actuation and the next poll is 2s away — without this
-		// the follower UI sits on a stale ▶/⏸ while mpv is already there
+		// the follower UI sits on a stale ▶/⏸ while mpv is already there.
+		// This runs BEFORE the stale gate on purpose: converging to the
+		// room's pause is local and reversible (setPause posts nothing) —
+		// the gate exists to stop WIRE actions, not to keep the follower
+		// playing in a paused room.
 		e.setPause(e.snap.paused)
 		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Sub: s.Sub, Layout: s.Layout}, 0)
 		return
@@ -620,6 +655,35 @@ func (e *Engine) followerTick(s mpv.State) {
 	if e.snap.paused {
 		e.setSpeed(1)  // paused: clear any tempo nudge for a clean resume
 		e.emitUi(s, 0) // both paused: hold position — the UI still tracks mpv
+		return
+	}
+	// m2-S1: only a LIVE master can starve us. A silent heartbeat means
+	// the room's clock is unknown: pausing it would punish the follower
+	// for the master's silence, and chasing the stale snapshot would
+	// flush the cache for nothing. The UI shows the stale chip instead.
+	if e.Clock.Since(e.snap.beat) > staleAge {
+		e.behind = 0
+		e.emitUi(s, 0)
+		return
+	}
+	// age must not grow while the master stands still
+	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
+	drift := *s.Pos - expected
+	// m2-S2: a resume (sleep, suspend, a long outage) is a jump, not
+	// starvation: re-seek once, give the cache time to refill, and never
+	// pause the room for it.
+	if drift < -resumeJump && !e.resumed {
+		e.resumed = true
+		e.behind = 0
+		e.resumeTil = e.Clock.Now().Add(resumeSettle)
+		e.seekTo(expected)
+		e.emitUi(s, drift)
+		return
+	}
+	if e.Clock.Now().Before(e.resumeTil) {
+		// settling after the resume: no seek storm, no room pause
+		e.behind = 0
+		e.emitUi(s, drift)
 		return
 	}
 	if s.Buffering {
@@ -633,13 +697,9 @@ func (e *Engine) followerTick(s mpv.State) {
 			return
 		}
 		e.setSpeed(1)
-		expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
-		e.emitUi(s, *s.Pos-expected)
+		e.emitUi(s, drift)
 		return
 	}
-	// age must not grow while the master stands still
-	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
-	drift := *s.Pos - expected
 	e.emitUi(s, drift)
 	switch {
 	case drift < -Tolerance:
@@ -655,13 +715,16 @@ func (e *Engine) followerTick(s mpv.State) {
 		e.seekTo(expected) // probe seek: one chance to converge before stalling
 	case abs(drift) > Tolerance:
 		e.behind = 0
+		e.resumed = false  // we caught up: the next jump is a new resume
 		e.seekTo(expected) // ahead of live: clock jump or a lagging master
 	case abs(drift) > speedBand:
 		e.behind = 0
+		e.resumed = false
 		// smooth converge: a small tempo nudge instead of a visible seek
 		e.setSpeed(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
 	default:
 		e.behind = 0
+		e.resumed = false
 		e.setSpeed(1) // inside the dead zone: plain 1x
 	}
 }
@@ -675,6 +738,7 @@ func (e *Engine) followerTick(s mpv.State) {
 func (e *Engine) stallBlock(s mpv.State) {
 	e.setSpeed(1)
 	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
+	e.mechPause = true // mechanical: nobody pressed anything (m2-S2)
 	e.emitUi(s, *s.Pos-expected)
 	if e.autoPaused {
 		return // we already paused the room for this stall episode
@@ -683,7 +747,9 @@ func (e *Engine) stallBlock(s mpv.State) {
 	e.snap.paused = true // mirror our post: heartbeats carry the pre-post state briefly
 	e.pausedBy = ""      // our own stall pause: no actor
 	e.lastPost = e.Clock.Now()
-	e.postDiscrete(room.Event{Type: "pause"})
+	// the marker travels on the wire: the other side must not blame a
+	// human for a pause the room asked for by itself (m2-S2)
+	e.postDiscrete(room.Event{Type: "pause", Mechanical: true})
 	_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
 }
 
@@ -702,7 +768,7 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 		by = "" // playing: the chip is not shown, the actor is moot
 	}
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Sub: s.Sub, Layout: s.Layout}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Mechanical: e.mechPause, Sub: s.Sub, Layout: s.Layout}:
 	default:
 	}
 }
