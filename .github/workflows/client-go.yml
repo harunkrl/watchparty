@@ -28,6 +28,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
+      # TestCleanQuitExitsZero pins the exit-code contract (clean=0) and
+      # skips without mpv — the contract must be measured in CI, not
+      # only locally (F2 review P2-2)
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: go test -race ./...

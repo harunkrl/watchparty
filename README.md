@@ -124,6 +124,9 @@ nix-shell -p mpv ffmpeg --run "node tests/soak.mjs"         # both sides act; no
 nix-shell -p mpv ffmpeg --run "node tests/master_restart.mjs" # the room survives a master restart
 node tests/persist.mjs   # room state survives a server restart
 node tests/audit_server.mjs && node tests/audit2_server.mjs && node tests/audit3_server.mjs   # adversarial audit pins
+node tests/f1_server.mjs   # v1.3.3 server-hardening pins
+nix-shell -p mpv ffmpeg --run "node tests/f2_server.mjs"   # claim freshness + mechanical relay (real-client E2E)
+nix-shell -p mpv ffmpeg --run "node tests/stall_family.mjs"  # silent master / resume / mechanical pause
 ```
 
 ## Deployment (homelab)
@@ -188,8 +191,13 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
   will not carry a high-bitrate file.
 - If the guest's link cannot sustain the bitrate, the follower falls
   behind: after one catch-up attempt the client stops seeking, shows the
-  backlog in the drift chip and pauses the room once ("buffering - room
-  paused" on screen) so the cache can refill. Press play when ready.
+  backlog in the drift chip and pauses the room once — mechanically,
+  labeled "paused (stall)" so nobody gets blamed — so the cache can
+  refill. Press play when ready. This only fires while the master's
+  heartbeat is fresh: a silent master never pauses the room. A resume
+  jump re-seeks once with a settle window when the connection survives;
+  after a full reconnect (typical for sleep/laptop lid) the room may
+  still pause once — press play when it does.
 - Prefer MKV, or faststart MP4s (`ffmpeg -i in.mp4 -c copy -movflags
   +faststart out.mp4`): an MP4 with its index (moov) at the end must be
   fetched from the far end of the file before playback starts, which can
@@ -201,12 +209,18 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
 - One master; if the master's player dies, restart the client and `play` again.
   A second `--master` cannot duel for the clock: the server keeps the first
   heartbeat sender, drops the other's heartbeats and warns the room; the
-  claim dies with the master's connection, so restarts succeed cleanly.
+  claim dies with the master's connection — or after 45 s without a
+  heartbeat post — so restarts succeed cleanly.
 - Chat history is in-memory only: the last 50 messages replay to each new
   joiner; a server restart clears it.
 - Windows client (named-pipe IPC) is supported; use the release bundle
   zip (it ships mpv). If the dashboard glyphs look garbled, run it in
   Windows Terminal.
+- Linux/macOS terminals only: at startup the TUI asks the terminal for
+  its background color. Tty-less sessions and TERM=dumb/screen/tmux
+  skip the query; a foreground terminal that never answers it (some
+  serial/minimal IDE terminals) stalls ~5 s and can swallow the first
+  typed line. Use a real terminal emulator.
 - Browsers are unsupported by design: generic Content-Type, no CORS — use mpv.
 - Follower drift correction is covered by `tests/pause_sync.mjs` (pause, resume,
   seek convergence). A reconnecting or late-joining client is seeked straight to

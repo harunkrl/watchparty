@@ -3,6 +3,15 @@ name: client-go-release
 on:
   push:
     tags: ['v*']
+  # a broken release workflow used to explode only at tag time; now
+  # the gate (test/test-windows/build) validates on PRs too — the
+  # release job below stays tag-gated
+  pull_request:
+    paths:
+      - .github/workflows/client-go-release.yml
+      - client-go/**
+      - server.js
+      - tests/**
 
 env:
   # pinned mpv daily build (shinchiro date tags): same tag => same bytes,
@@ -11,7 +20,7 @@ env:
   MPV_TAG: '20261021'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # full gate before anything ships: a tag must pass the same checks
@@ -19,6 +28,7 @@ jobs:
   # same linux run, no race/gofmt/audit3)
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: client-go
@@ -27,6 +37,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
+      # mpv before the go tests: TestCleanQuitExitsZero (exit-code
+      # contract, clean=0) skips without it (F2 review P2-2); ffmpeg
+      # is only needed by the node e2e suites below
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: go test -race ./...
@@ -36,7 +50,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |
@@ -56,9 +69,27 @@ jobs:
         # suites from the workspace root, like the CI node job
         working-directory: ${{ github.workspace }}
 
+  # m2-504: the gate never executed windows code paths — a Windows-only
+  # break could ship from a tag even though main CI runs this job.
+  # Mirror of the CI test-windows job (no -race, no mpv e2e).
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
   build:
-    needs: test
+    needs: [test, test-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: client-go
@@ -99,7 +130,13 @@ jobs:
 
   release:
     needs: build
+    # PR runs stop after the gate; tag pushes ship (belt AND suspenders:
+    # the event filter documents intent, the ref filter is the boundary)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # m2-505: a hung e2e must not lock the release for 6h
+    permissions:
+      contents: write # only the release job may write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -114,8 +151,11 @@ jobs:
             # zip with the same "nothing else needed" README is how a
             # friend ends up at "mpv not found"
             [ "$plat" = "watchparty-windows-amd64" ] && continue
-            zip -j "dist/${plat}.zip" "$d"/watchparty* \
-              client-go/README-friend.txt
+            # m2-508: README-friend.txt is Windows instructions; the
+            # linux/macOS zips carry a one-line usage note instead
+            note='Run ./watchparty <host:port> (host: --master --name <nick>)'
+            printf '%s\n' "$note" > "$d/README.txt"
+            zip -j "dist/${plat}.zip" "$d"/watchparty* "$d/README.txt"
           done
           # friend bundle: portable mpv next to the exe (plan Q2), pinned to
           # MPV_TAG and digest-verified — a repackaged download must fail
@@ -129,7 +169,13 @@ jobs:
           want=$(echo "$tagged" | jq -r --arg re "$pick" \
             '.assets[] | select(.name | test($re))
              | .digest' | head -1)
-          test -n "$url" && test "$want" != "null"
+          # m2-507: this used to be `test -n "$url" && test ...` — an
+          # AND-list is exempt from set -e, so a missing asset failed
+          # silently into a confusing curl/sha256 error below
+          if [ -z "$url" ] || [ -z "$want" ] || [ "$want" = "null" ]; then
+            echo "no mpv asset matched tag=$MPV_TAG pick=$pick" >&2
+            exit 1
+          fi
           curl -sL -o /tmp/mpv.7z "$url"
           echo "${want#sha256:}  /tmp/mpv.7z" | sha256sum -c -
           7z x -y /tmp/mpv.7z -o/tmp/mpv-portable >/dev/null
