@@ -8,9 +8,9 @@ package ui
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -438,7 +438,9 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "tab":
 		m, c := m.complete()
 		return m.syncLayout(), c
-	case "ctrl+@": // ctrl+space sends NUL: play/pause without leaving the chat
+	case "ctrl+@", "\x00": // ctrl+space sends NUL: play/pause without leaving the chat
+		// (on Windows bubbletea delivers ctrl+space as a NUL rune, not as
+		// "ctrl+@" — both spellings must toggle)
 		if m.engine != nil {
 			m.engine.PauseToggle()
 		}
@@ -660,7 +662,7 @@ func (m Model) barClick(msg tea.MouseMsg) tea.Cmd {
 	}
 	frac := float64(msg.X-left) / float64(cw)
 	t := frac * m.duration
-	return postEvent(m.api, room.Event{Type: "seek", T: t})
+	return m.seekRoom(t)
 }
 
 // dashBarClick maps a click on the dashboard band's progress bar to a
@@ -681,7 +683,18 @@ func (m Model) dashBarClick(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	frac := min(max(float64(msg.X-left)/float64(barW), 0), 1)
-	return postEvent(m.api, room.Event{Type: "seek", T: frac * m.duration})
+	return m.seekRoom(frac * m.duration)
+}
+
+// seekRoom moves our own player AND tells the room: the server never
+// echoes a poster's own event back, so a POST-only seek does nothing for
+// the clicker (the master would not move at all, a follower would snap
+// back on the next heartbeat).
+func (m Model) seekRoom(t float64) tea.Cmd {
+	if m.engine != nil {
+		m.engine.SeekTo(t)
+	}
+	return nil
 }
 
 // enqueue mirrors the server's enqueue conditions for instant feedback;
@@ -1066,7 +1079,9 @@ func (m Model) inviteLines() string {
 	for _, a := range addrs {
 		line := title.Render("  " + a)
 		if len(addrs) > 1 {
-			line += " " + dim.Render(inviteLabel(a))
+			if label := inviteLabel(a); label != "" {
+				line += " " + dim.Render(label)
+			}
 		}
 		out += "\n" + line
 	}
@@ -1075,24 +1090,61 @@ func (m Model) inviteLines() string {
 }
 
 // inviteLabel names an invite address by its network: the tailnet
-// (100.64/10) or the local LAN.
+// (100.64/10) or a real home LAN address. Anything else (a public IP, a
+// hostname, the docker range) stays unlabelled — "local lan" would be a
+// lie there (m2-S5).
 func inviteLabel(addr string) string {
+	ip := net.ParseIP(inviteHost(addr))
+	if ip == nil {
+		return "" // a hostname: no network claim
+	}
+	if isTailnetIP(ip) {
+		return "(tailscale)"
+	}
+	if isLocalLANIP(ip) {
+		return "(local lan)"
+	}
+	return "" // a public address: no claim
+}
+
+// isLocalLANIP is a real home LAN address: 10/8, 192.168/16 or
+// loopback. 172.16/12 is deliberately NOT here: it is the docker range
+// (net.IP.IsPrivate would claim it as a private LAN).
+func isLocalLANIP(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return ip.IsLoopback() // ::1
+	}
+	switch {
+	case v4[0] == 10:
+		return true
+	case v4[0] == 192 && v4[1] == 168:
+		return true
+	case v4[0] == 127:
+		return true
+	}
+	return false
+}
+
+// inviteHost is the host part of an invite address (no scheme, no port).
+func inviteHost(addr string) string {
 	host := addr
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+3:]
 	}
-	if i := strings.IndexAny(host, ":/"); i >= 0 {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	if i := strings.Index(host, ":"); i >= 0 {
 		host = host[:i]
 	}
-	parts := strings.Split(host, ".")
-	if len(parts) >= 2 {
-		o1, e1 := strconv.Atoi(parts[0])
-		o2, e2 := strconv.Atoi(parts[1])
-		if e1 == nil && e2 == nil && o1 == 100 && o2 >= 64 && o2 <= 127 {
-			return "(tailscale)"
-		}
-	}
-	return "(local lan)"
+	return host
+}
+
+// isTailnetIP is the Tailscale CGNAT range 100.64.0.0/10.
+func isTailnetIP(ip net.IP) bool {
+	v4 := ip.To4()
+	return v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
 }
 
 // dashOn reports whether the two-column dashboard fits.

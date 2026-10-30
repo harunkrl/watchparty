@@ -384,6 +384,22 @@ func (e *Engine) SeekBy(dt float64) {
 	}
 }
 
+// SeekTo jumps to an absolute position: the local player moves AND the
+// room is told. The clickable bar needs both halves — the server never
+// echoes a poster's own event back, so a POST-only seek does nothing for
+// the clicker (SeekBy parity).
+func (e *Engine) SeekTo(t float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t = max(0, t)
+	e.seekTo(t)
+	e.lastPost = e.Clock.Now()
+	e.postDiscrete(room.Event{Type: "seek", T: t})
+	if e.Master {
+		e.lastPos = nil // scrub-check restarts fresh (no double post)
+	}
+}
+
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()

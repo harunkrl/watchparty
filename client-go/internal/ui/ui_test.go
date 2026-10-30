@@ -698,7 +698,13 @@ func TestInviteHint(t *testing.T) {
 }
 
 func TestClickBarSeeks(t *testing.T) {
-	m := New("ada", nil, nil, false, nil)
+	pl := &recPlayer{}
+	var posted []room.Event
+	e := &sync.Engine{
+		Master: true, ID: "ada-1", Player: pl, Clock: sync.RealClock{},
+		Post: func(ev room.Event) error { posted = append(posted, ev); return nil },
+	}
+	m := New("ada", nil, nil, false, e)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 90, Height: 30}) // stacked layout: the dashboard owns >=100
 	pos := 10.0
 	m = upd(t, m, sync.UiState{Pos: &pos, Paused: false, Drift: 0})
@@ -709,13 +715,17 @@ func TestClickBarSeeks(t *testing.T) {
 		t.Fatal("precondition: bar visible")
 	}
 	click := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 3})
-	mm, cmd := m.Update(click)
-	if cmd == nil {
-		t.Fatal("bar click produced no seek command")
+	m.Update(click)
+	// G1: the click moves the clicker's own player AND tells the room
+	if len(pl.seeks) != 1 {
+		t.Fatalf("bar click produced no local seek: %v", pl.seeks)
 	}
-	_ = mm
+	if len(posted) != 1 || posted[0].Type != "seek" {
+		t.Fatalf("bar click did not tell the room: %v", posted)
+	}
 	miss := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 8})
-	if _, cmd2 := m.Update(miss); cmd2 != nil {
+	m.Update(miss)
+	if len(pl.seeks) != 1 || len(posted) != 1 {
 		t.Fatal("click off the bar row must not seek")
 	}
 }
@@ -1216,7 +1226,12 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 	defer srv.Close()
 
 	api := room.New(srv.URL, "sen-1")
-	m := New("sen", api, nil, true, nil)
+	pl := &recPlayer{}
+	eng := &sync.Engine{
+		Master: true, ID: "sen-1", Player: pl, Clock: sync.RealClock{},
+		Post: func(ev room.Event) error { return api.Post(ev) },
+	}
+	m := New("sen", api, nil, true, eng)
 	m = upd(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
 	pos := 0.0
 	m = upd(t, m, sync.UiState{Pos: &pos})
@@ -1225,11 +1240,12 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 
 	// the bar row of the band: header, gap, border, name, blank, bar
 	click := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 59, Y: 5})
-	_, cmd := m.Update(click)
-	if cmd == nil {
-		t.Fatal("the dashboard bar click produced no seek")
+	m.Update(click)
+	// G1: the clicker's own player moves too (the server never echoes a
+	// poster's own event back)
+	if len(pl.seeks) != 1 {
+		t.Fatalf("the dashboard bar click did not seek the local player: %v", pl.seeks)
 	}
-	cmd()
 	select {
 	case ev := <-posted:
 		if ev.Type != "seek" {
@@ -1242,9 +1258,14 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 		t.Fatal("no seek was posted")
 	}
 	// a click outside the bar row must not seek
-	_, cmd2 := m.Update(tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 59, Y: 4}))
-	if cmd2 != nil {
+	m.Update(tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 59, Y: 4}))
+	if len(pl.seeks) != 1 {
 		t.Fatal("a click off the bar row must not seek")
+	}
+	select {
+	case ev := <-posted:
+		t.Fatalf("a click off the bar row posted %+v", ev)
+	default:
 	}
 }
 
