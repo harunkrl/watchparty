@@ -197,9 +197,14 @@ const CLAIM_FRESH_MS = cfRaw && Number.isFinite(cfEnv) ? cfEnv : 45000;
 let clockOwner = null; // client id of the current master
 let claimAt = -Infinity; // mono() of the owner's last position post
 const impostorSeen = new Set();
+// M1-A: is the current claim STALE (owner silent past CLAIM_FRESH_MS)?
+// Read-only on purpose: hello/ended only OBSERVE staleness — only a
+// competing position post may release the claim (isClockOwner), so an
+// ended post can never demote a returning master.
+const claimStale = () => clockOwner !== null && mono() - claimAt > CLAIM_FRESH_MS;
 function isClockOwner(from) {
   if (from === clockOwner) { claimAt = mono(); return true; }
-  if (clockOwner !== null && mono() - claimAt > CLAIM_FRESH_MS) {
+  if (claimStale()) {
     clockOwner = null; // stale claim (w1-3): released silently, no notice
   }
   if (clockOwner === null) {
@@ -344,7 +349,11 @@ function handleCmd(cmd) {
       // A1: ended never CLAIMS the clock — only position heartbeats do. A
       // follower's EOF in an ownerless room must advance the queue without
       // demoting the real master when it returns.
-      if (clockOwner === null || clockOwner === cmd.from) advanceQueue(nickById.get(cmd.from));
+      // M1-A: a STALE claim counts as ownerless here too (the owner has
+      // been silent > CLAIM_FRESH_MS — half-open death): a follower's EOF
+      // may advance the queue. Read-only: a returning master keeps its
+      // claim; only a position post releases it.
+      if (clockOwner === null || clockOwner === cmd.from || claimStale()) advanceQueue(nickById.get(cmd.from));
       break;
     case 'skip': // same advance, on demand — anyone (dual control)
       advanceQueue(nickById.get(cmd.from));
@@ -460,8 +469,17 @@ const server = http.createServer((req, res) => {
     };
     if (inviteHostAlt) hello.inviteAlt = `http://${inviteHostAlt}:${PORT}`; // absent when there is no second address
     if (state.now && state.pos != null) {
+      // M1-A: nobody is driving the room (ownerless after a clean bye or a
+      // server restart, or the claim went stale on a half-open death) — do
+      // not extrapolate a late joiner from a clock nobody is advancing
+      // (m2-502: it would land them at EOF): serve the FROZEN last-known
+      // position. The paused flag travels AS-IS from the room state:
+      // forcing p=true here would pause a RECONNECTING master, whose p=true
+      // heartbeats would then hold the room paused forever (gate
+      // regression: master_restart).
+      if (clockOwner === null || claimStale()) hello.pos = state.pos;
       // age-adjusted: where the master is right now, not at heartbeat time
-      hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
+      else hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
       // S3: a known duration keeps long-downtime joins before EOF
       if (state.dur != null) hello.pos = Math.min(hello.pos, state.dur - 1);
       // A3: never hand out a negative position

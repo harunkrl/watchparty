@@ -108,9 +108,12 @@ try {
   assert.equal(h.type, 'hello');
   assert.equal(h.now, 'x.mp4', 'now not restored');
   assert.deepEqual(h.queue, ['y.mp4'], 'queue not restored');
-  // pos travels with wall-clock age across the restart (tolerance ±3s)
-  assert.ok(h.pos >= 42 && h.pos <= 45, `restored pos ${h.pos}, want ~42+age`);
-  assert.equal(h.p, false, 'paused flag not restored');
+  // pos: M1-A — a restored room is ownerless; hello serves the FROZEN
+  // restored position (nobody advanced the clock during the downtime).
+  // The paused flag travels as-is from the room state (forcing p=true
+  // would pause a reconnecting master: gate regression master_restart).
+  assert.equal(h.pos, 42, `restored pos ${h.pos}, want the frozen 42`);
+  assert.equal(h.p, false, 'restored paused flag must travel as-is');
 
   // second scenario: a queued file deleted from disk must not come back
   unlinkSync(join(dir, 'y.mp4'));

@@ -190,6 +190,85 @@ await scenario('[A5-8] CLAIM_FRESH_MS=" " falls back to the default', async () =
   }
 });
 
+// [M1-A] dead-master aftermath: once the claim is STALE (owner silent past
+// CLAIM_FRESH_MS, SSE still open — half-open death, no close event), a
+// follower's EOF advances the queue (it used to be dropped silently), the
+// returning master keeps the clock (ended must NOT demote it), and a
+// restarted master later takes over cleanly.
+await scenario('[M1-A] stale claim: follower EOF advances, owner not demoted, restart takes over', async () => {
+  const s = startServer(['a.mkv', 'b.mkv'], { CLAIM_FRESH_MS: '1500' });
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'm1', t: 10, p: false }); // m1 owns the clock
+    await post(s.base, { type: 'load', from: 'm1', name: 'a.mkv' });
+    await post(s.base, { type: 'enqueue', from: 'm1', name: 'b.mkv' });
+    await waitUntil(() => w.events.some((e) => e.type === 'queue' && e.queue.length === 1), 3000, 'enqueue relayed');
+    await sleep(2200); // m1 silent, claim stale; its (never-opened) presence cannot close
+    await post(s.base, { type: 'ended', from: 'f' }); // follower EOF on the dead-master room
+    await waitUntil(() => w.events.some((e) => e.type === 'load' && e.name === 'b.mkv'), 3000, 'follower EOF advanced the stale-owner queue');
+    await post(s.base, { type: 'position', from: 'm1', t: 30, p: false }); // m1 returns (same id)
+    await waitUntil(() => positions(w.events).some((e) => e.t === 30), 3000, 'returning master heartbeat relayed');
+    assert.equal(twoMasterNotices(w.events).length, 0, 'the ended post demoted the returning master');
+    await sleep(2200); // m1 silent again -> stale once more
+    await post(s.base, { type: 'position', from: 'm2', t: 40, p: false }); // a RESTARTED master (new id)
+    await waitUntil(() => positions(w.events).some((e) => e.t === 40), 3000, 'restarted master takeover relayed');
+    assert.equal(twoMasterNotices(w.events).length, 0, 'restarted master takeover was not silent');
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [M1-A] a joiner during a stale-owner window gets the FROZEN last-known
+// position (p=true) — not an age-extrapolated one that drifts a late joiner
+// to EOF while the room's clock is unowned (m2-502 prong A).
+await scenario('[M1-A] stale owner: hello.pos frozen, not extrapolated', async () => {
+  const s = startServer(['a.mkv'], { CLAIM_FRESH_MS: '1500' });
+  try {
+    await waitReady(s.base);
+    await post(s.base, { type: 'load', from: 'm', name: 'a.mkv' });
+    await post(s.base, { type: 'position', from: 'm', t: 10, p: false }); // m owns, playing
+    await sleep(2200); // claim stale, owner silent forever (no SSE -> no close)
+    const c = rawSse(s.base, 'late', 'late');
+    await waitUntil(() => c.events.length > 0, 3000, 'hello arrived');
+    const h = c.events[0];
+    c.close();
+    assert.equal(h.pos, 10, `hello.pos extrapolated while the claim is stale: ${h.pos}`);
+    assert.equal(h.p, false, 'stale-owner hello must not force pause (p travels as-is)');
+  } finally {
+    await s.stop();
+  }
+});
+
+// [M1-A follow-up] an OWNERLESS room (master exited cleanly: 'bye' cleared
+// the claim) must freeze hello too — the old clock must not age-extrapolate
+// a late joiner to EOF just because the claim is null rather than stale.
+// CLAIM_FRESH_MS is huge here so staleness can NEVER be the trigger.
+await scenario('[M1-A] ownerless room (bye): hello.pos frozen, not extrapolated', async () => {
+  const s = startServer(['a.mkv'], { CLAIM_FRESH_MS: '60000' });
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    const c0 = rawSse(s.base, 'm', 'm');
+    await sleep(150);
+    await post(s.base, { type: 'load', from: 'm', name: 'a.mkv' });
+    await post(s.base, { type: 'position', from: 'm', t: 10, p: false });
+    await waitUntil(() => positions(w.events).some((e) => e.t === 10), 3000, 'm heartbeat relayed');
+    c0.close(); // clean exit: the server's 'bye' clears the (fresh) claim
+    await waitUntil(() => w.events.some((e) => e.type === 'bye' && e.nick === 'm'), 3000, 'bye after clean exit');
+    const c = rawSse(s.base, 'late', 'late');
+    await waitUntil(() => c.events.length > 0, 3000, 'hello arrived');
+    const h = c.events[0];
+    c.close();
+    assert.equal(h.pos, 10, `ownerless hello.pos extrapolated: ${h.pos}`);
+    assert.equal(h.p, false, 'ownerless hello must not force pause (p travels as-is)');
+  } finally {
+    await s.stop();
+  }
+});
+
 // [mechanical guard] the /cmd relay passes the cmd object through verbatim:
 // the mechanical pause flag (client f29c3a2, room.Event.Mechanical) must
 // survive every relay-side touch (nick stamping, claim checks).
