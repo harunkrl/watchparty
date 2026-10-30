@@ -269,6 +269,121 @@ await scenario('[M1-A] ownerless room (bye): hello.pos frozen, not extrapolated'
   }
 });
 
+// [F3] old-file position gate: a position post naming a DIFFERENT file
+// than state.now drops entirely (no state.pos overwrite, no claim refresh)
+// with a rate-limited "the room moved on" notice; a matching-file post
+// relays, a file-less post is an old client (today's behavior), and the
+// relay passes unknown fields AS-IS.
+await scenario('[F3] old-file position gate + relay-AS-IS', async () => {
+  const s = startServer(['a.mkv', 'b.mkv']);
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'm1', t: 10, p: false, file: 'a.mkv' }); // m1 claims
+    await post(s.base, { type: 'load', from: 'm1', name: 'a.mkv' });
+    await post(s.base, { type: 'enqueue', from: 'm1', name: 'b.mkv' });
+    await post(s.base, { type: 'skip', from: 'm1' }); // dual control: room moves on, m1 keeps the clock
+    await waitUntil(() => w.events.some((e) => e.type === 'load' && e.name === 'b.mkv'), 3000, 'skip advanced');
+    await post(s.base, { type: 'position', from: 'm1', t: 99, p: false, file: 'a.mkv' }); // old master, old file
+    await sleep(300);
+    assert.ok(!positions(w.events).some((e) => e.t === 99), 'old-file position was relayed');
+    await waitUntil(() => w.events.some((e) => e.type === 'notice' && e.text.includes('the room moved on')), 3000, 'moved-on notice');
+    await post(s.base, { type: 'position', from: 'm1', t: 99, p: false, file: 'a.mkv' }); // again inside the window
+    await sleep(300);
+    const movedOn = w.events.filter((e) => e.type === 'notice' && e.text.includes('the room moved on'));
+    assert.equal(movedOn.length, 1, `moved-on notice not rate-limited: ${movedOn.length}`);
+    await post(s.base, { type: 'position', from: 'm1', t: 7, p: false, file: 'b.mkv' }); // caught up
+    await waitUntil(() => positions(w.events).some((e) => e.t === 7), 3000, 'new-file position relayed');
+    await post(s.base, { type: 'position', from: 'm1', t: 8, p: false }); // old client: no file field
+    await waitUntil(() => positions(w.events).some((e) => e.t === 8), 3000, 'file-less position relayed');
+    await post(s.base, { type: 'position', from: 'm1', t: 9, p: false, foo: 'bar' });
+    await waitUntil(() => positions(w.events).some((e) => e.t === 9), 3000, 'extra-field position relayed');
+    assert.equal(positions(w.events).find((e) => e.t === 9).foo, 'bar', 'unknown field stripped on relay');
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [P2-1] the moved-on notice embeds state.now — a client-supplied FILENAME:
+// control chars must never reach a TUI (w1-2 class). The room is advanced
+// onto the escape-named file, then the old master's wrong-file post must
+// produce a SANITIZED notice.
+await scenario('[P2-1] moved-on notice sanitizes state.now (no ESC/OSC)', async () => {
+  const esc = '\u001b]0;pwned\u0007';
+  const s = startServer(['a.mkv', `${esc}x.mkv`]);
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'm1', t: 1, p: false, file: 'a.mkv' }); // m1 claims
+    await post(s.base, { type: 'load', from: 'm1', name: 'a.mkv' });
+    await post(s.base, { type: 'load', from: 'm1', name: `${esc}x.mkv` }); // room moves onto the escape-named file
+    await waitUntil(() => w.events.some((e) => e.type === 'load' && e.name === `${esc}x.mkv`), 3000, 'escape-named load relayed');
+    await post(s.base, { type: 'position', from: 'm1', t: 2, p: false, file: 'a.mkv' }); // wrong file: notice fires
+    await waitUntil(() => w.events.some((e) => e.type === 'notice' && e.text.includes('the room moved on')), 3000, 'moved-on notice');
+    const notice = w.events.find((e) => e.type === 'notice' && e.text.includes('the room moved on'));
+    assert.ok(!/[\x00-\x1f\x7f]/.test(notice.text), `raw escape in moved-on notice: ${JSON.stringify(notice.text)}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [P3-1] the wrong-file gate must NOT refresh the claim: an old master can
+// post wrong-file heartbeats past the whole TTL and still lose the clock
+// silently to a restarted master (no two-masters notice for the successor).
+await scenario('[P3-1] wrong-file posts do not refresh claimAt', async () => {
+  const s = startServer(['a.mkv'], { CLAIM_FRESH_MS: '1500' });
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'load', from: 'm1', name: 'a.mkv' });
+    await post(s.base, { type: 'position', from: 'm1', t: 1, p: false }); // m1 claims (claimAt = now)
+    await sleep(400);
+    for (let i = 0; i < 6; i++) { // ~3s of wrong-file posts past the 1.5s TTL
+      await post(s.base, { type: 'position', from: 'm1', t: 2, p: false, file: 'ghost.mkv' });
+      await sleep(500);
+    }
+    assert.ok(!positions(w.events).some((e) => e.t === 2), 'wrong-file position relayed');
+    await post(s.base, { type: 'position', from: 'm2', t: 5, p: false }); // restarted master: silent takeover
+    await waitUntil(() => positions(w.events).some((e) => e.t === 5), 3000, 'successor heartbeat relayed');
+    assert.equal(twoMasterNotices(w.events).length, 0,
+      `wrong-file posts refreshed the claim (successor was noticed): ${JSON.stringify(twoMasterNotices(w.events).map((n) => n.text))}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [A5-3] impostorSeen must stay BOUNDED but never strand a legitimate
+// impostor: hitting the cap CLEARS the set (clear-on-full), so the 65th id
+// still gets its one-time notice and can self-demote. Observable via a
+// replayed ghost id: after the clear it is unknown again -> noticed twice.
+await scenario('[A5-3] impostorSeen bounded, clear-on-full', async () => {
+  const s = startServer(['a.mkv']);
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'owner', t: 1, p: false }); // fresh claim
+    await sleep(150);
+    for (let i = 0; i < 70; i++) await post(s.base, { type: 'position', from: `ghost${i}`, t: 2, p: false });
+    await sleep(300);
+    assert.equal(twoMasterNotices(w.events).length, 70,
+      `impostor notices: ${twoMasterNotices(w.events).length}, want one per id (cap cleared mid-run)`);
+    await post(s.base, { type: 'position', from: 'ghost0', t: 2, p: false }); // wiped by the clear -> noticed again
+    await sleep(300);
+    assert.equal(twoMasterNotices(w.events).length, 71,
+      `clear-on-full did not happen (ghost0 stayed known): ${twoMasterNotices(w.events).length}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
 // [mechanical guard] the /cmd relay passes the cmd object through verbatim:
 // the mechanical pause flag (client f29c3a2, room.Event.Mechanical) must
 // survive every relay-side touch (nick stamping, claim checks).

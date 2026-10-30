@@ -125,14 +125,29 @@ function flushState() {
   if (!stateDirty || !persistOK) return;
   stateDirty = false;
   const tmp = `${STATE_FILE}.tmp`;
-  fs.writeFile(tmp, stateSnapshot(), (e) => {
-    if (e) return persistFail(e);
-    fs.rename(tmp, STATE_FILE, (e) => { if (e) persistFail(e); }); // atomic: no torn state.json
-  });
+  // A5-4: rename is atomic but not durable — fsync the temp file before the
+  // rename so a power cut cannot leave state.json empty/stale. shortcut:
+  // per-flush fsync (~2s cadence) is fine on the target SSD hardware; revisit
+  // this trade if the server ever targets flash/SD media (P3-2 ruling:
+  // fsync stays on every flush)
+  fs.promises.writeFile(tmp, stateSnapshot())
+    .then(() => fs.promises.open(tmp, 'r'))
+    .then((h) => h.sync().finally(() => h.close()))
+    .then(() => fs.promises.rename(tmp, STATE_FILE))
+    .catch((e) => persistFail(e));
 }
 const persistAndExit = () => {
   if (persistOK && stateDirty) {
-    try { fs.writeFileSync(STATE_FILE, stateSnapshot()); } catch { /* best effort */ }
+    try {
+      // A5-4 (amendment): the exit-time write is the most important persist
+      // — the same atomic+durable dance as flushState, in sync form (a
+      // signal handler must finish before exit)
+      const tmp = `${STATE_FILE}.tmp`;
+      fs.writeFileSync(tmp, stateSnapshot());
+      const fd = fs.openSync(tmp, 'r');
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, STATE_FILE);
+    } catch { /* best effort */ }
   }
   process.exit(0);
 };
@@ -214,6 +229,11 @@ function isClockOwner(from) {
     return true;
   }
   if (!impostorSeen.has(from)) {
+    // A5-3: forged POST-only ids would grow this Set without bound — at the
+    // cap, CLEAR it: bounded memory, and a legitimate 65th impostor still
+    // gets its one-time notice (and can self-demote) instead of being
+    // stranded silently (master-2 review, P3-3)
+    if (impostorSeen.size >= 64) impostorSeen.clear();
     impostorSeen.add(from);
     broadcast({
       type: 'notice',
@@ -231,6 +251,9 @@ function isClockOwner(from) {
 // A2: room-wide cooldown — the queue notices explain a no-op, they must not
 // become an amplifier for a stuck key or a hostile loop
 let lastQueueNotice = -Infinity;
+// F3: cooldown for the old-file "the room moved on" notice — the stale
+// master posts every ~2s, so a tight cooldown would spam the room
+let lastMovedOnNotice = -Infinity;
 
 // advanceQueue is the shared body of ended/skip: promote the next queued
 // file for everyone.
@@ -313,6 +336,21 @@ function handleCmd(cmd) {
       break;
     case 'position':
       if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t) || cmd.t < 0) break; // same trust boundary as seek
+      // F3: a position post may name its file (new clients). When it names a
+      // DIFFERENT file than state.now, the poster is an old master still
+      // driving the previous film: drop the post ENTIRELY — no state.pos
+      // overwrite, no claim refresh — and tell the human (rate-limited).
+      // No `file` = old client = exactly the file-agnostic behavior; an
+      // idle room has no file to protect, so the gate stays off there.
+      if (state.now !== null && typeof cmd.file === 'string' && cmd.file !== state.now) {
+        if (mono() - lastMovedOnNotice > 10000) {
+          lastMovedOnNotice = mono();
+          // P2-1: state.now is a client-supplied FILENAME — same trust
+          // boundary as every other notice text (w1-2 class)
+          broadcast({ type: 'notice', from: null, text: `the room moved on: now playing ${clean(state.now, 64)}` });
+        }
+        break;
+      }
       if (!isClockOwner(cmd.from)) break;
       state.pos = cmd.t;
       state.paused = !!cmd.p;
