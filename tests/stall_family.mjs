@@ -149,7 +149,7 @@ const check = (ok, msg) => {
 };
 
 try {
-  makeVideo(dir, 120);
+  makeVideo(dir, 240); // 240s: both scenarios (silence + reconnect) must stay clear of EOF
   startServer(PORT, dir);
   if (!await waitServer(PORT)) throw new Error('the server did not come up');
 
@@ -196,6 +196,36 @@ try {
   check(Math.abs(mPos2 - fPos2) < 4, `the room re-converged after the resume (${mPos2} vs ${fPos2})`);
 
   mIpc.close(); fIpc.close();
+
+  // ---- m2-501 pin: sleep/resume WITH a reconnect must not pause the room ----
+  // drop mode DESTROYS the follower's SSE (a real RST — unlike silence mode,
+  // the sockets die), so its client must reconnect when the knob releases:
+  // hello re-anchors it with a seek, the cache flushes, and the OLD engine
+  // turned exactly that into a mechanical room pause (resumeTil wiped by
+  // hello). Until worker2's engine fix lands this check is EXPECTED RED —
+  // the failure is the pause line itself ("> pause (stall)").
+  proxy.dropEvents(true); // the follower's link dies (sleep simulation)
+  await sleep(4000); // the master plays on; the reconnect attempts all die
+  const mNow = await new MpvIpc(await mpvSocketPath(master)).connect();
+  await mNow.cmd('seek', 40, 'relative'); // the film moves on while "away"
+  await sleep(2000);
+  mNow.close();
+  proxy.dropEvents(false); // the network is back: reconnect + hello + seek
+  await sleep(12000); // the settle window elapses
+
+  const pausedAfterResume =
+    linesMatching(master, /> pause \(stall\)/).length +
+    linesMatching(follower, /> pause \(stall\)/).length;
+  check(pausedAfterResume === 0,
+    `a reconnect-resume must not mechanically pause the room (stall pauses: ${pausedAfterResume})`);
+
+  const mIpc2 = await new MpvIpc(await mpvSocketPath(master)).connect();
+  const fIpc2 = await new MpvIpc(await mpvSocketPath(follower)).connect();
+  const mPos3 = await mIpc2.get('time-pos');
+  const fPos3 = await fIpc2.get('time-pos');
+  check(Math.abs(mPos3 - fPos3) < 4,
+    `the room re-converged after the reconnect-resume (${mPos3} vs ${fPos3})`);
+  mIpc2.close(); fIpc2.close();
 } catch (e) {
   failed++;
   console.error(`FAIL: ${e.stack || e}`);

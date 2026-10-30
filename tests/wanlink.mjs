@@ -74,6 +74,15 @@ export class Proxy {
     // C-prep silence mode (see silenceEvents): black-hole server->client SSE
     // data instead of writing it
     if (this.eventsSilent && entry.kind === 'events') return;
+    // F2b drop mode (see dropEvents): kill the connection so the client's
+    // reconnect path fires — SSE and cmd alike (a dead network drops both)
+    if (this.eventsDropped && (entry.kind === 'events' || entry.kind === 'cmd')) {
+      try { entry.client.destroy(); } catch {}
+      try { entry.up.destroy(); } catch {}
+      const i = this.events.indexOf(entry);
+      if (i >= 0) this.events.splice(i, 1);
+      return;
+    }
     if (entry.kind !== 'video' || this.cap <= 0) { entry.client.write(data); return; }
     entry.queue.push(data); entry.queued += data.length;
     if (!this.videoConns.includes(entry)) this.videoConns.push(entry);
@@ -93,6 +102,15 @@ export class Proxy {
   // Batch-C stall-family silent-master tests; dropped events are lost, not
   // delayed.
   silenceEvents(on) { this.eventsSilent = !!on; }
+  // F2b "drop mode" knob: while enabled, /events and /cmd connections are
+  // DESTROYED as soon as data flows (and the live SSE links die right away)
+  // — the client's sockets actually die, so its reconnect/hello path fires.
+  // This is the sleep/resume shape the m2-501 pin needs; silenceEvents() is
+  // the other half-open shape (links stay healthy, data is black-holed).
+  dropEvents(on) {
+    this.eventsDropped = !!on;
+    if (on) this.killEvents(); // the live SSE links die now; deliver() drops the rest
+  }
   listen() { return new Promise((res) => this.server.listen(this.port, '127.0.0.1', res)); }
   close() { try { this.server.close(); } catch {} }
 }
