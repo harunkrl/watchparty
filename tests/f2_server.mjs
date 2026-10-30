@@ -148,6 +148,48 @@ await scenario('[w1-3] stale claim released silently, fresh claim preserved', as
   }
 });
 
+// [A5-8] CLAIM_FRESH_MS=0 must be expressible ("always stale"): the second
+// poster takes over immediately and silently. The old parse (|| 45000)
+// folded 0 into the default, making the knob unusable.
+await scenario('[A5-8] CLAIM_FRESH_MS=0 parses: immediate silent takeover', async () => {
+  const s = startServer(['a.mkv'], { CLAIM_FRESH_MS: '0' });
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'm1', t: 10, p: false });
+    await waitUntil(() => positions(w.events).some((e) => e.t === 10), 3000, 'm1 heartbeat relayed');
+    await post(s.base, { type: 'position', from: 'm2', t: 20, p: false }); // any gap > 0ms = claim already stale
+    await waitUntil(() => positions(w.events).some((e) => e.t === 20), 3000, 'm2 takeover relayed');
+    assert.equal(twoMasterNotices(w.events).length, 0,
+      `CLAIM_FRESH_MS=0 fell back to the default (fresh-claim notice fired): ${JSON.stringify(twoMasterNotices(w.events).map((n) => n.text))}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [A5-8 follow-up] a whitespace-only value must fall back to the DEFAULT
+// (Number(" ") is 0 — the raw string is trimmed before parsing): a fresh
+// 45s claim still repels the second master.
+await scenario('[A5-8] CLAIM_FRESH_MS=" " falls back to the default', async () => {
+  const s = startServer(['a.mkv'], { CLAIM_FRESH_MS: ' ' });
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'position', from: 'm1', t: 10, p: false });
+    await waitUntil(() => positions(w.events).some((e) => e.t === 10), 3000, 'm1 heartbeat relayed');
+    await post(s.base, { type: 'position', from: 'm2', t: 20, p: false }); // claim is fresh: repelled
+    await sleep(400);
+    assert.ok(!positions(w.events).some((e) => e.t === 20), 'whitespace value acted as 0 (impostor relayed)');
+    assert.equal(twoMasterNotices(w.events).length, 1, 'whitespace value acted as 0 (no fresh-claim notice)');
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
 // [mechanical guard] the /cmd relay passes the cmd object through verbatim:
 // the mechanical pause flag (client f29c3a2, room.Event.Mechanical) must
 // survive every relay-side touch (nick stamping, claim checks).

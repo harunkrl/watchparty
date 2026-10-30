@@ -6,7 +6,7 @@
 
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, unlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -89,6 +89,7 @@ const restart = async () => {
 
 const cleanup = (code) => {
   server.kill();
+  try { chmodSync(dir, 0o700); } catch {} // a locked dir would block the rm
   rmSync(dir, { recursive: true, force: true });
   process.exit(code);
 };
@@ -125,6 +126,31 @@ try {
   const h3 = await grabHello();
   assert.equal(h3.now, 'x.mp4', 'garbage wall dropped the restore');
   assert.ok(Number.isFinite(h3.pos) && h3.pos >= 7 && h3.pos <= 10, `garbage wall must not poison hello.pos, got ${h3.pos}`);
+
+  // m2-503: a restart with an UNREADABLE videos dir (transient, e.g. a
+  // pending mount) must not drop the persisted room — restore follows the
+  // runtime w1-1/I-3 semantics: a null listing is "cannot read", not "empty".
+  // Root cannot be locked out of a directory, so this scenario needs a
+  // non-root runner and is skipped for root.
+  if (typeof process.getuid !== 'function' || process.getuid() !== 0) {
+    writeFileSync(STATE_FILE, JSON.stringify({ now: 'x.mp4', queue: ['y.mp4'], pos: 100, paused: false, dur: 600, wall: Date.now() }));
+    // execute-only: readdir fails (list() -> null) while state.json stays
+    // readable — the production shape (STATE_FILE lives outside VIDEOS_DIR,
+    // e.g. /var/lib/watchparty), so ONLY the listing is lost
+    chmodSync(dir, 0o111);
+    await restart();
+    const h4 = await grabHello();
+    assert.equal(h4.now, 'x.mp4', 'unreadable dir wiped the restored now');
+    assert.deepEqual(h4.queue, ['y.mp4'], 'unreadable dir wiped the restored queue');
+    assert.ok(Number.isFinite(h4.pos) && h4.pos >= 100 && h4.pos <= 103, `unreadable dir dropped the restored pos: ${h4.pos}`);
+    chmodSync(dir, 0o700); // dir readable again: the disk filter applies once more
+    await restart();
+    const h5 = await grabHello();
+    assert.equal(h5.now, 'x.mp4', 'recovered dir lost the restored now');
+    assert.deepEqual(h5.queue, [], 'recovered dir must filter vanished files again');
+  } else {
+    console.log('SKIP: the m2-503 scenario needs a non-root runner (root reads through a locked dir)');
+  }
 
   console.log('PASS: room state persisted across restarts, vanished files filtered');
   cleanup(0);

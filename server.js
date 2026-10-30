@@ -144,9 +144,14 @@ const persistAndExit = () => {
     if (e.code !== 'ENOENT') console.error(`watchparty: state restore failed (${e.message})`);
     return;
   }
-  const files = list() || []; // restore on an unreadable dir starts empty
-  state.queue = Array.isArray(saved.queue) ? saved.queue.filter((n) => files.includes(n)) : [];
-  if (saved.now && files.includes(saved.now)) {
+  // m2-503: a null listing (transient unreadable dir, w1-1/I-3) must not
+  // wipe the persisted room at boot — "cannot read" is not "empty". The
+  // disk filter applies only when the dir was actually readable;
+  // advanceQueue already follows the same rule.
+  const files = list();
+  const onDisk = (n) => !files || files.includes(n);
+  state.queue = Array.isArray(saved.queue) ? saved.queue.filter(onDisk) : [];
+  if (saved.now && onDisk(saved.now)) {
     state.now = saved.now;
     if (typeof saved.pos === 'number' && Number.isFinite(saved.pos) && saved.pos >= 0) {
       state.pos = saved.pos;
@@ -183,8 +188,12 @@ function clean(s, max) {
 // the stall-family follower posts nothing while the master is silent, so
 // follower silence must never drop the claim. A paused master keeps
 // heartbeating, so paused rooms are unaffected. 45s ≈ 20 missed 2s
-// heartbeats; CLAIM_FRESH_MS shortens it for tests.
-const CLAIM_FRESH_MS = Number(process.env.CLAIM_FRESH_MS) || 45000;
+// heartbeats; CLAIM_FRESH_MS shortens it for tests. An explicit value
+// passes through verbatim — including 0 ("always stale", A5-8); unset,
+// empty or non-numeric keeps the 45s default.
+const cfRaw = String(process.env.CLAIM_FRESH_MS ?? '').trim();
+const cfEnv = Number(cfRaw);
+const CLAIM_FRESH_MS = cfRaw && Number.isFinite(cfEnv) ? cfEnv : 45000;
 let clockOwner = null; // client id of the current master
 let claimAt = -Infinity; // mono() of the owner's last position post
 const impostorSeen = new Set();
