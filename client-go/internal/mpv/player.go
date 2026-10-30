@@ -8,6 +8,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,17 +87,24 @@ type Player struct {
 	// Logf receives player diagnostics. It must not be stderr: in the TUI
 	// the alt-screen frame is owned by the renderer and a stray stderr line
 	// corrupts it (the engine's log goes through the program for the same
-	// reason).
-	Logf func(format string, args ...any)
-	mu   sync.Mutex // guards pend, seq, drops and writes
-	pend map[int]chan ipcMsg
-	seq  int
+	// reason). Use SetLogf to install it: the mpv stderr pump reads it
+	// concurrently.
+	Logf     func(format string, args ...any)
+	mu       sync.Mutex // guards pend, seq, drops, Logf and writes
+	pend     map[int]chan ipcMsg
+	seq      int
+	stderrCh chan string // mpv's stderr lines, bounded (the ring)
 }
+
+// stderrRingMax is how many mpv stderr lines we keep: mpv must never
+// stall on our logging (a full stderr pipe would freeze the player), so
+// the oldest line is dropped instead.
+const stderrRingMax = 200
 
 func Start(base string, extra []string) (*Player, error) {
 	var dir, sock string
 	if runtime.GOOS == "windows" {
-		sock = fmt.Sprintf(`\\.\pipe\watchparty-%d`, os.Getpid())
+		sock = ipcPipeName()
 	} else {
 		var err error
 		dir, err = os.MkdirTemp("", "watchparty-") // unguessable, python parity
@@ -104,13 +113,7 @@ func Start(base string, extra []string) (*Player, error) {
 		}
 		sock = filepath.Join(dir, fmt.Sprintf("mpv-%d.sock", os.Getpid()))
 	}
-	args := append([]string{
-		"--idle", "--force-window", "--really-quiet", "--title=Watchparty",
-		"--input-ipc-server=" + sock,
-		"--cache=yes",
-		fmt.Sprintf("--demuxer-readahead-secs=%d", demuxerReadaheadSecs),
-		"--demuxer-max-bytes=" + demuxerMaxBytes,
-	}, extra...)
+	args := mpvArgs(sock, extra)
 	bin, err := findMPV()
 	if err != nil {
 		os.RemoveAll(dir)
@@ -122,17 +125,26 @@ func Start(base string, extra []string) (*Player, error) {
 	if errors.Is(cmd.Err, exec.ErrDot) {
 		cmd.Err = nil
 	}
+	exited := make(chan struct{})
+	p := &Player{
+		base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited,
+		dead:     make(chan struct{}),
+		events:   make(chan Event, 64),
+		pend:     map[int]chan ipcMsg{},
+		stderrCh: make(chan string, stderrRingMax),
+	}
+	// mpv's diagnostics go to the client's log, not into the void: the
+	// friend must see WHY mpv failed (a missing DLL, a bad file).
+	// MEASURED: mpv writes its messages to STDOUT when stdout is a pipe
+	// (stderr stays empty), so BOTH streams are wired to the same writer.
+	out := &stderrWriter{p: p}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	go p.drainStderr()
 	// Stdin nil = os.DevNull: otherwise mpv steals the keyboard from the TUI
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("could not start mpv (%s): %w", bin, err)
-	}
-	exited := make(chan struct{})
-	p := &Player{
-		base: strings.TrimRight(base, "/"), proc: cmd, dir: dir, exited: exited,
-		dead:   make(chan struct{}),
-		events: make(chan Event, 64),
-		pend:   map[int]chan ipcMsg{},
 	}
 	go func() {
 		_ = cmd.Wait()
@@ -155,28 +167,140 @@ func Start(base string, extra []string) (*Player, error) {
 	return nil, fmt.Errorf("could not connect to mpv ipc")
 }
 
+// mpvQuiet keeps mpv's error messages (unlike --really-quiet, which
+// silences everything) while --quiet still silences the status line.
+// Measured: the playback chatter goes to STDOUT (the client discards
+// it), the errors go to STDERR (the client forwards them).
+const mpvQuiet = "--quiet"
+
+// mpvArgs are the flags the client always passes to mpv. --quiet (not
+// --really-quiet) keeps mpv's error messages: the friend must see WHY
+// mpv failed. --quiet still silences the status line.
+func mpvArgs(sock string, extra []string) []string {
+	return append([]string{
+		"--idle", "--force-window", mpvQuiet, "--title=Watchparty",
+		"--input-ipc-server=" + sock,
+		"--cache=yes",
+		fmt.Sprintf("--demuxer-readahead-secs=%d", demuxerReadaheadSecs),
+		"--demuxer-max-bytes=" + demuxerMaxBytes,
+	}, extra...)
+}
+
+// ipcPipeName is the Windows named pipe the client and mpv talk over.
+// The PID alone can collide: an orphaned mpv still holds the old name
+// and Windows reuses PIDs — the random suffix kills that.
+func ipcPipeName() string {
+	return fmt.Sprintf(`\\.\pipe\watchparty-%d-%s`, os.Getpid(), randSuffix())
+}
+
+// randSuffix is a short random hex tag for the pipe name.
+func randSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "0"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// stderrWriter forwards mpv's diagnostics (stdout AND stderr) to the
+// player's log. exec serializes the writes when both streams share one
+// comparable writer, so the lines keep their order.
+type stderrWriter struct{ p *Player }
+
+func (w *stderrWriter) Write(b []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(b), "\r\n"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			w.p.pushStderr(line)
+		}
+	}
+	return len(b), nil
+}
+
+// pushStderr queues one mpv stderr line WITHOUT blocking: mpv must not
+// stall on our logging (a full stderr pipe would freeze the player). The
+// buffer is bounded — the oldest line is dropped instead.
+func (p *Player) pushStderr(line string) {
+	select {
+	case p.stderrCh <- line:
+	default:
+		select { // drop the oldest, keep the newest
+		case <-p.stderrCh:
+		default:
+		}
+		select {
+		case p.stderrCh <- line:
+		default:
+		}
+	}
+}
+
+// drainStderr forwards the queued mpv lines to the client log. Until the
+// caller installs a logger the lines wait: mpv starts before the client
+// can wire it, and a stray stderr line would corrupt the alt-screen
+// frame.
+func (p *Player) drainStderr() {
+	for line := range p.stderrCh {
+		p.logStderrNow(line)
+	}
+}
+
+// logStderrNow logs one mpv line, waiting for the logger to be installed.
+func (p *Player) logStderrNow(line string) {
+	for {
+		p.mu.Lock()
+		f := p.Logf
+		p.mu.Unlock()
+		if f != nil {
+			f("mpv: %s", line)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// SetLogf installs the diagnostics sink. Use it instead of writing the
+// field: the mpv stderr pump reads the field concurrently.
+func (p *Player) SetLogf(f func(format string, args ...any)) {
+	p.mu.Lock()
+	p.Logf = f
+	p.mu.Unlock()
+}
+
 // mpvBinaryNames are the file names an mpv build can carry.
 var mpvBinaryNames = []string{"mpv", "mpv.exe"}
 
-// findMPV locates the mpv binary: the PATH first, then the bundle next
-// to the executable. A release zip ships mpv in a subfolder (or beside
+// mpvExeDir is the folder that holds the executable: the release bundle
+// ships its mpv there. A var so the tests can point it elsewhere.
+var mpvExeDir = defaultMPVExeDir
+
+func defaultMPVExeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
+}
+
+// findMPV locates the mpv binary: the bundle next to the executable
+// first, then PATH. A release zip ships mpv in a subfolder (or beside
 // the exe), and on Windows there is no PATH entry for it — without this
-// the client would die with "could not start mpv".
+// the client would die with "could not start mpv". The bundle wins over
+// PATH: it is the digest-pinned mpv, a stale system mpv must not shadow
+// it.
 func findMPV() (string, error) {
+	looked := []string{"PATH"}
+	if dir := mpvExeDir(); dir != "" {
+		looked = []string{dir, filepath.Join(dir, "mpv*"), "PATH"}
+		if p := findMPVIn(dir); p != "" {
+			return p, nil
+		}
+	}
 	var relative string
 	if p, err := exec.LookPath("mpv"); err == nil {
 		if !errors.Is(err, exec.ErrDot) {
 			return p, nil
 		}
 		relative = p // "./mpv": the current folder happens to hold it
-	}
-	looked := []string{"PATH"}
-	if exe, err := os.Executable(); err == nil {
-		edir := filepath.Dir(exe)
-		looked = append(looked, edir, filepath.Join(edir, "mpv*"))
-		if p := findMPVIn(edir); p != "" {
-			return p, nil
-		}
 	}
 	if relative != "" {
 		return relative, nil
@@ -294,8 +418,11 @@ func (p *Player) readLoop() {
 // logf routes a diagnostic to the caller's logger. stderr would corrupt
 // the TUI's alt-screen frame, so the caller must provide Logf.
 func (p *Player) logf(format string, args ...any) {
-	if p.Logf != nil {
-		p.Logf(format, args...)
+	p.mu.Lock()
+	f := p.Logf
+	p.mu.Unlock()
+	if f != nil {
+		f(format, args...)
 		return
 	}
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
