@@ -117,7 +117,7 @@ restart clears history).
 
 ```sh
 node tests/smoke.mjs   # spawns its own server on a random port
-cd client-go && go build && cd ..   # the mpv tests drive this binary
+cd client-go && go build && go vet ./... && go test -race ./... && go test -tags audit3 ./internal/... && cd ..   # the mpv tests drive this binary
 nix-shell -p mpv ffmpeg --run "node tests/integration.mjs"   # real-mpv Phase A (skips if mpv/ffmpeg missing)
 nix-shell -p mpv ffmpeg --run "node tests/pause_sync.mjs"   # two real clients: pause/resume/seek sync, both directions
 nix-shell -p mpv ffmpeg --run "node tests/soak.mjs"         # both sides act; no echo storms, convergence holds
@@ -204,7 +204,9 @@ spot is a 1080p HEVC/AV1 encode in the 8–15 Mbps range.
   claim dies with the master's connection, so restarts succeed cleanly.
 - Chat history is in-memory only: the last 50 messages replay to each new
   joiner; a server restart clears it.
-- Windows client (named-pipe IPC) is untested; treat it as best-effort.
+- Windows client (named-pipe IPC) is supported; use the release bundle
+  zip (it ships mpv). If the dashboard glyphs look garbled, run it in
+  Windows Terminal.
 - Browsers are unsupported by design: generic Content-Type, no CORS — use mpv.
 - Follower drift correction is covered by `tests/pause_sync.mjs` (pause, resume,
   seek convergence). A reconnecting or late-joining client is seeked straight to

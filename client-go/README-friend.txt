@@ -11,6 +11,9 @@ watchparty — how to watch together (3 steps)
      default port (8090) is added when you leave it out.
    - Next time you start the client, the address you used last is the
      default: just press Enter and you are in the room again.
+   - If the black window shows garbled symbols (boxes, ?), open it once
+     from Windows Terminal instead (right-click the folder → Open in
+     Terminal, then run watchparty).
 
 Optional, to check the download was not corrupted: in PowerShell run
   Get-FileHash watchparty-windows-bundle.zip -Algorithm SHA256

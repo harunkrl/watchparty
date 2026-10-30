@@ -2,14 +2,59 @@ name: client-go
 
 on:
   push:
-    paths: [client-go/**, server.js, tests/**, .github/workflows/client-go.yml]
+    paths:
+      - client-go/**
+      - server.js
+      - tests/**
+      - .github/workflows/client-go.yml
+      # release-pipeline edits used to run no CI at all until the next
+      # tag tripped over them
+      - .github/workflows/client-go-release.yml
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
+  # vet/gofmt/test once — the build matrix used to repeat the identical
+  # linux test run for every cross-compile target (5x)
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
+      # adversarial audit pins: used to live only in the local battery
+      - run: go test -tags audit3 ./internal/...
+
+  # execute windows code paths natively: cross-compile covered nothing,
+  # so the named-pipe IPC layer had zero test coverage and go vet never
+  # saw mpv_windows.go. shortcut: no -race (windows runners make the
+  # race build slow enough to time out the job), no mpv e2e (linux job
+  # owns those)
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
   build:
+    needs: [test, test-windows]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -22,29 +67,26 @@ jobs:
             ext: .exe
           - goos: linux
             goarch: amd64
-            ext: ""
+            ext: ''
           - goos: linux
             goarch: arm64
-            ext: ""
+            ext: ''
           - goos: darwin
             goarch: amd64
-            ext: ""
+            ext: ''
           - goos: darwin
             goarch: arm64
-            ext: ""
+            ext: ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
-      - run: go vet ./...
-      - run: test -z "$(gofmt -l .)"
-      - run: go test -race ./...
       - run: >-
           go build -trimpath -ldflags="-s -w"
           -o watchparty${{ matrix.ext }} .
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
       - uses: actions/upload-artifact@v4
@@ -67,6 +109,7 @@ jobs:
           node tests/audit_server.mjs
           node tests/audit2_server.mjs
           node tests/audit3_server.mjs
+          node tests/f1_server.mjs
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod

@@ -14,7 +14,48 @@ permissions:
   contents: write
 
 jobs:
+  # full gate before anything ships: a tag must pass the same checks
+  # as main CI (previously vet+test ran once per matrix entry — 5x the
+  # same linux run, no race/gofmt/audit3)
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client-go/go.mod
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
+      - run: go test -tags audit3 ./internal/...
+      # the wire's only e2e tests: a tag may ship server.js changes, so
+      # the node battery gates releases too (mpv+ffmpeg ≈ 1-2 min)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
+      - run: go build -o watchparty .
+        working-directory: client-go
+      - run: |
+          node tests/smoke.mjs
+          node tests/persist.mjs
+          node tests/audit_server.mjs
+          node tests/audit2_server.mjs
+          node tests/audit3_server.mjs
+          node tests/f1_server.mjs
+          node tests/integration.mjs
+          node tests/pause_sync.mjs
+          node tests/master_restart.mjs
+          node tests/soak.mjs
+        # the job default (client-go) does not contain tests/: run the
+        # suites from the workspace root, like the CI node job
+        working-directory: ${{ github.workspace }}
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -42,7 +83,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
-      - run: go vet ./... && go test ./...
       - run: >-
           go build -trimpath -ldflags="-s -w"
           -o watchparty${{ matrix.ext }} .
@@ -68,6 +108,10 @@ jobs:
           mkdir dist
           for d in artifacts/watchparty-*; do
             plat=$(basename "$d")
+            # windows ships ONLY as the mpv bundle below: a bare windows
+            # zip with the same "nothing else needed" README is how a
+            # friend ends up at "mpv not found"
+            [ "$plat" = "watchparty-windows-amd64" ] && continue
             zip -j "dist/${plat}.zip" "$d"/watchparty* \
               client-go/README-friend.txt
           done
@@ -91,12 +135,16 @@ jobs:
           cp artifacts/watchparty-windows-amd64/watchparty.exe /tmp/bundle/
           cp client-go/README-friend.txt /tmp/bundle/
           cp -r /tmp/mpv-portable/* /tmp/bundle/
-          # shinchiro's 7z may extract into a single top-level dir; the
-          # canonical layout has mpv.exe beside watchparty.exe (the client
-          # also searches mpv*/ as a fallback, but the bundle stays flat)
+          # shinchiro's 7z may extract into top-level dir(s); flatten by
+          # COPY (mv '*' drops dotfiles and rmdir then fails the step) and
+          # assert the canonical layout: mpv.exe beside watchparty.exe
           if [ ! -f /tmp/bundle/mpv.exe ]; then
-            mv /tmp/bundle/mpv-*/* /tmp/bundle/ && rmdir /tmp/bundle/mpv-*
+            for sub in /tmp/bundle/*/; do
+              cp -r "${sub%/}/." /tmp/bundle/
+              rm -rf "${sub%/}"
+            done
           fi
+          test -f /tmp/bundle/mpv.exe
           cd /tmp/bundle
           zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
           cd "$GITHUB_WORKSPACE/dist"
@@ -105,6 +153,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
-            --notes-file client-go/CHANGELOG.md dist/*.zip dist/SHA256SUMS
+          # re-runnable without a vanish window: refresh assets in place
+          # instead of delete+create (shared links stay valid)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              dist/*.zip dist/SHA256SUMS --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
+              --notes-file client-go/CHANGELOG.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
+              --notes-file client-go/CHANGELOG.md dist/*.zip dist/SHA256SUMS
+          fi
