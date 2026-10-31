@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.6.1 — a release the windows runner can pass
+
+- client (tests): the two freeze pins asserted sub-second UI returns
+  with a 1s budget — a loaded windows CI runner can pause mid-assert
+  and trip them (the v1.6.0 release run flaked exactly there while
+  the same commit passed the tag CI). The budgets move to 2s: still
+  far under the 5s-class hang and the forever-deadlock they pin,
+  immune to runner pauses. No behavior change — this is a re-release
+  of v1.6.0's keys
+
 ## v1.6.0 — keys for a whole movie
 
 - client (ui): ctrl+shift+←/→ seek ±30s — the second cadence: ctrl+←/→

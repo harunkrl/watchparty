@@ -154,7 +154,9 @@ func TestCtrlSpaceDoesNotFreezeOnAHungServer(t *testing.T) {
 	m := New("ada", api, nil, true, e)
 	start := time.Now()
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlAt}) // ctrl+space
-	if el := time.Since(start); el > time.Second {
+	// 2s, not 1s: a loaded CI runner can pause mid-assert; the pin
+	// guards the 5s-class hang, not microsecond latency
+	if el := time.Since(start); el > 2*time.Second {
 		t.Fatalf("the UI froze for %s on a hung server", el)
 	}
 	if len(pl.pauses) != 1 {
