@@ -43,8 +43,8 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
-      - run: go test -race ./...
-      - run: go test -tags audit3 ./internal/...
+      - run: ../tests/ci_retry.sh go test -race ./...
+      - run: ../tests/ci_retry.sh go test -tags audit3 ./internal/...
       # the wire's only e2e tests: a tag may ship server.js changes, so
       # the node battery gates releases too (mpv+ffmpeg ≈ 1-2 min)
       - uses: actions/setup-node@v4
@@ -53,18 +53,14 @@ jobs:
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |
-          node tests/smoke.mjs
-          node tests/persist.mjs
-          node tests/audit_server.mjs
-          node tests/audit2_server.mjs
-          node tests/audit3_server.mjs
-          node tests/f2_server.mjs
-          node tests/f1_server.mjs
-          node tests/integration.mjs
-          node tests/pause_sync.mjs
-          node tests/stall_family.mjs
-          node tests/master_restart.mjs
-          node tests/soak.mjs
+          # each suite gets the documented single re-run (decisions #56):
+          # 2-core CI runners trip timing pins; deterministic failures
+          # still fail twice
+          for s in smoke persist audit_server audit2_server audit3_server \
+                   f2_server f1_server integration pause_sync \
+                   stall_family master_restart soak; do
+            ../tests/ci_retry.sh node tests/$s.mjs || exit 1
+          done
         # the job default (client-go) does not contain tests/: run the
         # suites from the workspace root, like the CI node job
         working-directory: ${{ github.workspace }}
@@ -84,7 +80,8 @@ jobs:
         with:
           go-version-file: client-go/go.mod
       - run: go vet ./...
-      - run: go test ./...
+      - shell: bash
+        run: ../tests/ci_retry.sh go test ./...
 
   build:
     needs: [test, test-windows]

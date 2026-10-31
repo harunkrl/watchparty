@@ -34,9 +34,9 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
-      - run: go test -race ./...
+      - run: ../tests/ci_retry.sh go test -race ./...
       # adversarial audit pins: used to live only in the local battery
-      - run: go test -tags audit3 ./internal/...
+      - run: ../tests/ci_retry.sh go test -tags audit3 ./internal/...
 
   # execute windows code paths natively: cross-compile covered nothing,
   # so the named-pipe IPC layer had zero test coverage and go vet never
@@ -55,7 +55,8 @@ jobs:
         with:
           go-version-file: client-go/go.mod
       - run: go vet ./...
-      - run: go test ./...
+      - shell: bash
+        run: ../tests/ci_retry.sh go test ./...
 
   build:
     needs: [test, test-windows]
@@ -106,15 +107,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node tests/smoke.mjs
-      - run: node tests/persist.mjs
+      - run: tests/ci_retry.sh node tests/smoke.mjs
+      - run: tests/ci_retry.sh node tests/persist.mjs
       - run: |
           # adversarial audit pins (server-only, no mpv needed)
-          node tests/audit_server.mjs
-          node tests/audit2_server.mjs
-          node tests/audit3_server.mjs
-          node tests/f1_server.mjs
-          node tests/f2_server.mjs
+          tests/ci_retry.sh node tests/audit_server.mjs
+          tests/ci_retry.sh node tests/audit2_server.mjs
+          tests/ci_retry.sh node tests/audit3_server.mjs
+          tests/ci_retry.sh node tests/f1_server.mjs
+          tests/ci_retry.sh node tests/f2_server.mjs
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
@@ -122,8 +123,8 @@ jobs:
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |
-          node tests/integration.mjs
-          node tests/pause_sync.mjs
-          node tests/stall_family.mjs
-          node tests/master_restart.mjs
-          node tests/soak.mjs
+          tests/ci_retry.sh node tests/integration.mjs
+          tests/ci_retry.sh node tests/pause_sync.mjs
+          tests/ci_retry.sh node tests/stall_family.mjs
+          tests/ci_retry.sh node tests/master_restart.mjs
+          tests/ci_retry.sh node tests/soak.mjs

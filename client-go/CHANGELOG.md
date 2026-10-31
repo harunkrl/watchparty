@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.6.2 — a release pipeline that re-runs its own flakes
+
+- ci: every gate step in both workflows (go test/test-race/audit3,
+  windows go test, all 12 node suites) now gets the team's documented
+  flake protocol as code: one automatic re-run via tests/ci_retry.sh
+  — a deterministic failure still fails twice, a timing flake on the
+  2-core shared runners passes the second try. This is what kept
+  killing the releases: windows go test flaked 3 of 7 runs and a node
+  suite tripped 2 more, while the same commits were green locally
+  and on other runs. No product change — the binaries equal v1.6.1's
+
 ## v1.6.1 — a release the windows runner can pass
 
 - client (tests): the two freeze pins asserted sub-second UI returns
