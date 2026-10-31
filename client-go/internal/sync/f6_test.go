@@ -31,21 +31,34 @@ func TestLoadSettleRunsOffTheLock(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("OnRoom blocked on the load chain (the settle did not go off the lock)")
 	}
-	if pl.startLoads != 1 {
-		t.Fatalf("the loadfile tell did not fire: %d", pl.startLoads)
+	var nStart, nAttach int
+	pl.mu.Lock()
+	nStart, nAttach = pl.startLoads, pl.attachCalls
+	pl.mu.Unlock()
+	if nStart != 1 {
+		t.Fatalf("the loadfile tell did not fire: %d", nStart)
 	}
 	if e.loaded != "a.mkv" {
 		t.Fatalf("the speculative claim is missing (a hello in the settle window would reload the old file): %q", e.loaded)
 	}
-	if pl.attachCalls != 0 {
+	if nAttach != 0 {
 		t.Fatal("the settle ran before the live signal")
 	}
 	close(pl.wedgeWait) // the guaranteed signal fires (the fake's own WaitLive)
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && pl.attachCalls != 1 {
+	for time.Now().Before(deadline) {
+		pl.mu.Lock()
+		n := pl.attachCalls
+		pl.mu.Unlock()
+		if n == 1 {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if pl.attachCalls != 1 {
+	pl.mu.Lock()
+	n := pl.attachCalls
+	pl.mu.Unlock()
+	if n != 1 {
 		t.Fatal("the settle never completed after the signal")
 	}
 }

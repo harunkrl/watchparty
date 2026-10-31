@@ -204,16 +204,37 @@ func TestMasterPausePlayTransitions(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(7), Pause: true}) // user pressed space
 	e.OnMpvp(mpv.State{Pos: ptr(7), Pause: true}) // steady: pause not repeated,
 	// but the position heartbeat fires on every tick (client.py parity)
-	types := evType(t, po.all(t))
-	// F6-A3: the heartbeat flood coalesces — the pause discrete keeps its
-	// slot, the three heartbeats collapse to the LATEST one.
-	want := []string{"pause", "position"}
-	if len(types) != len(want) {
-		t.Fatalf("events = %v, want %v", types, want)
+	// F6-A3: the pause discrete is never repeated and the latest position
+	// wins. The deterministic collapse pin (wedge-based) lives in
+	// TestPostQueueCoalescesAndBounds; here the worker may already be
+	// mid-post on the first heartbeat when the tail collapses, so up to
+	// one in-flight position can precede the coalesced one (the server
+	// takes the latest either way).
+	evs := po.all(t)
+	pauses, positions := 0, 0
+	lastPos, pauseIdx := -1.0, -1
+	for i, ev := range evs {
+		switch ev.Type {
+		case "pause":
+			pauses++
+			pauseIdx = i
+		case "position":
+			positions++
+			lastPos = ev.T
+		}
 	}
-	for i := range want {
-		if types[i] != want[i] {
-			t.Fatalf("events = %v, want %v", types, want)
+	if pauses != 1 {
+		t.Fatalf("pause posted %d times, want exactly 1: %v", pauses, evType(t, evs))
+	}
+	if positions < 1 || positions > 2 {
+		t.Fatalf("positions = %d, want 1 (coalesced) or 2 (one in flight): %v", positions, evType(t, evs))
+	}
+	if lastPos != 7 {
+		t.Fatalf("the latest position is %v, want 7: %v", lastPos, evType(t, evs))
+	}
+	for i, ev := range evs {
+		if ev.Type == "pause" && i != pauseIdx {
+			t.Fatalf("repeated pause at %d: %v", i, evType(t, evs))
 		}
 	}
 }
@@ -559,14 +580,29 @@ func TestFollowerNoSnapshotNeverPosts(t *testing.T) {
 
 func TestLoadFailureLogged(t *testing.T) {
 	logs, sink := logSink()
+	// the settle continuation logs from its own goroutine: the sink and
+	// every read of *logs must share a mutex (the CI race detector bit us)
+	var mu sync.Mutex
 	e, pl, _ := newEngine(false)
-	e.Logf = sink
+	e.Logf = func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		sink(f, a...)
+	}
 	pl.loadErr = errors.New("load failed: nope.mkv") // F6-A1: maps to not-going-live
 	e.OnRoom(room.Event{Type: "load", Name: "nope.mkv"})
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !hasLine(*logs, "mpv: load did not go live: nope.mkv") {
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := hasLine(*logs, "mpv: load did not go live: nope.mkv")
+		mu.Unlock()
+		if got {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if !hasLine(*logs, "> playing nope.mkv") || !hasLine(*logs, "mpv: load did not go live: nope.mkv") {
 		t.Fatalf("failed load not surfaced: %v", *logs)
 	}

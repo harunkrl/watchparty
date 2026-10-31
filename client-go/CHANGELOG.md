@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.7.1 — the race the CI runner saw first
+
+- client (sync): setSpeed mutated the engine's tempo cache without the
+  engine lock — harmless everywhere except the new F6 load continuation,
+  which calls it from its own goroutine; the CI race detector caught
+  it (2-core scheduling), local runs mostly did not. setSpeed is now
+  goroutine-safe; the under-lock callers use setSpeedLocked. The
+  postQueue's dead wake() helper is gone
+- client (tests): the settle pins synchronized with the continuation
+  (the fake's counters and the log sink shared a mutex with the test
+  reads); TestMasterPausePlayTransitions now asserts the honest
+  contract — the pause never repeats, the latest position wins, and at
+  most one in-flight position can precede the coalesced one (the
+  deterministic collapse pin stays, wedge-based, in
+  TestPostQueueCoalescesAndBounds)
+
 ## v1.7.0 — a room that says when it goes quiet (UX + release hygiene)
 
 - client (sync): loading a new file no longer freezes the TUI — the

@@ -309,15 +309,6 @@ func (q *postQueue) push(ev room.Event) {
 	}
 }
 
-// wake nudges the worker (non-blocking: a pending signal already covers
-// the whole backlog).
-func (q *postQueue) wake() {
-	select {
-	case q.sig <- struct{}{}:
-	default:
-	}
-}
-
 // pop takes the next event, waiting for one to arrive.
 func (q *postQueue) pop() (room.Event, bool) {
 	for {
@@ -404,8 +395,17 @@ func (e *Engine) seekTo(t float64) {
 }
 
 // setSpeed applies a tempo nudge once per distinct value; repeated ticks
-// with the same drift stay silent on the IPC.
+// with the same drift stay silent on the IPC. Goroutine-safe: the F6-A1
+// continuation calls it with NO engine lock held (the CI race detector
+// caught the unsynchronized engine fields).
 func (e *Engine) setSpeed(f float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setSpeedLocked(f)
+}
+
+// setSpeedLocked is setSpeed for callers that already hold e.mu.
+func (e *Engine) setSpeedLocked(f float64) {
 	if e.speedSet && f == e.lastSpeed {
 		return
 	}
@@ -585,7 +585,7 @@ func (e *Engine) continueLoad(name string, deadline time.Time) {
 		e.logf("mpv: load did not go live: %s", name)
 		return
 	}
-	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
+	e.setSpeed(1) // new file: clear any tempo nudge from the previous one (no lock held here)
 	e.Player.AttachSubs(name)
 }
 
@@ -1004,8 +1004,8 @@ func (e *Engine) followerTick(s mpv.State) {
 		return
 	}
 	if e.snap.paused {
-		e.setSpeed(1)  // paused: clear any tempo nudge for a clean resume
-		e.emitUi(s, 0) // both paused: hold position — the UI still tracks mpv
+		e.setSpeedLocked(1) // paused: clear any tempo nudge for a clean resume
+		e.emitUi(s, 0)      // both paused: hold position — the UI still tracks mpv
 		return
 	}
 	// m2-S1: only a LIVE master can starve us. A silent heartbeat means
@@ -1067,7 +1067,7 @@ func (e *Engine) followerTick(s mpv.State) {
 			e.stallBlock(s)
 			return
 		}
-		e.setSpeed(1)
+		e.setSpeedLocked(1)
 		e.emitUi(s, drift)
 		return
 	}
@@ -1094,12 +1094,12 @@ func (e *Engine) followerTick(s mpv.State) {
 		e.resumed = false
 		e.resumeSeen = false
 		// smooth converge: a small tempo nudge instead of a visible seek
-		e.setSpeed(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
+		e.setSpeedLocked(1 + clamp(-drift*0.1, -speedAdj, speedAdj))
 	default:
 		e.behind = 0
 		e.resumed = false
 		e.resumeSeen = false
-		e.setSpeed(1) // inside the dead zone: plain 1x
+		e.setSpeedLocked(1) // inside the dead zone: plain 1x
 	}
 }
 
@@ -1110,7 +1110,7 @@ func (e *Engine) followerTick(s mpv.State) {
 // once so the cache can refill. No auto-resume: a wire pause carries no
 // owner, auto-resuming could fight a deliberate pause — humans press play.
 func (e *Engine) stallBlock(s mpv.State) {
-	e.setSpeed(1)
+	e.setSpeedLocked(1)
 	expected := e.snap.t + e.Clock.Since(e.snap.at).Seconds()
 	if !e.autoPaused {
 		e.autoPaused = true
