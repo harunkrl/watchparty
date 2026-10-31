@@ -31,6 +31,9 @@ type pipeIPC struct {
 	// firstOnly makes the fake answer the FIRST request of a batch and
 	// then go quiet: the batch comes back truncated (A3-MPV1).
 	firstOnly bool
+	// tells records every command line when non-nil: the pins that assert
+	// exact wire commands (the expand-properties hint, sub-add) read here.
+	tells chan []any
 }
 
 // serve answers the client's requests until the connection dies. A
@@ -41,15 +44,21 @@ func (f *pipeIPC) serve(values map[string]any) {
 	sc := bufio.NewScanner(f.conn)
 	answered := 0
 	for sc.Scan() {
-		if values == nil && !f.firstOnly {
-			continue // wedged: swallow the request, never answer
-		}
 		var req struct {
 			Command   []any `json:"command"`
 			RequestID int   `json:"request_id"`
 		}
 		if json.Unmarshal(sc.Bytes(), &req) != nil {
 			continue
+		}
+		if f.tells != nil { // record before any swallow/answer decision
+			select {
+			case f.tells <- append([]any(nil), req.Command...):
+			default:
+			}
+		}
+		if values == nil && !f.firstOnly {
+			continue // wedged: swallow the request, never answer
 		}
 		answered++
 		if f.firstOnly && answered > 1 {

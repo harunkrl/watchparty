@@ -659,6 +659,30 @@ func (p *Player) ToggleMute() error {
 	return p.tell("cycle", "mute")
 }
 
+// AddSubDelay shifts subtitle timing by delta seconds (positive = subs
+// appear later): mpv's own relative `add`, so the read-add-set happens
+// inside mpv as one step — tell-only like SetVolume, no round trip to read
+// the current value; the next OSD renders mpv's real value.
+func (p *Player) AddSubDelay(delta float64) error {
+	return p.tell("add", "sub-delay", delta)
+}
+
+// SetSubDelay pins subtitle timing to v seconds (0 = back in sync).
+func (p *Player) SetSubDelay(v float64) error {
+	return p.tell("set_property", "sub-delay", v)
+}
+
+// ShowSubDelayHint renders the subtitle-timing hint in the mpv window.
+// The JSON array API mpv receives over the IPC has property expansion
+// OFF by default — the dedicated expand-properties prefix turns it on,
+// so the window shows the REAL current delay (mpv renders the value in
+// its own milliseconds format). The shared ShowText must stay
+// prefix-free: it also displays other users' chat, and a chat line
+// containing ${...} must never be expanded.
+func (p *Player) ShowSubDelayHint() error {
+	return p.tell("expand-properties", "show-text", "sub-delay ${sub-delay}", 1500)
+}
+
 func (p *Player) Seek(t float64) error {
 	return p.tell("seek", t, "absolute")
 }
@@ -723,24 +747,12 @@ func (p *Player) WaitLive(name string, deadline time.Time) bool {
 // tells + the j-key OSD). F6-A1: a continuation step — best-effort, run
 // OFF the engine lock.
 func (p *Player) AttachSubs(name string) {
-	stem := strings.TrimSuffix(name, filepath.Ext(name))
 	// R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) ride along as
 	// selectable tracks — each user switches locally with mpv's j/J keys in
 	// the player window; subtitle choice never enters the sync layer. The
 	// plain <stem>.srt goes first and is selected, matching the old
 	// single-subtitle behaviour; the rest are added unselected.
-	subs, stemPrefix := p.subList(), stem+"."
-	ordered := make([]string, 0, len(subs))
-	for _, exact := range []string{stem + ".srt", stem + ".ass"} {
-		if slices.Contains(subs, exact) {
-			ordered = append(ordered, exact)
-		}
-	}
-	for _, s := range subs { // server list is sorted: en < es < tr ...
-		if strings.HasPrefix(s, stemPrefix) && !slices.Contains(ordered, s) {
-			ordered = append(ordered, s)
-		}
-	}
+	ordered := subCandidates(p.subList(), name)
 	added := 0
 	for _, s := range ordered {
 		flag := "auto"
@@ -754,6 +766,38 @@ func (p *Player) AttachSubs(name string) {
 	if added > 1 {
 		_ = p.ShowText(fmt.Sprintf("%d subtitles: press j in the player window to switch", added), 4000)
 	}
+}
+
+// subCandidates filters the server's /subs listing down to the sidecars of
+// video name: the exact <stem>.srt/.ass first, then the rest of the
+// <stem>.* family in server order (the server list is sorted). Pure string
+// logic so AttachSubs and /sub agree on what belongs to the file.
+func subCandidates(subs []string, name string) []string {
+	stem := strings.TrimSuffix(name, filepath.Ext(name))
+	ordered := make([]string, 0, len(subs))
+	for _, exact := range []string{stem + ".srt", stem + ".ass"} {
+		if slices.Contains(subs, exact) {
+			ordered = append(ordered, exact)
+		}
+	}
+	for _, s := range subs {
+		if strings.HasPrefix(s, stem+".") && !slices.Contains(ordered, s) {
+			ordered = append(ordered, s)
+		}
+	}
+	return ordered
+}
+
+// SubCandidates lists the sidecar subtitles for video name (the /sub
+// listing): the same probe and ordering AttachSubs attaches from.
+func (p *Player) SubCandidates(name string) []string {
+	return subCandidates(p.subList(), name)
+}
+
+// AttachSub selects ONE sidecar subtitle for the CURRENT video (a sub-add
+// tell; never a loadfile — the film keeps playing). /sub's attach step.
+func (p *Player) AttachSub(name string) error {
+	return p.tell("sub-add", fmt.Sprintf("%s/sub/%s", p.base, url.PathEscape(name)), "select")
 }
 
 // subList fetches the server's subtitle listing; subtitles are best-effort

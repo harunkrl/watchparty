@@ -16,11 +16,12 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { existsSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Proxy } from './wanlink.mjs';
+import { rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -37,6 +38,7 @@ const OPT = {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const children = [];
+const servers = []; // every server handle: the shared dir goes away only after the LAST one is reaped
 const cleanup = () => { for (const c of children) { try { c.kill('SIGKILL'); } catch {} } };
 process.on('exit', cleanup);
 process.on('SIGINT', () => { cleanup(); process.exit(130); });
@@ -114,6 +116,7 @@ function startServer(port, videos, stateFile) {
   if (stateFile) env.STATE_FILE = stateFile; // R4: unique state file per run (tmp)
   const s = spawn(process.execPath, [OPT.server], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   children.push(s);
+  servers.push(s);
   s.out = '';
   s.stdout.on('data', (d) => { s.out += d; });
   s.stderr.on('data', (d) => { s.out += d; });
@@ -127,6 +130,23 @@ async function waitServer(port) {
     await sleep(100);
   }
   return false;
+}
+
+// F6/C1: kill -> WAIT for the real exit. The server writes its room state
+// into ctx.dir (state.json + state.json.tmp): removing the dir while the
+// server is still alive races that write (ENOTEMPTY) and loses it.
+// The signal stays SIGKILL (the phases' current teardown): a SIGTERM would
+// add an exit-time state write that the NEXT phase's server restores (the
+// state file is shared across the phases) - a semantic change, not a hardening.
+function waitExit(proc) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((r) => proc.once('exit', r));
+}
+function reap(proc) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  const exited = waitExit(proc);
+  try { proc.kill('SIGKILL'); } catch {}
+  return exited;
 }
 
 function makeVideo(dir, mbit, seconds) {
@@ -190,6 +210,7 @@ async function phaseF2(ctx) {
   res.proxyLog = proxyF.log;
   res.serverLog = server.out;
   res.serverExited = server.exited;
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close();
   return res;
@@ -306,6 +327,7 @@ async function phaseF3(ctx) {
     serverLog: server.out,
     serverExited: server.exited,
   };
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close();
   return res;
@@ -347,6 +369,7 @@ async function phaseR4(ctx) {
   // crash the server (SIGKILL = no clean shutdown, no flush)
   const tKill = Date.now();
   server.kill('SIGKILL');
+  await waitExit(server); // the crash must not flush, but the exit must be over before the restart
   await sleep(2000);
   const duringOutage = await snap();
   // restart with the SAME state file
@@ -386,6 +409,7 @@ async function phaseR4(ctx) {
     masterOut: master.out,
     followerOut: follower.out,
   };
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close(); cIpc.close();
   return res;
@@ -446,6 +470,7 @@ async function phasePause(ctx) {
     followerOut: follower.out,
     serverLog: server.out,
   };
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   proxyF.close(); proxyM.close(); mIpc.close(); fIpc.close();
   return res;
@@ -476,7 +501,7 @@ async function phaseR7(ctx) {
           try { sseEvents.push({ t: +((Date.now() - t0) / 1000).toFixed(2), ev: JSON.parse(m[1]) }); } catch {}
         }
       }
-    })();
+    })().catch(() => {}); // the teardown kills the server under the open probe: it is best-effort
   } catch (e) { sseEvents.push({ t: -1, ev: { type: 'probe-error', msg: String(e) } }); }
 
   const proxyF = new Proxy(ctx.proxyFPort, ctx.port, 0, 'F');
@@ -558,7 +583,7 @@ async function phaseR7(ctx) {
     await sleep(6000);
     await sample('after-impostor-user-seek+8.5s');
   }
-  const afterSeek = samples[samples.length - 1];
+  const _afterSeek = samples[samples.length - 1];
 
   // (c) the owner dies: the election resets, the survivor claims the clock
   const survivorIpc = ownerName === 'bo' ? i1 : i2;
@@ -622,6 +647,7 @@ async function phaseR7(ctx) {
     },
     serverLog: server.out,
   };
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   proxyF.close(); proxyM.close(); i1.close(); i2.close(); iF.close();
   return res;
@@ -652,7 +678,7 @@ async function phaseLatejoin(ctx) {
           try { sseEvents.push({ t: +((Date.now() - t0) / 1000).toFixed(2), ev: JSON.parse(m[1]) }); } catch {}
         }
       }
-    })();
+    })().catch(() => {}); // the teardown kills the server under the open probe: it is best-effort
   } catch {}
 
   const master = startClient('M', true, `http://127.0.0.1:${ctx.port}`);
@@ -711,6 +737,7 @@ async function phaseLatejoin(ctx) {
     masterOut: master.out,
     sseEvents,
   };
+  await reap(server); // F6/C1: the exit before the dir goes away
   for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
   mIpc.close(); fIpc.close();
   return res;
@@ -766,7 +793,10 @@ async function phaseLatejoin(ctx) {
   if (slim.f3) { delete slim.f3.masterOut; delete slim.f3.followerOut; }
   console.log(JSON.stringify(slim, null, 2));
   if (OPT.out) writeFileSync(OPT.out, JSON.stringify(out, null, 2));
-  rmSync(dir, { recursive: true, force: true });
+  // F6/C1: the shared dir goes away only after the LAST server on it is
+  // reaped (each phase reaps its own), and the rm retries the directory race.
+  for (const s of servers) await reap(s);
+  rmWithRetry(dir);
   cleanup();
   process.exit(0);
 })();

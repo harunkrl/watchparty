@@ -14,12 +14,15 @@ import (
 
 // recPlayer records what the engine asked mpv to do.
 type recPlayer struct {
-	pauses []bool
-	seeks  []float64
-	vols   []float64 // F5 local volume nudges
-	mutes  int       // F5 mute toggles
-	pos    float64
-	hasPos bool
+	pauses  []bool
+	seeks   []float64
+	vols    []float64 // F5 local volume nudges
+	mutes   int       // F5 mute toggles
+	subAdds []float64 // v1.8.0 local subtitle-timing nudges
+	subSets []float64 // v1.8.0 absolute sub-delay sets
+	hints   int       // v1.8.0 sub-delay OSD hint asks (the template is mpv's to expand)
+	pos     float64
+	hasPos  bool
 }
 
 func (p *recPlayer) Load(string) error          { return nil }

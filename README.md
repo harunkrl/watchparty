@@ -61,8 +61,15 @@ Everything you type goes to the room as chat. Commands start with `/`:
 | `/play <file>` | start playing a file for everyone (anyone can call it) |
 | `/queue` | open the cursor list in queue mode (enter queues) |
 | `/queue <file>` | append to the shared queue; auto-plays when the current file ends |
+| `/sub` | list the subtitle files that belong to the current video |
+| `/sub <name>` | attach that subtitle to the current video — no reload, only your screen |
+| `/subdelay <±sec>` | shift your subtitle timing (`+0.35` delays subs, `0` resets) — local only |
 | `/skip` | jump to the next file in the queue (same as the current file ending) |
 | `/quit` | exit |
+
+These slash commands are TUI features — the headless adapter (the test
+harness) only knows the plain verbs (`list`, `play`, …) and sends
+anything else to the room as chat.
 
 The TUI has a few shortcuts beyond the slash commands (wide terminals
 get a two-column dashboard: now-playing, watchers, queue and system log
@@ -79,6 +86,7 @@ on the left; chat and input on the right):
 | `ctrl+↑` / `ctrl+↓` | your own volume ±5 % — local, the room never hears it |
 | `alt+p` | play/pause for the whole room (where `ctrl+space` does not arrive) |
 | `alt+←` / `alt+→` | seek everyone ∓5 s / ±5 s (same as `ctrl+←/→`) |
+| `alt+↑` / `alt+↓` | your own subtitle timing ±0.5 s — local, the room never hears it |
 | `alt+m` | mute your own player — local, the room never hears it |
 | `F1` | a keys sheet: every other key keeps working while it is open |
 | `ctrl+z` | movie mode: collapse to one status line + chat + input |

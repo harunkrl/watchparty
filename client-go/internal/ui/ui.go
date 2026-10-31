@@ -7,10 +7,13 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,14 +31,15 @@ import (
 )
 
 const (
-	logCap      = 500
-	histCap     = 100
-	durProbes   = 20   // duration fetch retries after a load (500ms apart)
-	dashMin     = 100  // two-column dashboard needs this many columns
-	dashMinH    = 20   // ... and this many rows; narrower falls back to the stacked layout
-	seekStep    = 5.0  // ctrl+arrow nudge, seconds
-	seekStepBig = 30.0 // ctrl+shift+arrow nudge: the whole-movie cadence (F5)
-	volStepUI   = 5.0  // F5 local volume nudge, percent (the OSD hint)
+	logCap       = 500
+	histCap      = 100
+	durProbes    = 20   // duration fetch retries after a load (500ms apart)
+	dashMin      = 100  // two-column dashboard needs this many columns
+	dashMinH     = 20   // ... and this many rows; narrower falls back to the stacked layout
+	seekStep     = 5.0  // ctrl+arrow nudge, seconds
+	seekStepBig  = 30.0 // ctrl+shift+arrow nudge: the whole-movie cadence (F5)
+	volStepUI    = 5.0  // F5 local volume nudge, percent (the OSD hint)
+	subDelayStep = 0.5  // v1.8.0 local subtitle-timing nudge, seconds
 
 	resizeSettle = 100 * time.Millisecond // A4: the resize-storm debounce window
 	sysRows      = 30                     // system tail lines in the dashboard
@@ -131,7 +135,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+m mute · F1 keys · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /sub [sub] · /subdelay <±sec> · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+↑/↓ sub-delay ±0.5s · alt+m mute · F1 keys · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -389,6 +393,31 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	case sync.UiState:
 		st := msg
 		m.st = &st
+	case subMsg: // the /sub probe answered (off the update thread)
+		if msg.video != m.now { // the room moved on while the probe ran
+			if msg.name == "" {
+				return m, nil // a stale list is noise
+			}
+			return m.failf("the room moved to %s — /sub %s cancelled", m.now, msg.name)
+		}
+		if msg.name == "" {
+			if len(msg.subs) == 0 {
+				return m.logf("> no sidecar subtitles for %s", msg.video), nil
+			}
+			m = m.logf("> subtitles for %s (attach with /sub <name>):", msg.video)
+			for _, s := range msg.subs {
+				m = m.logf("  %s", s)
+			}
+			return m, nil
+		}
+		if !slices.Contains(msg.subs, msg.name) {
+			return m.failf("no such subtitle for %s (try bare /sub)", msg.video)
+		}
+		if err := m.player.AttachSub(msg.name); err != nil {
+			return m.failf("sub attach failed: %v", err)
+		}
+		m.osd("sub " + msg.name)
+		return m.logf("> sub %s attached (j switches tracks in the player window)", msg.name), nil
 	case filesMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
@@ -556,6 +585,16 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case "alt+up", "alt+down": // v1.8.0: LOCAL subtitle timing — never posted
+		if m.engine != nil {
+			d := -subDelayStep
+			if msg.String() == "alt+up" {
+				d = subDelayStep
+			}
+			m.engine.SubDelayBy(d)
+			m.osdSubDelay()
+		}
+		return m, nil
 	case "ctrl+z": // movie-night mode: one status line + chat + input
 		m.zen = !m.zen
 		return m.syncLayout(), nil
@@ -666,19 +705,22 @@ func (m Model) pickKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// verbs is the tab-completion candidate set (cmd.Parse accepts these).
-var verbs = []string{"pick", "play", "queue", "skip", "chat", "list", "help", "quit"}
+// verbs is the tab-completion candidate set (the TUI dispatches these;
+// sub/subdelay are TUI-local and never reach the headless verb parser).
+var verbs = []string{"pick", "play", "queue", "sub", "subdelay", "skip", "chat", "list", "help", "quit"}
 
 // verbDescs feeds the Tab menu.
 var verbDescs = map[string]string{
-	"pick":  "browse and play/queue",
-	"play":  "start a file for everyone",
-	"queue": "append to the shared queue",
-	"skip":  "jump to the next file",
-	"chat":  "send a message",
-	"list":  "list videos on the server",
-	"help":  "show commands",
-	"quit":  "exit",
+	"pick":     "browse and play/queue",
+	"play":     "start a file for everyone",
+	"queue":    "append to the shared queue",
+	"sub":      "attach a sidecar subtitle",
+	"subdelay": "shift your subtitle timing",
+	"skip":     "jump to the next file",
+	"chat":     "send a message",
+	"list":     "list videos on the server",
+	"help":     "show commands",
+	"quit":     "exit",
 }
 
 // candidatesFor returns the completion matches for the current input:
@@ -907,6 +949,11 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		if strings.TrimSpace(arg) == "" {
 			return m.openPicker(pickActQueue)
 		}
+	case "sub", "subdelay": // v1.8.0: LOCAL subtitle surfaces, never posted
+		if verb == "sub" {
+			return m.requestSub(strings.TrimSpace(arg))
+		}
+		return m.setSubDelay(strings.TrimSpace(arg))
 	}
 	c, err := cmd.Parse(body)
 	if err != nil {
@@ -945,6 +992,59 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 func firstLine(err error) string {
 	line, _, _ := strings.Cut(err.Error(), "\n")
 	return line
+}
+
+// subDelayHint asks the mpv window to show the REAL current delay: the
+// hint is a template mpv expands (Player.ShowSubDelayHint rides the
+// expand-properties prefix — the IPC array API expands nothing by
+// default), so the client never guesses the value and even z/Z pressed
+// in the player window cannot make the hint lie. The hook seam records
+// the ask; the wire form is pinned in the mpv package.
+func (m Model) osdSubDelay() {
+	if m.osdHook != nil {
+		m.osdHook("sub-delay ${sub-delay}")
+		return
+	}
+	if m.player != nil {
+		_ = m.player.ShowSubDelayHint()
+	}
+}
+
+// setSubDelay runs /subdelay <±N.N|0>: pin the subtitle timing to an
+// absolute value (0 = back in sync). Personal: no room post.
+func (m Model) setSubDelay(arg string) (Model, tea.Cmd) {
+	v, err := strconv.ParseFloat(arg, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return m.failf("subdelay needs a number like +0.35 or 0 (got %q)", arg)
+	}
+	if m.engine != nil {
+		m.engine.SubDelaySet(v)
+	}
+	m.osdSubDelay()
+	return m, nil
+}
+
+// subMsg is the /sub probe answer. The /subs HTTP probe rides a tea.Cmd
+// (the playFile precedent): a slow or unreachable server must never
+// freeze the update loop; the attach itself is a tell and fires when the
+// answer arrives.
+type subMsg struct {
+	video string   // the file the probe ran for
+	name  string   // the requested sub ("" = listing)
+	subs  []string // the candidates for video
+}
+
+// requestSub runs /sub: bare, it lists the sidecar candidates for the
+// current file; with a name it attaches that one track — no reload, and
+// no room post (subtitle choice is personal, like the timing).
+func (m Model) requestSub(name string) (Model, tea.Cmd) {
+	if m.now == "" || m.player == nil {
+		return m.failf("no file playing — /sub attaches to the current video")
+	}
+	pl, video := m.player, m.now
+	return m, func() tea.Msg {
+		return subMsg{video: video, name: name, subs: pl.SubCandidates(video)}
+	}
 }
 
 func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
@@ -1472,7 +1572,7 @@ func (m Model) nowPlayingLines(w int) []string {
 			stats = append(stats, clk.Render("◷ clock: master (reference)"))
 		} else {
 			ds := lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift)))
-			stats = append(stats, ds.Render(fmt.Sprintf("≈ drift %+.1fs", m.st.Drift)))
+			stats = append(stats, ds.Render(driftChip(m.st.Drift)))
 		}
 		if m.st.Cache > 0 {
 			bs := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
@@ -2118,6 +2218,10 @@ func (m Model) helpLines() []string {
 		"ctrl+←/→            seek ±5s",
 		"ctrl+shift+←/→      seek ±30s",
 		"alt+←/→             seek ±5s (terminal-proof alias)",
+		title.Render("subtitles (local — the room never hears it)"),
+		"alt+↑/↓             sub-delay ±0.5s",
+		"/sub [name]         attach a sidecar sub · bare /sub lists them",
+		"/subdelay <±sec>    set the timing precisely · 0 resets",
 		title.Render("audio (local — the room never hears it)"),
 		"ctrl+↑/↓            volume ±5",
 		"alt+m               mute",
@@ -2126,7 +2230,7 @@ func (m Model) helpLines() []string {
 		"ctrl+z              movie mode · ctrl+g system pane",
 		"enter send · up/down history · pgup/pgdn scroll · tab complete",
 		"",
-		"commands: /list /pick /play [file] /queue [file] /skip /help /quit",
+		"commands: /list /pick /play [file] /queue [file] /sub [sub] /subdelay <±sec> /skip /help /quit",
 		"picker: up/down move · enter play/enqueue · q queue · esc cancel",
 		dim.Render("legacy conhost: ctrl+z / ctrl+g are dead there — alt keys and F1 still work"),
 	}
@@ -2250,7 +2354,7 @@ func (m Model) zenSyncChip() string {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("◷ master clock"))
 	} else {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
-			Render(fmt.Sprintf("≈ %+.1fs", m.st.Drift)))
+			Render(driftChip(m.st.Drift)))
 	}
 	return strings.Join(parts, dim.Render(" · "))
 }
@@ -2279,6 +2383,12 @@ func (m Model) progressBar(cw int) string {
 	return timeStyle.Render(elapsed) + " " + bar + " " + timeStyle.Render(total)
 }
 
+// driftChip is the movie-mode sync strip's drift string: a heads-up
+// triangle plus the signed seconds. The band color stays with driftColor.
+func driftChip(d float64) string {
+	return fmt.Sprintf("▸ %+.1fs", d)
+}
+
 // driftColor bands drift for the footer and the dashboard stat row, so the
 // classic and dashboard layouts never disagree about what "bad" means.
 func driftColor(d float64) string {
@@ -2299,7 +2409,7 @@ func (m Model) footerLine(cw int) string {
 		right = dim.Render(fmt.Sprintf("%d listening", len(m.peers)))
 	} else if m.st != nil && m.st.Pos != nil {
 		right = lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
-			Render(fmt.Sprintf("drift %+.1fs", m.st.Drift))
+			Render(driftChip(m.st.Drift))
 	}
 	return joinLR(m.queuePreview(), right, cw)
 }

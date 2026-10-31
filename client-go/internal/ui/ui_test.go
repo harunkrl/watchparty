@@ -258,7 +258,7 @@ func TestFooterShowsDriftAndListeners(t *testing.T) {
 	p := 10.0
 	f := New("t", nil, nil, false, nil)
 	m := upd(t, f, sync.UiState{Drift: 0.42, Pos: &p})
-	if !strings.Contains(m.footerLine(m.contentWidth()), "drift +0.4s") {
+	if !strings.Contains(m.footerLine(m.contentWidth()), "+0.4s") {
 		t.Fatalf("footer missing drift: %q", m.footerLine(m.contentWidth()))
 	}
 	mm := New("t", nil, nil, true, nil)

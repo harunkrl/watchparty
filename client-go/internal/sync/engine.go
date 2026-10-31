@@ -118,6 +118,11 @@ type Player interface {
 	// posts these — audio belongs to the viewer's ears, not the room.
 	SetVolume(delta float64) error
 	ToggleMute() error
+	// v1.8.0: LOCAL subtitle timing — same personal law as volume. The
+	// nudge is mpv's relative add (read-add-set inside mpv), the set pins
+	// the absolute value; both are tell-only.
+	AddSubDelay(delta float64) error
+	SetSubDelay(v float64) error
 }
 
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
@@ -747,6 +752,38 @@ func (e *Engine) VolumeMute() {
 	} else {
 		e.logf("> unmuted")
 	}
+}
+
+// SubDelayBy/SubDelaySet are LOCAL subtitle-timing keys (v1.8.0): timing
+// is personal, the room is never told — the F5 volume law again. Lock
+// discipline: both take e.mu and fire a tell-only player call, exactly the
+// volumeNudge pattern — no engine field holds the value (mpv owns it; the
+// nudge is mpv's relative add), so there is no cross-goroutine state to
+// race and no round trip to hold the lock on a wedged mpv.
+func (e *Engine) SubDelayBy(delta float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Player == nil {
+		return
+	}
+	if err := e.Player.AddSubDelay(delta); err != nil {
+		e.logf("> subdelay: mpv refused (%v)", err)
+		return
+	}
+	e.logf("> subdelay %+.1f", delta)
+}
+
+func (e *Engine) SubDelaySet(v float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Player == nil {
+		return
+	}
+	if err := e.Player.SetSubDelay(v); err != nil {
+		e.logf("> subdelay: mpv refused (%v)", err)
+		return
+	}
+	e.logf("> subdelay %.1f", v)
 }
 
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.

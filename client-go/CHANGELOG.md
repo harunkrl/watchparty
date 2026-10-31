@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.8.0 — subtitles you can actually align
+
+- client (ui): alt+↑/↓ nudge your subtitle timing ±0.5s and /subdelay
+  <±sec> pins it precisely ("/subdelay 0" resets) — LOCAL surfaces on the
+  F5 volume law: timing is personal, the room is never told. The mpv
+  window shows the REAL delay on every change: the hint is a template
+  mpv itself expands (the dedicated expand-properties tell — the IPC
+  array API expands nothing by default; the shared chat OSD stays
+  expansion-free so a chat ${...} can never be expanded) and renders in
+  mpv's own milliseconds format, so even z/Z pressed in the player
+  window cannot make the hint lie. The nudge rides mpv's relative add —
+  the read-add-set happens inside mpv as one step, no client copy of the
+  value to go stale and no IPC round trip to hold the engine lock
+- client (ui): /sub <name> attaches one sidecar subtitle to the CURRENT
+  film without reloading it, and bare /sub lists the candidates — the
+  same probe and family ordering AttachSubs uses (extracted as one rule
+  so the two surfaces cannot disagree). The /subs probe rides a
+  background command (the playFile rule): a slow server can freeze the
+  room's heartbeat, never the TUI. Honest refusals: nothing playing, a
+  name that is not a sidecar of this file, or a probe that outlived the
+  file. A subtitle choice is personal: local notice only, never a room
+  post
+- client (ui): the drift chip carries the number in one shared format
+  everywhere ("▸ +2.3s", signed, one decimal — movie-mode strip,
+  dashboard stat row and the classic footer alike); the band color stays
+  driftColor's, unchanged; pinned at the band boundaries
+- docs: the v1.7.0 section loses a stray blank line that split it in two
+
 ## v1.7.1 — the race the CI runner saw first
 
 - client (sync): setSpeed mutated the engine's tempo cache without the
@@ -36,7 +64,6 @@
 - client (ui): resize storms debounce — the first resize applies, a
   burst only updates the dimensions and one re-layout lands after
   the 100ms settle
-
 - client: when the room's heartbeat stops, the status row says "no room
   heartbeat — waiting for the master" — and an ENDED film no longer
   looks like a missing master (the master's heartbeats stop with the

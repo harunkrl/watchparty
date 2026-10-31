@@ -20,6 +20,8 @@ type fakePlayer struct {
 	showText []string
 	vols     []float64 // F5 local volume nudges
 	mutes    int       // F5 mute toggles
+	subAdds  []float64 // v1.8.0 local subtitle-timing nudges
+	subSets  []float64 // v1.8.0 absolute sub-delay sets
 	pos      *float64
 	posCalls int   // F6-A2: SeekBy must not pay IPC round trips
 	loadErr  error // returned by Load to simulate a failed loadfile

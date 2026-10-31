@@ -10,11 +10,12 @@
 
 import { execFileSync, execSync, spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Proxy } from './wanlink.mjs';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -141,6 +142,7 @@ class MpvIpc {
 }
 
 const dir = mkdtempSync(join(tmpdir(), 'wp-stall-'));
+let server = null;
 let failed = 0;
 const check = (ok, msg) => {
   if (ok) { console.log(`PASS: ${msg}`); return; }
@@ -150,7 +152,7 @@ const check = (ok, msg) => {
 
 try {
   makeVideo(dir, 240); // 240s: both scenarios (silence + reconnect) must stay clear of EOF
-  startServer(PORT, dir);
+  server = startServer(PORT, dir);
   if (!await waitServer(PORT)) throw new Error('the server did not come up');
 
   // the follower goes through the proxy (its link can be silenced), the
@@ -230,7 +232,11 @@ try {
   failed++;
   console.error(`FAIL: ${e.stack || e}`);
 } finally {
-  rmSync(dir, { recursive: true, force: true });
+  // F6/C1: kill -> WAIT for the exit -> rm (3x retry). The server writes its
+  // room state into dir when it exits: removing the dir first raced that
+  // write (ENOTEMPTY) and lost it.
+  if (server) await stopServer(server, dir);
+  else rmWithRetry(dir);
   cleanup();
 }
 
