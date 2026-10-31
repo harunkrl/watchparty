@@ -59,7 +59,9 @@ jobs:
           for s in smoke persist audit_server audit2_server audit3_server \
                    f2_server f1_server integration pause_sync \
                    stall_family master_restart soak; do
-            ../tests/ci_retry.sh node tests/$s.mjs || exit 1
+            # this block runs from the repo ROOT (see working-directory
+            # below) — NOT the ../tests path the client-go steps use
+            tests/ci_retry.sh node tests/$s.mjs || exit 1
           done
         # the job default (client-go) does not contain tests/: run the
         # suites from the workspace root, like the CI node job
