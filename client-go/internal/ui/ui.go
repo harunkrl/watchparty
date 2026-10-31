@@ -35,11 +35,18 @@ const (
 	dashMinH    = 20   // ... and this many rows; narrower falls back to the stacked layout
 	seekStep    = 5.0  // ctrl+arrow nudge, seconds
 	seekStepBig = 30.0 // ctrl+shift+arrow nudge: the whole-movie cadence (F5)
-	sysRows     = 30   // system tail lines in the dashboard
-	eqBars      = 40   // vibe equalizer column budget (widest terminal)
-	eqPeriod    = 150 * time.Millisecond
-	zenDimAfter = 15 * time.Minute // zen only: messages older than this fade out
+	volStepUI   = 5.0  // F5 local volume nudge, percent (the OSD hint)
+
+	resizeSettle = 100 * time.Millisecond // A4: the resize-storm debounce window
+	sysRows      = 30                     // system tail lines in the dashboard
+	eqBars       = 40                     // vibe equalizer column budget (widest terminal)
+	eqPeriod     = 150 * time.Millisecond
+	zenDimAfter  = 15 * time.Minute // zen only: messages older than this fade out
 )
+
+// resizeSettleMsg closes the A4 debounce window: the layout re-syncs once
+// after the storm instead of per event.
+type resizeSettleMsg struct{}
 
 type mode int
 
@@ -139,6 +146,7 @@ type Model struct {
 	master     bool
 	api        *room.Client
 	player     *mpv.Player
+	osdHook    func(string) // test seam for the OSD hint (nil = the mpv window)
 	engine     *sync.Engine
 	input      textinput.Model
 	spin       spinner.Model  // connecting screen (pre-WindowSizeMsg)
@@ -170,6 +178,7 @@ type Model struct {
 	zen        bool       // movie-night mode: one status line + input only
 	sysOff     bool       // ctrl+g: system pane hidden
 	helpOpen   bool       // F1: passive keys overlay (every other key keeps working)
+	resizing   bool       // A4: a resize storm is in flight (the settle re-syncs)
 	gone       []string   // departed nicks, shown offline (cap 5)
 	eq         []float64  // vibe equalizer bar heights 0..1
 	compOpen   bool       // Tab menu of command/file completions
@@ -245,16 +254,23 @@ func postEvent(api *room.Client, ev room.Event) tea.Cmd {
 // playFile mirrors client.py's play: load locally first, then tell the
 // room. The engine is told too (OwnLoad) — our own load never comes back
 // as a room event, and without it a later hello would reload the very
-// file mpv is already playing (F3, master half).
+// file mpv is already playing (F3, master half). F6-A1: the settle (wait
+// + subtitles) continues in the background — the cmd goroutine reports
+// the load to the room immediately instead of after the whole chain.
 func playFile(pl *mpv.Player, api *room.Client, engine *sync.Engine, name string) tea.Cmd {
 	return func() tea.Msg {
-		if err := pl.Load(name); err != nil {
+		if _, err := pl.StartLoad(name); err != nil {
 			return errMsg{err}
 		}
 		engine.OwnLoad(name)
 		if err := api.Post(room.Event{Type: "load", Name: name}); err != nil {
 			return errMsg{err}
 		}
+		go func() {
+			if pl.WaitLive(name, time.Now().Add(mpv.LoadWait)) {
+				pl.AttachSubs(name)
+			}
+		}()
 		return loadedMsg{name}
 	}
 }
@@ -337,7 +353,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// A4: a terminal drag fires dozens of resizes per second; the layout
+		// join is not free. The FIRST resize applies (feedback is instant),
+		// the rest of the storm only updates the dims, and a settle tick
+		// re-runs the layout once the storm passes.
 		m.width, m.height = msg.Width, msg.Height
+		if m.resizing {
+			return m, nil
+		}
+		m.resizing = true
+		return m.syncLayout(), tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizeSettleMsg{} })
+	case resizeSettleMsg:
+		m.resizing = false
 		return m.syncLayout(), nil
 	case tea.MouseMsg: // wheel scrolls chat; a click on the bar seeks
 		if c := m.barClick(msg); c != nil {
@@ -420,6 +447,20 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 // inputKeys handles typing plus history browsing and viewport scrolling.
+// osd shows a short hint in the mpv window: the movie window is often
+// hidden behind the TUI, so the log line alone is invisible feedback.
+// LOCAL ONLY — the OSD never touches the room (F6 D3).
+func (m Model) osd(text string) {
+	if m.osdHook != nil {
+		m.osdHook(text)
+		return
+	}
+	if m.player == nil {
+		return
+	}
+	_ = m.player.ShowText(text, 1500)
+}
+
 func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if m.compOpen { // the completion menu owns the keys while open
 		switch msg.String() {
@@ -463,6 +504,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				dt = seekStep
 			}
 			m.engine.SeekBy(dt)
+			m.osd(fmt.Sprintf("%+.0fs", dt)) // F6 D3: the mpv window shows the nudge
 		}
 		return m, nil
 	case "ctrl+shift+left", "ctrl+shift+right": // F5: the whole-movie cadence
@@ -472,6 +514,7 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				dt = seekStepBig
 			}
 			m.engine.SeekBy(dt)
+			m.osd(fmt.Sprintf("%+.0fs", dt))
 		}
 		return m, nil
 	case "alt+p": // conhost-proof alias: same toggle as ctrl+space
@@ -486,14 +529,17 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				dt = seekStep
 			}
 			m.engine.SeekBy(dt)
+			m.osd(fmt.Sprintf("%+.0fs", dt))
 		}
 		return m, nil
 	case "ctrl+up", "ctrl+down": // F5: LOCAL volume — never posted to the room
 		if m.engine != nil {
 			if msg.String() == "ctrl+up" {
 				m.engine.VolumeUp()
+				m.osd(fmt.Sprintf("vol %+.0f%%", volStepUI))
 			} else {
 				m.engine.VolumeDown()
+				m.osd(fmt.Sprintf("vol %+.0f%%", -volStepUI))
 			}
 		}
 		return m, nil
@@ -501,6 +547,13 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// so ctrl+m is a dead key by physics — alt carries the mute key instead
 		if m.engine != nil {
 			m.engine.VolumeMute()
+			// the polled flag is the pre-toggle state: name the state we
+			// EXPECT (the next poll corrects it if mpv refused)
+			if m.st != nil && m.st.Muted {
+				m.osd("unmuted")
+			} else {
+				m.osd("muted")
+			}
 		}
 		return m, nil
 	case "ctrl+z": // movie-night mode: one status line + chat + input
@@ -1456,8 +1509,11 @@ func (m Model) nowPlayingLines(w int) []string {
 			stats = append(stats, ss.Render(fmt.Sprintf("⊞ you: sub %s [j in mpv]", m.st.Sub)))
 		}
 		if m.st.Stale { // no heartbeat from the room: say so instead of pretending
-			// (neutral wording: our own link may be the broken one — A5 W9)
-			stats = append(stats, pausedStyle.Render("⚠ no room heartbeat"))
+			// (neutral wording: our own link may be the broken one — A5 W9.
+			// F6 D1: "waiting for the master" states what WE do, not a
+			// diagnosis we cannot make — the client's own link can be the
+			// broken one, so "master gone" would be an unfounded claim.)
+			stats = append(stats, pausedStyle.Render("⚠ no room heartbeat — waiting for the master"))
 		}
 	}
 	// a blank row above and below the bar: the position reads calmer

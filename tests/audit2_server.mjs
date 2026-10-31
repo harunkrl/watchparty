@@ -10,6 +10,7 @@ import { mkdtempSync, writeFileSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,9 +29,8 @@ function startServer(files) {
   proc.stdout.on('data', (d) => (out += d));
   proc.stderr.on('data', (d) => (out += d));
   const base = `http://127.0.0.1:${port}`;
-  const stop = () => {
-    proc.kill();
-    rmSync(dir, { recursive: true, force: true });
+  const stop = async () => {
+    await stopServer(proc, dir); // kill -> wait for the exit -> rm (F6/C1)
   };
   return { dir, base, proc, out: () => out, stop };
 }
@@ -118,7 +118,7 @@ test('idle-room skip keeps the queued files waiting', async () => {
     assert.deepEqual(last.queue, ['a.mkv', 'b.mkv'], `idle skip wiped the queue: ${JSON.stringify(last.queue)}`);
     w.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -152,7 +152,7 @@ test('master crash mid-film: claim transfer and follower control still work', as
     f1.close();
     f2.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -177,7 +177,7 @@ test('ended during pause advances to the next queued file', async () => {
     late.close();
     w.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -196,7 +196,7 @@ test('sync events preserve wire order per connection', async () => {
     assert.deepEqual(kinds, ['position', 'seek', 'position'], `wire order ${JSON.stringify(kinds)}`);
     w.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 

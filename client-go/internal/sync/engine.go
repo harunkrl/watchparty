@@ -11,13 +11,22 @@ import (
 	"watchparty/client-go/internal/room"
 )
 
-// Fixed numbers, plan section 1 (client.py parity; taken verbatim).
 const (
 	PollSecs           = 2.0 // mpv poll period (master heartbeat cadence)
 	Tolerance          = 1.0 // follower drift threshold before re-seek
 	SeekScrubThreshold = 3.0 // |pos - last_pos - PollSecs| beyond this = scrub
 	volStep            = 5.0 // F5 local volume nudge (ctrl+up/down), percent
 )
+
+// postQueueMax bounds the wire backlog (F6-A3): a wedged server must not
+// grow the queue without end. Past the bound the oldest item dies — a
+// queued position dies before any discrete event (the next heartbeat
+// supersedes it anyway).
+const postQueueMax = 64
+
+// loadSettle bounds the off-lock half of a file change (F6-A1): how long
+// continueLoad waits for mpv to take the file (mirrors mpv.loadWait).
+const loadSettle = 5 * time.Second
 
 // Smooth-sync band: inside (speedBand, Tolerance] the follower nudges mpv's
 // speed instead of issuing a visible seek; the clamp keeps the tempo change
@@ -93,7 +102,13 @@ func (RealClock) Since(t time.Time) time.Duration { return time.Since(t) }
 
 // Player is the engine's view of mpv; *mpv.Player satisfies it.
 type Player interface {
-	Load(name string) error
+	// F6-A1: the load chain is split — StartLoad is the ONLY load step
+	// allowed under the engine lock (a bounded tell); the wait for the file
+	// to go live and the subtitle attach continue off it (guaranteed-signal
+	// re-poll, never the drop-on-full events channel).
+	StartLoad(name string) (string, error)
+	WaitLive(name string, deadline time.Time) bool
+	AttachSubs(name string)
 	SetPause(paused bool) error
 	Seek(t float64) error
 	Speed(f float64) error
@@ -137,7 +152,8 @@ type Engine struct {
 
 	lastPos   *float64
 	lastPause bool
-	muted     bool // last polled mpv mute flag: the mute log names the state we expect
+	muted     bool     // last polled mpv mute flag: the mute log names the state we expect
+	polledPos *float64 // last polled mpv position: SeekBy's target without an IPC round trip (F6-A2)
 	wasActive bool
 	pausedBy  string    // who paused the room (the relay's nick); "" = our own action
 	snap      *snapshot // follower: latest master position heartbeat
@@ -261,10 +277,41 @@ func newPostQueue() *postQueue {
 }
 
 // push appends an event and wakes the worker.
+// F6-A3: a queued position is superseded by any newer one — the heartbeat
+// flood collapses to exactly the latest position, landed at the TAIL so
+// the discrete events (seeks/pauses, which keep their order) execute
+// first; a pure discrete flood clamps at postQueueMax (the oldest item
+// dies, a queued position dying before any discrete).
 func (q *postQueue) push(ev room.Event) {
 	q.mu.Lock()
-	q.items = append(q.items, ev)
+	if ev.Type == "position" {
+		// F6-A3: the heartbeat flood collapses to the LATEST position,
+		// landed at the tail (after the discrete events, which keep their
+		// order)
+		keep := q.items[:0]
+		for _, it := range q.items {
+			if it.Type != "position" {
+				keep = append(keep, it)
+			}
+		}
+		q.items = append(keep, ev)
+	} else {
+		q.items = append(q.items, ev)
+	}
+	for len(q.items) > postQueueMax {
+		q.items = q.items[1:] // F6-A3: the oldest dies; the coalesced tail
+		// position only reaches here once 64 newer events made it stale
+	}
 	q.mu.Unlock()
+	select {
+	case q.sig <- struct{}{}:
+	default:
+	}
+}
+
+// wake nudges the worker (non-blocking: a pending signal already covers
+// the whole backlog).
+func (q *postQueue) wake() {
 	select {
 	case q.sig <- struct{}{}:
 	default:
@@ -371,7 +418,18 @@ func (e *Engine) setSpeed(f float64) {
 // position is stored, discrete events are applied to the player).
 func (e *Engine) OnRoom(ev room.Event) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	deferred := e.onRoomLocked(ev)
+	e.mu.Unlock()
+	// F6-A1 condition 4: the OSD tells run AFTER the unlock — a wedged mpv
+	// must not hold the engine lock (or the UI thread) for a chat bubble.
+	for _, f := range deferred {
+		f()
+	}
+}
+
+// onRoomLocked is OnRoom under e.mu; player calls that may block are
+// returned as deferred closures and run after the unlock.
+func (e *Engine) onRoomLocked(ev room.Event) (deferred []func()) {
 	switch ev.Type {
 	case "position":
 		now := e.Clock.Now()
@@ -387,7 +445,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 		// only (re)load when the file actually differs from what our mpv is
 		// already playing: an SSE blip must not restart a mid-film download (F3)
 		if ev.Now != "" && ev.Now != e.loaded {
-			e.load(ev.Now)
+			e.startLoad(ev.Now)
 		}
 		// a reconnect is a fresh stall window: a behind-tick from before
 		// the outage must not trip the stall counter on the first tick
@@ -427,7 +485,7 @@ func (e *Engine) OnRoom(ev room.Event) {
 		}
 	case "load":
 		if ev.Name != e.loaded {
-			e.load(ev.Name)
+			e.startLoad(ev.Name)
 		}
 	case "pause":
 		e.setPause(true)
@@ -461,8 +519,10 @@ func (e *Engine) OnRoom(ev room.Event) {
 		e.seekTo(ev.T)
 		e.lastPos = nil // the applied seek moved us: the scrub baseline is stale
 	case "chat":
-		// chat OSD over the video (client.py parity: 3s show-text)
-		_ = e.Player.ShowText(fmt.Sprintf("%s: %s", ev.Nick, ev.Text), 3000)
+		// chat OSD over the video (client.py parity: 3s show-text) — F6-A1:
+		// the tell runs after the unlock (condition 4)
+		osd := fmt.Sprintf("%s: %s", ev.Nick, ev.Text)
+		deferred = append(deferred, func() { _ = e.Player.ShowText(osd, 3000) })
 	case "notice":
 		// room-level warning (server election, R7). If it names US, a second
 		// --master is running: demote to follower instead of dueling — the
@@ -471,13 +531,21 @@ func (e *Engine) OnRoom(ev room.Event) {
 			e.Master = false
 			e.logf("> demoted to follower: another master owns the clock")
 		}
-		// OSD so both users see it even with the TUI window hidden
-		_ = e.Player.ShowText(ev.Text, 4000)
+		// OSD so both users see it even with the TUI window hidden —
+		// F6-A1: after the unlock (condition 4)
+		osd := ev.Text
+		deferred = append(deferred, func() { _ = e.Player.ShowText(osd, 4000) })
 	}
+	return deferred
 }
 
-func (e *Engine) load(name string) {
-	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
+// startLoad is the lock-held half of a file change (F6-A1): the
+// bookkeeping and the loadfile tell — the ONLY blocking call allowed here
+// (a bounded tell). The wait for the file to go live and the subtitle
+// attach continue OFF the lock (continueLoad), so a wedged mpv cannot
+// freeze the TUI for the whole load chain anymore (~25-35s before).
+func (e *Engine) startLoad(name string) {
+	// caller holds e.mu
 	e.behind, e.autoPaused = 0, false
 	e.resumed = false            // a new file: the next jump is a new resume
 	e.resumeSeen = false         // a new file: no unresolved jump
@@ -486,11 +554,10 @@ func (e *Engine) load(name string) {
 	e.mechPause = false          // the room plays a new file: no mechanical pause
 	e.wasActive = false          // the new file gets its own EOF: the old one is over
 	e.logf("> playing %s", name) // client.py Player.load parity (harness key)
-	if err := e.Player.Load(name); err != nil {
-		e.logf("mpv: %s", err)
-		return
-	}
-	e.loaded = name // claim it only once mpv actually took the file
+	// F6-A1: claimed SPECULATIVELY — the settle window must not let a hello
+	// reload the very file mpv is already taking (OwnLoad parity). If the
+	// load never goes live, the next load/hello re-syncs (logged there).
+	e.loaded = name
 	e.loadedAt = e.Clock.Now()
 	e.lastPos = nil // a new file starts at the head: the old scrub baseline is stale
 	e.dur = 0       // the new file's duration is unknown until mpv reports it
@@ -499,6 +566,27 @@ func (e *Engine) load(name string) {
 	// the room could be paused for a "stall" that is just the new head)
 	e.snap = nil
 	e.pendingPos = nil
+	if _, err := e.Player.StartLoad(name); err != nil {
+		e.logf("mpv: %s", err)
+		return
+	}
+	go e.continueLoad(name, e.Clock.Now().Add(loadSettle))
+}
+
+// continueLoad is the off-lock half of a file change (F6-A1): wait until
+// the file is live behind a GUARANTEED signal (WaitLive's own re-poll —
+// the mpv events channel DROPS under stall, so it can never be the
+// trigger), then clear the tempo nudge and attach subtitles. No e.mu is
+// held here.
+func (e *Engine) continueLoad(name string, deadline time.Time) {
+	if !e.Player.WaitLive(name, deadline) {
+		// shortcut: the speculative claim stays; a wedged mpv heals through
+		// the next load/hello (the room was told either way)
+		e.logf("mpv: load did not go live: %s", name)
+		return
+	}
+	e.setSpeed(1) // new file: clear any tempo nudge from the previous one
+	e.Player.AttachSubs(name)
 }
 
 // OwnLoad records a file the local user started outside the room-event
@@ -586,15 +674,16 @@ func (e *Engine) PauseToggle() {
 
 // SeekBy is the TUI hotkey nudge (ctrl+arrow): seek locally and post the
 // target — seekTo marks the echo so the resulting mpv event is consumed,
-// never re-posted.
+// never re-posted. F6-A2: the target comes from the polled position field,
+// NOT a Pos() IPC round trip (a wedged mpv would hold e.mu for ≤5s per
+// keypress).
 func (e *Engine) SeekBy(dt float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	t, ok := e.Player.Pos()
-	if !ok {
+	if e.polledPos == nil {
 		return
 	}
-	t = max(0, t+dt)
+	t := max(0, *e.polledPos+dt)
 	e.seekTo(t)
 	e.lastPost = e.Clock.Now()
 	e.postDiscrete(room.Event{Type: "seek", T: t})
@@ -673,6 +762,13 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	}
 	if s.Dur > 0 {
 		e.dur = s.Dur // the locally known media duration (F1 clamp)
+	}
+	e.muted = s.Muted // the mute log names the state we expect (F5)
+	if s.Pos != nil { // F6-A2: SeekBy spends this, not an IPC round trip
+		p := *s.Pos
+		e.polledPos = &p
+	} else {
+		e.polledPos = nil
 	}
 	e.muted = s.Muted // the mute log names the state we expect (F5)
 	// EOF transition (either role): at idle mpv keeps pause=false and drops
@@ -1043,7 +1139,11 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 	// The heartbeat age is measured on its own stamp (snap.beat): the
 	// snapshot's anchor (snap.at) is re-anchored by a discrete play event
 	// (R5), which would hide a dead master.
-	stale := !e.Master && e.snap != nil && e.Clock.Since(e.snap.beat) > staleAge
+	// F6 D1: an IDLE local player means the film ENDED — the master's
+	// heartbeats stop with the file (m2-S1's rule: only a LIVE master can
+	// starve us). An ended film is not a missing master, so the flag must
+	// not fire there (M1 semantics: EOF != a lost master).
+	stale := !e.Master && e.snap != nil && !s.Idle && e.Clock.Since(e.snap.beat) > staleAge
 	by := e.pausedBy
 	if !s.Pause {
 		by = "" // playing: the chip is not shown, the actor is moot

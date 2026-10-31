@@ -1,5 +1,61 @@
 # Changelog
 
+## v1.7.0 — a room that says when it goes quiet (UX + release hygiene)
+
+- client (sync): loading a new file no longer freezes the TUI — the
+  old Load held the engine lock across the whole chain (loadfile
+  wait + terminal Gets + subtitle HTTP, up to ~25-35s on a wedged
+  mpv); now only the loadfile tell runs under the lock and the wait
+  rides the player's own re-poll (the mpv events channel DROPS under
+  stall, so it can never be the trigger), with subtitles/speed/OSD
+  deferred to a lock-free continuation
+- client (sync): the wire queue is bounded (64) and position floods
+  collapse to the single latest position while discrete events keep
+  their order — a wedged server can no longer pile up a stale
+  position storm that all fires on reconnect
+- client: seeking jumps to the LAST POLLED position ± the step — the
+  old code did a fresh position round trip under the engine lock (up
+  to 5s on a wedged mpv); both viewers land on the same absolute
+  target, the aim is now approximate (± the 2s poll cadence)
+- client (ui): resize storms debounce — the first resize applies, a
+  burst only updates the dimensions and one re-layout lands after
+  the 100ms settle
+
+- client: when the room's heartbeat stops, the status row says "no room
+  heartbeat — waiting for the master" — and an ENDED film no longer
+  looks like a missing master (the master's heartbeats stop with the
+  file, so the flag stays off at EOF)
+- client: the local actions leave a hint in the mpv window (the movie
+  window is often hidden behind the TUI): "vol +5%", "-5s", "muted" —
+  local only, the room never hears a volume or a mute
+- docs: the README's shortcut table lists the F5 keys (ctrl+shift+←/→,
+  ctrl+↑/↓, alt+p, alt+←/→, alt+m, F1) and the conhost paragraph is
+  corrected — the alt+ aliases reach the app where ctrl+space does not
+- docs: the friend bundle's README mentions F1 (the passive key sheet)
+- server: a slow or half-open SSE client is cut off at a write
+  backlog cap (SSE_MAX_BUFFER, default 4MB) — the one unbounded
+  memory path on the server is gone; dead peers drop off the roster
+  via keepalive
+- server: the wrong-file gate now covers ALL steering — a client that
+  posted a position for another file has its load/play/pause dropped
+  too (TTL-bounded set, no clearing exception; skip stays open to
+  everyone)
+- server: state flushes serialize (write→fsync→rename chain; the
+  exit write JOINS the chain instead of racing it on the same tmp
+  file) and a corrupt state.json falls back to state.json.bak loudly
+  instead of booting an empty room
+- server: the exit-time write failure — the only silent catch — logs
+  now (a killed server's last flush is visible, never swallowed)
+- ci: every gate step's retry writes its logs to the step summary and
+  failed runs upload them as artifacts — the flake hunt has eyes at
+  last; the release gate refuses a tag without a changelog section
+  and the release notes quote only that tag's section
+- ci: a release now REQUIRES a "## <tag>" section in this changelog —
+  the gate fails the release instead of shipping a tag nobody can read
+  about (v1.6.3 shipped without one)
+- ci: the release notes are this tag's section only (not the whole
+  history) and they state the bundle size and the pinned mpv tag
+
 ## v1.6.2 — a release pipeline that re-runs its own flakes
 
 - ci: every gate step in both workflows (go test/test-race/audit3,

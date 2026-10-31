@@ -3,6 +3,7 @@ package ui
 import (
 	"math"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -30,8 +31,11 @@ func (p *recPlayer) SetVolume(delta float64) error {
 	p.vols = append(p.vols, delta)
 	return nil
 }
-func (p *recPlayer) ToggleMute() error    { p.mutes++; return nil }
-func (p *recPlayer) Pos() (float64, bool) { return p.pos, p.hasPos }
+func (p *recPlayer) ToggleMute() error                { p.mutes++; return nil }
+func (p *recPlayer) Pos() (float64, bool)             { return p.pos, p.hasPos }
+func (p *recPlayer) StartLoad(string) (string, error) { return "", nil }
+func (p *recPlayer) WaitLive(string, time.Time) bool  { return true }
+func (p *recPlayer) AttachSubs(string)                {}
 
 // W1: on Windows bubbletea delivers ctrl+space as a NUL rune (KeyRunes),
 // not as "ctrl+@" — the room play/pause hotkey must work for both, and

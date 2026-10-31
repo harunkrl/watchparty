@@ -19,6 +19,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"watchparty/client-go/internal/mpv"
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
 )
@@ -172,14 +173,17 @@ type matrixPlayer struct {
 	seeks  []float64
 }
 
-func (p *matrixPlayer) Load(string) error          { return nil }
-func (p *matrixPlayer) SetPause(v bool) error      { p.pauses = append(p.pauses, v); return nil }
-func (p *matrixPlayer) Seek(t float64) error       { p.seeks = append(p.seeks, t); return nil }
-func (p *matrixPlayer) Speed(float64) error        { return nil }
-func (p *matrixPlayer) ShowText(string, int) error { return nil }
-func (p *matrixPlayer) Pos() (float64, bool)       { return 30, true } // the seek needs a position
-func (p *matrixPlayer) SetVolume(float64) error    { return nil }
-func (p *matrixPlayer) ToggleMute() error          { return nil }
+func (p *matrixPlayer) Load(string) error                { return nil }
+func (p *matrixPlayer) SetPause(v bool) error            { p.pauses = append(p.pauses, v); return nil }
+func (p *matrixPlayer) Seek(t float64) error             { p.seeks = append(p.seeks, t); return nil }
+func (p *matrixPlayer) Speed(float64) error              { return nil }
+func (p *matrixPlayer) ShowText(string, int) error       { return nil }
+func (p *matrixPlayer) Pos() (float64, bool)             { return 30, true } // the seek needs a position
+func (p *matrixPlayer) SetVolume(float64) error          { return nil }
+func (p *matrixPlayer) ToggleMute() error                { return nil }
+func (p *matrixPlayer) StartLoad(string) (string, error) { return "", nil }
+func (p *matrixPlayer) WaitLive(string, time.Time) bool  { return true }
+func (p *matrixPlayer) AttachSubs(string)                {}
 
 // matrixMode is one context of the matrix: the state the user is in.
 type matrixMode struct {
@@ -380,6 +384,8 @@ func TestCtrlShortcutMatrix(t *testing.T) {
 				Master: true, ID: "ada-1", Player: pl, Clock: sync.RealClock{},
 				Post: func(room.Event) error { return nil },
 			}
+			thirty := 30.0 // F6-A2: the seek nudge reads the polled position
+			e.OnMpvp(mpv.State{Pos: &thirty, At: time.Now()})
 			m := New("ada", nil, nil, true, e)
 			m = mo.prep(t, m)
 			before := m

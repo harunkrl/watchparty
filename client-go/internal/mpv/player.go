@@ -39,7 +39,7 @@ const (
 // Bounds on the IPC layer. Vars, not consts, so tests can shrink them.
 var (
 	cmdTimeout = 5 * time.Second // one IPC round trip
-	loadWait   = 5 * time.Second // how long Load waits for the file to go live
+	LoadWait   = 5 * time.Second // how long WaitLive waits for the file to go live (F6-A1)
 )
 
 // State is one poll sample of the player, consumed by the sync engine.
@@ -673,38 +673,56 @@ func (p *Player) ShowText(text string, ms int) error {
 	return p.tell("show-text", text, ms)
 }
 
-// Load starts playing name, waits until the file is actually live, then
-// attaches a sidecar subtitle if one sits next to the video. A missing
-// subtitle (404) is not an error worth logging (python parity).
-func (p *Player) Load(name string) error {
+// StartLoad tells mpv to play vurl and returns the URL the file will live
+// under. F6-A1: this tell is the ONLY load step allowed under the engine
+// lock (a bounded write); the wait and the subtitles continue off it.
+func (p *Player) StartLoad(name string) (string, error) {
 	vurl := fmt.Sprintf("%s/v/%s", p.base, url.PathEscape(name))
 	if err := p.tell("loadfile", vurl); err != nil {
-		return err
+		return "", err
 	}
-	deadline := time.Now().Add(loadWait)
-	for i := 0; i < 50; i++ { // wait until loaded AND seekable: a seek issued
-		// between loadfile and file-loaded is silently dropped by mpv
-		// The wait is bounded by a deadline, not by a round count: on a wedged
-		// mpv every Get() costs a full cmdTimeout, and the caller (the engine)
-		// holds its lock across this call.
-		if time.Now().After(deadline) {
-			break
-		}
-		if got, _ := p.Get("path"); got == vurl {
+	return vurl, nil
+}
+
+// WaitLive blocks until name is the live, seekable file or the deadline
+// passes. F6-A1: this is the load settle's GUARANTEED signal — the mpv
+// events channel drops under stall, so it can never be the trigger. Every
+// IPC round trip is taken only while budget remains: a wedged mpv may
+// overshoot the deadline by ONE cmdTimeout, never by two (master-2
+// condition on the old loop's tail).
+func (p *Player) WaitLive(name string, deadline time.Time) bool {
+	vurl := fmt.Sprintf("%s/v/%s", p.base, url.PathEscape(name))
+	pathOK := false
+	for time.Until(deadline) > 0 {
+		if !pathOK {
+			got, _ := p.Get("path") // may eat the whole remaining budget
+			pathOK = got == vurl
+		} else {
 			if v, _ := p.Get("seekable"); v == true {
-				break
+				return true
 			}
+			pathOK = false // seekable lags: re-confirm the path next round
+		}
+		if time.Until(deadline) <= 0 {
+			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// a loadfile that failed (bad file, 404, unsupported) drops mpv back to
-	// idle — surface it instead of returning success for a player that never
-	// started (the engine logs this as "mpv: ..." next to its "playing" line)
-	if got, _ := p.Get("path"); got != vurl {
-		if idle, _ := p.Get("idle-active"); idle == true {
-			return fmt.Errorf("load failed: %s", name)
+	// one final honest check after the deadline — a single Get pair
+	// (up to ~2x cmdTimeout; the caller is the lock-free continuation,
+	// so this tail cannot stall the UI)
+	if got, _ := p.Get("path"); got == vurl {
+		if v, _ := p.Get("seekable"); v == true {
+			return true
 		}
 	}
+	return false
+}
+
+// AttachSubs attaches the sidecar subtitle tracks (HTTP probe + sub-add
+// tells + the j-key OSD). F6-A1: a continuation step — best-effort, run
+// OFF the engine lock.
+func (p *Player) AttachSubs(name string) {
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
 	// R8: subtitle siblings (movie.tr.srt, movie.es.srt, ...) ride along as
 	// selectable tracks — each user switches locally with mpv's j/J keys in
@@ -736,7 +754,6 @@ func (p *Player) Load(name string) error {
 	if added > 1 {
 		_ = p.ShowText(fmt.Sprintf("%d subtitles: press j in the player window to switch", added), 4000)
 	}
-	return nil
 }
 
 // subList fetches the server's subtitle listing; subtitles are best-effort

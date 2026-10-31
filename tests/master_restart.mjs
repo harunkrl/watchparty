@@ -11,6 +11,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -92,7 +93,7 @@ const mpvGet = (sockPath, prop) =>
     s.on('error', reject);
   });
 
-const cleanup = (code) => {
+const cleanup = async (code) => {
   for (const p of [master, follower, server]) {
     try { execSync(`pkill -TERM -P ${p.pid}`); } catch {}
     p.kill();
@@ -148,10 +149,10 @@ try {
   assert.ok(last.mPos > 5, `master restarted from scratch instead of resuming: ${last.mPos}`);
 
   console.log(`PASS: master restart resumed the room (master@${last.mPos.toFixed(1)}s, follower@${last.fPos.toFixed(1)}s)`);
-  cleanup(0);
+  await cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message);
   console.error('--- master ---\n' + master.out);
   console.error('--- follower ---\n' + follower.out);
-  cleanup(1);
+  await cleanup(1);
 }

@@ -48,6 +48,9 @@ binary (it asks for the server URL) or:
 ./watchparty --name bo http://<your-tailscale-ip>:8090
 ```
 
+Press `F1` in the client for the full key sheet (pause, seek, volume,
+mute, the file picker) — every other key keeps working while it is open.
+
 Everything you type goes to the room as chat. Commands start with `/`:
 
 | Command | Effect |
@@ -72,6 +75,12 @@ on the left; chat and input on the right):
 | `ctrl+p` | pick a film: browse and play/queue with the arrow keys |
 | `ctrl+space` | play/pause for the whole room |
 | `ctrl+←` / `ctrl+→` | seek everyone ∓5 s / ±5 s |
+| `ctrl+shift+←` / `ctrl+shift+→` | seek everyone ∓30 s / ±30 s (whole-movie jumps) |
+| `ctrl+↑` / `ctrl+↓` | your own volume ±5 % — local, the room never hears it |
+| `alt+p` | play/pause for the whole room (where `ctrl+space` does not arrive) |
+| `alt+←` / `alt+→` | seek everyone ∓5 s / ±5 s (same as `ctrl+←/→`) |
+| `alt+m` | mute your own player — local, the room never hears it |
+| `F1` | a keys sheet: every other key keeps working while it is open |
 | `ctrl+z` | movie mode: collapse to one status line + chat + input |
 | `ctrl+g` | hide/show the system pane (join/leave/sync chatter) |
 | mouse wheel | scroll the chat |
@@ -84,9 +93,9 @@ The `ctrl+` shortcuts above are inert until it closes.
 Two terminals eat shortcuts before the app sees them: tmux uses `ctrl+z`
 for suspend (so movie mode is unreachable there without rebinding it),
 and the old Windows console may not deliver `ctrl+space` as a control
-key — there is no room-wide pause shortcut there, so use Windows
-Terminal. (The space bar in the mpv window toggles your own player, not
-the room.)
+key. The `alt+` aliases exist for that case: `alt+p` pauses the room,
+`alt+m` mutes, `alt+←/→` seeks — or use Windows Terminal. (The space bar
+in the mpv window toggles your own player, not the room.)
 
 Note: with mouse on, terminal text selection needs `shift` held.
 
@@ -125,6 +134,11 @@ restart clears history).
 | `PORT` | `8090` | server port |
 | `WATCHPARTY_MPV` | — | extra mpv flags for the client, e.g. `"--vo=null"` |
 | `STATE_FILE` | `state.json` next to `server.js` | where the room state persists across restarts |
+| `SSE_MAX_BUFFER` | `4194304` (4 MB) | per-client SSE write backlog cap — a slower client is cut off instead of growing server memory |
+
+`GET /health` answers `{"now":<file|null>,"queueLen":<n>,"paused":<bool>,
+"listeners":<n>}` — a cheap diagnostic probe (curl only, no SSE join
+needed). It carries room state, never a name or an id.
 
 ## Test
 

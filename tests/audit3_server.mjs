@@ -139,7 +139,10 @@ await scenario('pin: /health leaks no room/identity detail', async () => {
     await waitReady(s.base);
     await post(s.base, { type: 'load', from: 'm', name: 'x.mp4' });
     const h = await (await fetch(`${s.base}/health`)).json();
-    assert.deepEqual(Object.keys(h).sort(), ['listeners', 'now', 'queueLen']);
+    // 'paused' joined the diagnostic surface in v1.7.0 (F6 B-batch,
+    // documented in README Config) — same class as 'now': room state,
+    // no identity
+    assert.deepEqual(Object.keys(h).sort(), ['listeners', 'now', 'paused', 'queueLen']);
     assert.equal(h.now, 'x.mp4', 'bare filename, not a path');
   } finally {
     await s.stop();

@@ -23,3 +23,7 @@ The movie plays in a separate mpv window. The black window is the remote
 control — just type your message there and press Enter to talk.
 Commands start with "/": /list | /pick | /play <file> | /queue <file> |
 /skip | /help   (everything else you type goes to the room as chat)
+
+Keys: press F1 in the client for the full sheet (pause, seek, volume,
+mute, the file picker). F1 works while you type — every other key keeps
+working while the sheet is open.

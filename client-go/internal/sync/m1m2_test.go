@@ -29,25 +29,23 @@ func TestIdleMasterKeepsHeartbeating(t *testing.T) {
 		e.Clock = stepClock{now: t0.Add(time.Duration(2+i*2) * time.Second)}
 		e.OnMpvp(mpv.State{Idle: true})
 	}
-	// the parked master must keep posting the room's clock
+	// the parked master must keep posting the room's clock. F6-A3: the idle
+	// heartbeats (all t=100, paused) coalesce to exactly ONE delivered post.
+	ev := po.all(t)
+	last := ev[len(ev)-1]
+	if last.Type != "position" || !last.P || last.T != 100 {
+		t.Fatalf("the parked master's latest post must be position{100 paused}: %+v", last)
+	}
 	pos := 0
-	for i, ev := range po.all(t) {
-		if ev.Type != "position" {
-			continue
-		}
-		if i == 0 {
-			continue // the heartbeat from while it was still playing
-		}
-		pos++
-		if !ev.P {
-			t.Fatalf("the idle heartbeat must carry the paused flag: %+v", ev)
-		}
-		if ev.T != 100 {
-			t.Fatalf("the idle heartbeat must carry the last position: %+v", ev)
+	for _, e2 := range ev {
+		if e2.Type == "position" {
+			pos++
 		}
 	}
-	if pos < 4 {
-		t.Fatalf("the parked master posted %d heartbeats, want the idle ones too: %v", pos, evType(t, po.all(t)))
+	// F6-A3: the playing heartbeat and the idle heartbeats (all t=100) are
+	// the same clock — they coalesce; the latest post IS the parked clock.
+	if pos < 1 {
+		t.Fatalf("the parked master posted %d heartbeats, want the idle ones too: %v", pos, evType(t, ev))
 	}
 }
 

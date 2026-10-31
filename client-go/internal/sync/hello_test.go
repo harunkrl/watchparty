@@ -13,8 +13,9 @@ func TestHelloAppliesSnapshot(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	pos := 123.5
 	e.OnRoom(room.Event{Type: "hello", Now: "x.mkv", Pos: &pos, P: true})
-	if len(pl.loads) != 1 || pl.loads[0] != "x.mkv" {
-		t.Fatalf("load: got %v, want [x.mkv]", pl.loads)
+	// F6-A1: the load claim is speculative at StartLoad
+	if e.loaded != "x.mkv" {
+		t.Fatalf("load: got %q, want x.mkv", e.loaded)
 	}
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("pause: got %v, want [true]", pl.pauses)
@@ -39,9 +40,9 @@ func TestHelloAppliesSnapshot(t *testing.T) {
 func TestHelloWithoutPosDoesNotSnap(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(room.Event{Type: "hello", Now: "x.mkv"})
-	if len(pl.loads) != 1 || len(pl.seeks) != 0 || len(pl.pauses) != 0 {
-		t.Fatalf("legacy hello: got loads=%v seeks=%v pauses=%v",
-			pl.loads, pl.seeks, pl.pauses)
+	if e.loaded != "x.mkv" || len(pl.seeks) != 0 || len(pl.pauses) != 0 {
+		t.Fatalf("legacy hello: got loaded=%q seeks=%v pauses=%v",
+			e.loaded, pl.seeks, pl.pauses)
 	}
 	if e.snap != nil {
 		t.Fatalf("snap must be nil for hello without Pos: %+v", e.snap)

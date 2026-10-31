@@ -349,21 +349,25 @@ func TestPipePollReadsLayoutAndSubtitle(t *testing.T) {
 	}
 }
 
-// A wedged mpv must not pin the caller: Load waits for the file to go
-// live and the engine holds its lock across that call (OnRoom -> load ->
-// Player.Load), so the wait must be bounded.
+// A wedged mpv must not pin the caller: WaitLive waits for the file to go
+// live and (pre-F6-A1) the engine held its lock across that call, so the
+// wait must be bounded.
 func TestPipeLoadWaitIsBoundedWhenMpvIsWedged(t *testing.T) {
-	origCmd, origWait := cmdTimeout, loadWait
-	cmdTimeout, loadWait = 20*time.Millisecond, 200*time.Millisecond
-	defer func() { cmdTimeout, loadWait = origCmd, origWait }()
+	origCmd, origWait := cmdTimeout, LoadWait
+	cmdTimeout, LoadWait = 20*time.Millisecond, 200*time.Millisecond
+	defer func() { cmdTimeout, LoadWait = origCmd, origWait }()
 
 	p, _ := newFake(t, nil, nil) // wedged: the requests are swallowed
 	defer p.Close()
 
 	start := time.Now()
-	_ = p.Load("movie.mkv")
+	_, _ = p.StartLoad("movie.mkv")
+	live := p.WaitLive("movie.mkv", time.Now().Add(LoadWait))
 	if el := time.Since(start); el > 2*time.Second {
-		t.Fatalf("Load blocked %s on a wedged mpv (the wait must be bounded)", el)
+		t.Fatalf("WaitLive blocked %s on a wedged mpv (the wait must be bounded)", el)
+	}
+	if live {
+		t.Fatal("a wedged mpv must not report the file as live")
 	}
 }
 

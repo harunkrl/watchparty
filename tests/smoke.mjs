@@ -9,6 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 18000 + Math.floor(Math.random() * 1000);
@@ -28,6 +29,7 @@ const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
 // Minimal SSE collector
 function sse(id, nick) {
   const events = [];
+  const errors = [];
   const ctrl = new AbortController();
   (async () => {
     const res = await fetch(`${BASE}/events?id=${id}&nick=${encodeURIComponent(nick)}`, { signal: ctrl.signal });
@@ -46,8 +48,8 @@ function sse(id, nick) {
         if (chunk.startsWith('data: ')) events.push(JSON.parse(chunk.slice(6)));
       }
     }
-  })().catch(() => {});
-  return { events, close: () => ctrl.abort() };
+  })().catch((e) => { errors.push(e); }); // C2: a failed connect must be visible
+  return { events, errors, close: () => ctrl.abort() };
 }
 
 async function post(obj) {
@@ -72,13 +74,12 @@ function waitUntil(fn, ms = 3000) {
   });
 }
 
-const cleanup = (code) => {
-  server.kill();
-  rmSync(dir, { recursive: true, force: true });
+const cleanup = async (code) => {
+  await stopServer(server, dir); // kill -> wait for the exit -> rm (F6/C1)
   process.exit(code);
 };
 server.on('exit', (code) => {
-  rmSync(dir, { recursive: true, force: true });
+  rmWithRetry(dir); // the server is gone: only the dir is left
   if (code && code !== 0 && !process.exitCode) {
     console.error(`server exited with ${code}`);
     process.exit(1);
@@ -100,7 +101,8 @@ try {
 
   const a = sse('alice', 'Alice'); // receiver
   const b = sse('bob', 'Bob'); // sender
-  await sleep(200);
+  await waitUntil(() => a.events.length > 0, 5000, 'the hello arrived');
+  assert.deepEqual(a.errors, [], `the SSE collector failed: ${a.errors}`);
   assert.equal(a.events[0].type, 'hello');
   // S-A: hello carries a dialable invite URL — the server is the only party
   // that knows its reachable address (the client may be off-host)
@@ -235,8 +237,7 @@ try {
   await waitUntil(() => latecomer.events.some((e) => e.type === 'hello' && e.pos >= 100.3 && e.pos <= 102));
   latecomer.close();
   await post({ type: 'ended', from: 'bob' });
-  await sleep(300);
-  assert.equal(a.events.filter((e) => e.type === 'load').length, 1);
+  await waitUntil(() => a.events.filter((e) => e.type === 'load').length === 1, 5000, 'the load arrived');
 
   // skip advances the queue for everyone, including the requester
   await post({ type: 'enqueue', from: 'bob', name: 'movie two.mkv' });
@@ -275,7 +276,7 @@ try {
   await post({ type: 'seek', from: 'bob' }); // no t: gate must drop
   await post({ type: 'position', from: 'bob', t: 'x' }); // string t: gate must drop
   await waitUntil(() => a.events.some((e) => e.type === 'position' && e.t === 0));
-  await sleep(300);
+  await waitUntil(() => a.events.some((e) => e.type === 'seek' && e.t === 0), 5000, 'the seek arrived');
   const zeroSeek = a.events.filter((e) => e.type === 'seek' && e.t === 0);
   assert.equal(zeroSeek.length, 1, 'seek t=0 relayed exactly once');
   assert.ok('t' in zeroSeek[0], 'seek t=0 must carry t on the wire');
@@ -338,8 +339,7 @@ try {
   assert.equal(a.events.filter((e) => e.type === 'notice').length, noticesBefore + 1, 'notice not one-time');
   assert.equal(a.events.filter((e) => e.type === 'position').length, posBefore, 'impostor heartbeat relayed');
   await post({ type: 'position', from: 'impostor', t: 99, p: false }); // repeat: still one notice, no relay
-  await sleep(300);
-  assert.equal(a.events.filter((e) => e.type === 'notice').length, noticesBefore + 1);
+  await waitUntil(() => a.events.filter((e) => e.type === 'notice').length === noticesBefore + 1, 5000, 'the notice arrived');
   assert.equal(a.events.filter((e) => e.type === 'position').length, posBefore);
 
   // B2 pin: loading a queued file rebroadcasts the queue — every client
@@ -421,8 +421,8 @@ try {
   await waitUntil(() => a.events.some((e) => e.type === 'bye' && e.nick === 'Bob'));
   a.close();
   console.log('PASS: all smoke assertions held');
-  cleanup(0);
+  await cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message);
-  cleanup(1);
+  await cleanup(1);
 }

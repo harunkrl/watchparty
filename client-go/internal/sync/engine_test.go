@@ -21,7 +21,14 @@ type fakePlayer struct {
 	vols     []float64 // F5 local volume nudges
 	mutes    int       // F5 mute toggles
 	pos      *float64
+	posCalls int   // F6-A2: SeekBy must not pay IPC round trips
 	loadErr  error // returned by Load to simulate a failed loadfile
+
+	// F6-A1: the load settle — WaitLive blocks until wedgeWait is closed
+	// (the guaranteed signal), then the sub attach runs exactly once.
+	wedgeWait   chan struct{}
+	startLoads  int
+	attachCalls int
 }
 
 // pauseCount reads the recorded pauses safely: the post worker can apply
@@ -66,10 +73,40 @@ func (f *fakePlayer) Speed(v float64) error {
 func (f *fakePlayer) Pos() (float64, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.posCalls++ // F6-A2: SeekBy must not pay this round trip
 	if f.pos == nil {
 		return 0, false
 	}
 	return *f.pos, true
+}
+
+// F6-A1: StartLoad is the lock-held tell; WaitLive blocks until the wedge
+// is released (the guaranteed signal), then the sub attach runs once.
+func (f *fakePlayer) StartLoad(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startLoads++
+	return "v:" + name, nil
+}
+
+func (f *fakePlayer) WaitLive(name string, deadline time.Time) bool {
+	f.mu.Lock()
+	err := f.loadErr // F6-A1: a failed load maps to not-going-live
+	w := f.wedgeWait
+	f.mu.Unlock()
+	if err != nil {
+		return false
+	}
+	if w != nil {
+		<-w
+	}
+	return true
+}
+
+func (f *fakePlayer) AttachSubs(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attachCalls++
 }
 func (f *fakePlayer) ShowText(s string, ms int) error {
 	f.mu.Lock()
@@ -153,13 +190,11 @@ func TestMasterHeartbeatNoScrub(t *testing.T) {
 	e, _, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false}) // +2s: exactly PollSecs
-	if len(po.all(t)) != 2 {
-		t.Fatalf("events = %v, want 2 position heartbeats", evType(t, po.all(t)))
-	}
-	for i, want := range []float64{10, 12} {
-		if got := po.all(t)[i]; got.Type != "position" || got.T != want || got.P {
-			t.Fatalf("event %d = %+v, want position{t:%v p:false}", i, got, want)
-		}
+	// F6-A3: the steady heartbeats coalesce to the LATEST one — the pin's
+	// intent is that no scrub/seek fires on the steady cadence.
+	ev := po.all(t)
+	if len(ev) != 1 || ev[0].Type != "position" || ev[0].T != 12 {
+		t.Fatalf("events = %v, want one coalesced position{12}", evType(t, ev))
 	}
 }
 
@@ -170,7 +205,9 @@ func TestMasterPausePlayTransitions(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(7), Pause: true}) // steady: pause not repeated,
 	// but the position heartbeat fires on every tick (client.py parity)
 	types := evType(t, po.all(t))
-	want := []string{"position", "pause", "position", "position"}
+	// F6-A3: the heartbeat flood coalesces — the pause discrete keeps its
+	// slot, the three heartbeats collapse to the LATEST one.
+	want := []string{"pause", "position"}
 	if len(types) != len(want) {
 		t.Fatalf("events = %v, want %v", types, want)
 	}
@@ -369,11 +406,32 @@ func TestFollowerBigDriftSeeksAndPauseResetsSpeed(t *testing.T) {
 }
 
 // Loading a new file clears any leftover tempo nudge.
+// waitSettle blocks until the F6-A1 background load continuation has run
+// (the settle is asynchronous now: the tests must yield to it).
+func waitSettle(t *testing.T, pl *fakePlayer, attaches int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pl.mu.Lock()
+		n := pl.attachCalls
+		pl.mu.Unlock()
+		if n >= attaches {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	pl.mu.Lock()
+	n := pl.attachCalls
+	pl.mu.Unlock()
+	t.Fatalf("the load settle never finished (attaches=%d, want ≥%d)", n, attaches)
+}
+
 func TestLoadResetsSpeed(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // nudge 0.97
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"})
+	waitSettle(t, pl, 1) // F6-A1: the speed reset rides the background settle
 	last := pl.speeds[len(pl.speeds)-1]
 	if last != 1 {
 		t.Fatalf("speed after load = %v, want 1", last)
@@ -405,8 +463,10 @@ func TestOnRoomAppliesDiscreteEvents(t *testing.T) {
 	e.OnRoom(room.Event{Type: "pause"})
 	e.OnRoom(room.Event{Type: "play"})
 	e.OnRoom(room.Event{Type: "seek", T: 42})
-	if len(pl.loads) != 1 || pl.loads[0] != "a.mkv" {
-		t.Fatalf("loads = %v", pl.loads)
+	// F6-A1: the load is claimed speculatively at startLoad (the settle
+	// continues in the background)
+	if e.loaded != "a.mkv" {
+		t.Fatalf("loaded = %q", e.loaded)
 	}
 	if len(pl.pauses) != 2 || !pl.pauses[0] || pl.pauses[1] {
 		t.Fatalf("pauses = %v, want [true false]", pl.pauses)
@@ -501,9 +561,13 @@ func TestLoadFailureLogged(t *testing.T) {
 	logs, sink := logSink()
 	e, pl, _ := newEngine(false)
 	e.Logf = sink
-	pl.loadErr = errors.New("load failed: nope.mkv")
+	pl.loadErr = errors.New("load failed: nope.mkv") // F6-A1: maps to not-going-live
 	e.OnRoom(room.Event{Type: "load", Name: "nope.mkv"})
-	if !hasLine(*logs, "> playing nope.mkv") || !hasLine(*logs, "mpv: load failed: nope.mkv") {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !hasLine(*logs, "mpv: load did not go live: nope.mkv") {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !hasLine(*logs, "> playing nope.mkv") || !hasLine(*logs, "mpv: load did not go live: nope.mkv") {
 		t.Fatalf("failed load not surfaced: %v", *logs)
 	}
 }

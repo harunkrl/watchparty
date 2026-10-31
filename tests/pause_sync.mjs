@@ -11,6 +11,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -119,7 +120,7 @@ function waitUntil(fn, ms = 15000, what = '') {
   });
 }
 
-const cleanup = (code) => {
+const cleanup = async (code) => {
   // kill the mpv children first: a bare client.kill() orphans them
   for (const p of [master, follower]) {
     try {
@@ -127,8 +128,7 @@ const cleanup = (code) => {
     } catch {}
     p.kill();
   }
-  server.kill();
-  rmSync(dir, { recursive: true, force: true });
+  await stopServer(server, dir); // kill -> wait for the exit -> rm (F6/C1)
   process.exit(code);
 };
 
@@ -245,10 +245,10 @@ try {
   assert.ok(mConv, `master did not converge after follower seek (at ${await mpvCall(mSock, ['get_property', 'time-pos'])})`);
 
   console.log('PASS: pause/resume/seek sync held (both directions)');
-  cleanup(0);
+  await cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message);
   console.error('--- master out ---\n' + master.out);
   console.error('--- follower out ---\n' + follower.out);
-  cleanup(1);
+  await cleanup(1);
 }

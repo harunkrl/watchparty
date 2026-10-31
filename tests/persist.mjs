@@ -10,6 +10,7 @@ import { mkdtempSync, writeFileSync, rmSync, unlinkSync, chmodSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 18900 + Math.floor(Math.random() * 90);
@@ -87,10 +88,9 @@ const restart = async () => {
   await waitUp();
 };
 
-const cleanup = (code) => {
-  server.kill();
+const cleanup = async (code) => {
   try { chmodSync(dir, 0o700); } catch {} // a locked dir would block the rm
-  rmSync(dir, { recursive: true, force: true });
+  await stopServer(server, dir); // kill -> wait for the exit -> rm (F6/C1)
   process.exit(code);
 };
 
@@ -156,8 +156,8 @@ try {
   }
 
   console.log('PASS: room state persisted across restarts, vanished files filtered');
-  cleanup(0);
+  await cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message);
-  cleanup(1);
+  await cleanup(1);
 }

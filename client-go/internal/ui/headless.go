@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"watchparty/client-go/internal/cmd"
@@ -69,10 +70,18 @@ func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine,
 			}
 		case cmd.Play:
 			fmt.Fprintf(out, "> playing %s\n", c.Arg) // client.py parity
-			if err := player.Load(c.Arg); err != nil {
+			// F6-A1: the settle (wait-for-live + subtitles) continues in the
+			// background — the headless loop must not stall for the whole
+			// load chain on a wedged mpv
+			if _, err := player.StartLoad(c.Arg); err != nil {
 				fmt.Fprintln(out, "> err:", err)
 				continue
 			}
+			go func(name string) {
+				if player.WaitLive(name, time.Now().Add(mpv.LoadWait)) {
+					player.AttachSubs(name)
+				}
+			}(c.Arg)
 			engine.OwnLoad(c.Arg) // our own load never echoes back; the engine must know (F3)
 			report(out, api.Post(room.Event{Type: "load", Name: c.Arg}))
 		case cmd.Queue:

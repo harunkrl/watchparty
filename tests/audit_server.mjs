@@ -9,6 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync, unlinkSync, symlinkSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -27,9 +28,8 @@ function startServer(files) {
   proc.stdout.on('data', (d) => (out += d));
   proc.stderr.on('data', (d) => (out += d));
   const base = `http://127.0.0.1:${port}`;
-  const stop = () => {
-    proc.kill();
-    rmSync(dir, { recursive: true, force: true });
+  const stop = async () => {
+    await stopServer(proc, dir); // kill -> wait for the exit -> rm (F6/C1)
   };
   return { dir, base, proc, out: () => out, stop };
 }
@@ -121,7 +121,7 @@ test('stale same-id close keeps the live connection in the roster', async () => 
     c.close();
     b.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -146,7 +146,7 @@ test('position with a non-number t cannot poison the room state', async () => {
     j.close();
     k.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -164,7 +164,7 @@ test('cmd trace never emits ANSI escapes into the log', async () => {
     await sleep(300);
     assert.ok(!s.out().includes('\x1b'), 'ANSI escape reached the server log');
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -196,7 +196,7 @@ test('auto-advance skips queued files that vanished from disk', async () => {
     late.close();
     w.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -225,7 +225,7 @@ test('two-master notice is one-time and the clock succeeds cleanly', async () =>
     assert.equal(w.events.filter((e) => e.type === 'notice').length, 1, 'spurious notice on takeover');
     w.close();
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -270,7 +270,7 @@ test('HTTP hardening edges hold', async () => {
     assert.equal((await fetch(`${s.base}/cmd`)).status, 404);
     assert.ok((await fetch(`${s.base}/files`)).ok, 'server alive after hostile requests');
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 
@@ -292,7 +292,7 @@ test('server survives stat/realpath TOCTOU races', async () => {
       if (i % 30 === 0) assert.ok((await fetch(`${s.base}/files`)).ok, 'server died under stat race');
     }
   } finally {
-    s.stop();
+    await s.stop();
   }
 });
 

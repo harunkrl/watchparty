@@ -146,8 +146,13 @@ func TestHelloBlipNoReload(t *testing.T) {
 
 	p := 30.0
 	e.OnRoom(room.Event{Type: "hello", Now: "x.mkv", Pos: &p})
-	if len(pl.loads) != 1 {
-		t.Fatalf("hello blip reloaded the file: loads=%v", pl.loads)
+	// F6-A1: the load claim is speculative at StartLoad — a hello for the
+	// SAME file must not reload (startLoads stays 1)
+	pl.mu.Lock()
+	starts := pl.startLoads
+	pl.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("hello blip reloaded the file: startLoads=%d", starts)
 	}
 	if len(pl.seeks) != 0 {
 		t.Fatalf("hello blip seeked: %v", pl.seeks)
@@ -162,8 +167,9 @@ func TestHelloDifferentFileLoads(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(room.Event{Type: "load", Name: "x.mkv"})
 	e.OnRoom(room.Event{Type: "hello", Now: "y.mkv"})
-	if len(pl.loads) != 2 || pl.loads[0] != "x.mkv" || pl.loads[1] != "y.mkv" {
-		t.Fatalf("loads = %v, want [x.mkv y.mkv]", pl.loads)
+	// F6-A1: both loads claim speculatively at StartLoad
+	if pl.startLoads != 2 || e.loaded != "y.mkv" {
+		t.Fatalf("loads = %d loaded = %q, want 2 loads ending at y.mkv", pl.startLoads, e.loaded)
 	}
 }
 

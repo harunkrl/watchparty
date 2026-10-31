@@ -8,6 +8,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stopServer, rmWithRetry } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -122,11 +123,10 @@ function alive(pid) {
   }
 }
 
-const cleanup = (code) => {
+const cleanup = async (code) => {
   ctrl.abort();
   client.kill();
-  server.kill();
-  rmSync(dir, { recursive: true, force: true });
+  await stopServer(server, dir); // kill -> wait for the exit -> rm (F6/C1)
   process.exit(code);
 };
 server.on('exit', (code) => {
@@ -175,8 +175,8 @@ try {
   assert.ok(!out.includes('panic:'), `client crashed:\n${out}`);
 
   console.log('PASS: integration with real mpv held');
-  cleanup(0);
+  await cleanup(0);
 } catch (e) {
   console.error('FAIL:', e.message, '\n--- client output ---\n' + out);
-  cleanup(1);
+  await cleanup(1);
 }

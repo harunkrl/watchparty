@@ -3,9 +3,11 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"watchparty/client-go/internal/mpv"
 	"watchparty/client-go/internal/room"
 	"watchparty/client-go/internal/sync"
 )
@@ -24,6 +26,9 @@ func f5Model(t *testing.T) (Model, *recPlayer) {
 		Clock: sync.RealClock{},
 		Post:  func(room.Event) error { return nil },
 	}
+	// F6-A2: the seek keys read the POLLED position, not a Pos() round trip
+	pos := 10.0
+	e.OnMpvp(mpv.State{Pos: &pos, At: time.Now()})
 	return New("ada", nil, nil, true, e), pl
 }
 

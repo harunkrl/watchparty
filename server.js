@@ -120,44 +120,73 @@ function saveState() {
   stateDirty = true;
   if (!stateTimer) stateTimer = setTimeout(flushState, 2000);
 }
+// B3: ONE in-flight flush chain. Two writers on the same .tmp path would
+// interleave their content: the room state could end up corrupted, or an
+// older snapshot could win the rename. The exit path joins this chain
+// instead of racing it.
+let stateFlush = Promise.resolve();
+
 function flushState() {
   stateTimer = null;
   if (!stateDirty || !persistOK) return;
   stateDirty = false;
-  const tmp = `${STATE_FILE}.tmp`;
-  // A5-4: rename is atomic but not durable — fsync the temp file before the
-  // rename so a power cut cannot leave state.json empty/stale. shortcut:
-  // per-flush fsync (~2s cadence) is fine on the target SSD hardware; revisit
-  // this trade if the server ever targets flash/SD media (P3-2 ruling:
-  // fsync stays on every flush)
-  fs.promises.writeFile(tmp, stateSnapshot())
-    .then(() => fs.promises.open(tmp, 'r'))
-    .then((h) => h.sync().finally(() => h.close()))
-    .then(() => fs.promises.rename(tmp, STATE_FILE))
-    .catch((e) => persistFail(e));
+  stateFlush = stateFlush.then(async () => {
+    const tmp = `${STATE_FILE}.tmp`;
+    await fs.promises.writeFile(tmp, stateSnapshot());
+    const h = await fs.promises.open(tmp, 'r');
+    try { await h.sync(); } finally { await h.close(); }
+    // B4: keep the previous good snapshot — a corrupted state.json must
+    // not wipe the room (the restore falls back to it, loudly)
+    try {
+      await fs.promises.copyFile(STATE_FILE, `${STATE_FILE}.bak`);
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.error(`watchparty: state backup failed (${e.message})`);
+    }
+    await fs.promises.rename(tmp, STATE_FILE);
+  }).catch((e) => persistFail(e));
 }
 const persistAndExit = () => {
-  if (persistOK && stateDirty) {
-    try {
-      // A5-4 (amendment): the exit-time write is the most important persist
-      // — the same atomic+durable dance as flushState, in sync form (a
-      // signal handler must finish before exit)
-      const tmp = `${STATE_FILE}.tmp`;
-      fs.writeFileSync(tmp, stateSnapshot());
-      const fd = fs.openSync(tmp, 'r');
-      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      fs.renameSync(tmp, STATE_FILE);
-    } catch { /* best effort */ }
-  }
-  process.exit(0);
+  // B3: the exit write JOINS the flush chain instead of racing it on the
+  // same .tmp. The chain is one write+fsync+rename, so the join cannot
+  // hold the exit for long.
+  stateFlush.then(() => {
+    if (persistOK && stateDirty) {
+      try {
+        // A5-4 (amendment): the exit-time write is the most important persist
+        // — the same atomic+durable dance as flushState, in sync form (a
+        // signal handler must finish before exit)
+        const tmp = `${STATE_FILE}.tmp`;
+        fs.writeFileSync(tmp, stateSnapshot());
+        const fd = fs.openSync(tmp, 'r');
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        fs.renameSync(tmp, STATE_FILE);
+      } catch (e) {
+        // C1: this was the ONLY empty catch in the file: a lost room state
+        // (the dir vanished, the disk is full) was swallowed silently.
+        // A lost room must be visible.
+        console.error(`watchparty: exit-time state write failed (${e.message})`);
+      }
+    }
+    process.exit(0);
+  });
 };
 (function restoreState() {
   let saved;
   try {
     saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch (e) {
-    if (e.code !== 'ENOENT') console.error(`watchparty: state restore failed (${e.message})`);
-    return;
+    if (e.code === 'ENOENT') return; // no state yet: a fresh server
+    // B4: the main file is broken — the backup holds the room's last good
+    // snapshot. The fallback is logged loudly: a silent restore looks
+    // exactly like an empty room.
+    console.error(`watchparty: state restore failed (${e.message}) — trying the backup`);
+    try {
+      saved = JSON.parse(fs.readFileSync(`${STATE_FILE}.bak`, 'utf8'));
+      console.error(`watchparty: restored the room state from ${STATE_FILE}.bak`);
+    } catch (e2) {
+      console.error(`watchparty: backup restore failed too (${e2.message})`);
+      return;
+    }
   }
   // m2-503: a null listing (transient unreadable dir, w1-1/I-3) must not
   // wipe the persisted room at boot — "cannot read" is not "empty". The
@@ -180,9 +209,27 @@ const persistAndExit = () => {
   console.log(`watchparty: restored room state from ${STATE_FILE}`);
 })();
 
+// B1: a client that stops reading must not make the server buffer every
+// room event in its socket — the only unbounded memory path here.
+const SSE_MAX_BUFFER = Number(process.env.SSE_MAX_BUFFER) || 4 * 1024 * 1024;
+
+// sseWrite writes one SSE chunk. A client whose buffer grew past the
+// threshold is dropped: its window never drains, so the buffer would
+// grow for the life of the process.
+function sseWrite(res, chunk) {
+  if (res.writableEnded || res.destroyed) return false;
+  if (res.writableLength > SSE_MAX_BUFFER) {
+    console.error(`watchparty: dropping a client that stopped reading (${res.writableLength} bytes buffered)`);
+    res.destroy();
+    return false;
+  }
+  res.write(chunk);
+  return true;
+}
+
 function broadcast(ev, exceptId) {
   const line = `data: ${JSON.stringify(ev)}\n\n`;
-  for (const [res, id] of listeners) if (id !== exceptId) res.write(line);
+  for (const [res, id] of listeners) if (id !== exceptId) sseWrite(res, line);
 }
 
 function clean(s, max) {
@@ -302,6 +349,28 @@ function advanceQueue(byNick) {
   }
 }
 
+// B2: the wrong-file gate drops a position that names another file. The
+// poster is an OLD master still driving the previous film: its steering
+// posts (load/play/pause) are dropped too, or it can drag the room back
+// to its own film and pause a room that moved on. NO clearing exception
+// (master-2 proved it re-opens the hole in two steps). Entries expire by
+// TTL, so the set stays bounded.
+const STALE_TTL_MS = Number(process.env.STALE_TTL_MS) || 60000;
+const staleClients = new Map(); // client id -> mono() of the last gate hit
+
+const isStale = (from) => {
+  if (!from) return false;
+  const at = staleClients.get(from);
+  if (at === undefined) return false;
+  if (mono() - at > STALE_TTL_MS) { staleClients.delete(from); return false; }
+  return true;
+};
+
+// the set grows with the distinct stale ids: sweep the expired ones
+setInterval(() => {
+  for (const [id, at] of staleClients) if (mono() - at > STALE_TTL_MS) staleClients.delete(id);
+}, Math.max(1000, STALE_TTL_MS / 2)).unref();
+
 function handleCmd(cmd) {
   if (cmd.type === 'chat') {
     cmd.nick = clean(cmd.nick || '', 32);
@@ -330,6 +399,7 @@ function handleCmd(cmd) {
       break;
     case 'play':
     case 'pause':
+      if (isStale(cmd.from)) break; // B2: a stale client cannot steer the room
       state.paused = cmd.type === 'pause';
       broadcast(cmd, cmd.from);
       saveState();
@@ -343,6 +413,9 @@ function handleCmd(cmd) {
       // No `file` = old client = exactly the file-agnostic behavior; an
       // idle room has no file to protect, so the gate stays off there.
       if (state.now !== null && typeof cmd.file === 'string' && cmd.file !== state.now) {
+        // B2: the poster is an old master driving the previous film — it
+        // loses its steering rights for STALE_TTL_MS
+        if (cmd.from) staleClients.set(cmd.from, mono());
         if (mono() - lastMovedOnNotice > 10000) {
           lastMovedOnNotice = mono();
           // P2-1: state.now is a client-supplied FILENAME — same trust
@@ -362,6 +435,7 @@ function handleCmd(cmd) {
       saveState();
       break;
     case 'load':
+      if (isStale(cmd.from)) break; // B2: a stale client cannot steer the room
       if (!(list() || []).includes(cmd.name)) break; // null listing (w1-1): cannot verify, no-op
       state.now = cmd.name;
       state.pos = null; // old file's position is meaningless now
@@ -481,10 +555,12 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify(library));
   }
 
-  // S5: watchdog / manual liveness probe
+  // S5: watchdog / manual liveness probe. F6: it also reports the room's
+  // paused flag (a watcher needs to tell "paused" from "stuck"); this is a
+  // diagnostic endpoint, not the room protocol.
   if (req.method === 'GET' && u.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ now: state.now, queueLen: state.queue.length, listeners: listeners.size }));
+    return res.end(JSON.stringify({ now: state.now, queueLen: state.queue.length, paused: state.paused, listeners: listeners.size }));
   }
 
   if (req.method === 'GET' && u.pathname === '/events') {
@@ -495,6 +571,10 @@ const server = http.createServer((req, res) => {
     });
     const id = u.searchParams.get('id') || '';
     const nick = clean(u.searchParams.get('nick') || id, 32);
+    // B5: a half-open connection would keep its nick in the roster for
+    // the life of the process: TCP keepalive lets the OS notice the dead
+    // peer, the socket errors and the close handler cleans the roster.
+    res.socket.setKeepAlive?.(true, 30000);
     listeners.set(res, id);
     nickById.set(id, nick);
     // roster rides hello: late joiners must see everyone already in the
@@ -524,7 +604,7 @@ const server = http.createServer((req, res) => {
       hello.pos = Math.max(0, hello.pos);
       hello.p = state.paused;
     }
-    res.write(`data: ${JSON.stringify(hello)}\n\n`);
+    sseWrite(res, `data: ${JSON.stringify(hello)}\n\n`);
     // R9: replay chat history to first-time connections only (same-id
     // reconnects already have these lines in their TUI)
     if (id && !chatHistorySent.has(id)) {
@@ -532,10 +612,10 @@ const server = http.createServer((req, res) => {
       if (chatHistorySent.size > 1024) { // bound: drop the oldest insertion
         for (const k of chatHistorySent) { chatHistorySent.delete(k); break; }
       }
-      for (const ev of chatLog) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+      for (const ev of chatLog) sseWrite(res, `data: ${JSON.stringify(ev)}\n\n`);
     }
     broadcast({ type: 'join', nick }, id);
-    const ping = setInterval(() => res.write(': ping\n\n'), 15000);
+    const ping = setInterval(() => sseWrite(res, ': ping\n\n'), 15000);
     req.on('close', () => {
       clearInterval(ping);
       listeners.delete(res);

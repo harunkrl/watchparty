@@ -41,6 +41,16 @@ jobs:
       # contract, clean=0) skips without it (F2 review P2-2); ffmpeg
       # is only needed by the node e2e suites below
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
+
+      # F6/C3: the retry must not hide the flake — the failed run's logs
+      # become an artifact, so the flake hunt finally has eyes
+      - name: upload the test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wp-retry-*.log
+          if-no-files-found: ignore
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: ../tests/ci_retry.sh go test -race ./...
@@ -58,7 +68,7 @@ jobs:
           # still fail twice
           for s in smoke persist audit_server audit2_server audit3_server \
                    f2_server f1_server integration pause_sync \
-                   stall_family master_restart soak; do
+                   stall_family master_restart soak f6_server; do
             # this block runs from the repo ROOT (see working-directory
             # below) — NOT the ../tests path the client-go steps use
             tests/ci_retry.sh node tests/$s.mjs || exit 1
@@ -84,6 +94,16 @@ jobs:
       - run: go vet ./...
       - shell: bash
         run: ../tests/ci_retry.sh go test ./...
+
+      # F6/C3: the retry must not hide the flake — the failed run's logs
+      # become an artifact, so the flake hunt finally has eyes
+      - name: upload the test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wp-retry-*.log
+          if-no-files-found: ignore
 
   build:
     needs: [test, test-windows]
@@ -196,6 +216,36 @@ jobs:
           zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
           cd "$GITHUB_WORKSPACE/dist"
           sha256sum *.zip > SHA256SUMS
+      - name: changelog gate — the tag needs its own changelog section
+        run: |
+          # F6 D4: a tag without a "## <tag>" section in the changelog
+          # would ship a release nobody can read about. Fail the release
+          # instead: the changelog entry is part of the release contract.
+          if ! grep -q "^## ${GITHUB_REF_NAME} " client-go/CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${GITHUB_REF_NAME}'" >&2
+            exit 1
+          fi
+      - name: release notes — this tag's changelog section only
+        run: |
+          # the whole changelog as release notes buries this release; the
+          # notes are the tag's own section (+ the bundle facts)
+          awk -v head="## ${GITHUB_REF_NAME} " '
+            index($0, head) == 1 { on = 1; print; next }
+            on && /^## / { exit }
+            on { print }
+          ' client-go/CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::the ${GITHUB_REF_NAME} section is empty" >&2
+            exit 1
+          fi
+          size=$(du -h dist/watchparty-windows-bundle.zip | cut -f1)
+          {
+            echo "The Windows bundle carries a portable mpv"
+            echo "(pinned to $MPV_TAG) — expect $size to download."
+            echo "The other zips are the client alone."
+            echo ""
+            cat "$RUNNER_TEMP/notes.md"
+          } > "$RUNNER_TEMP/notes-final.md"
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -207,9 +257,10 @@ jobs:
               dist/*.zip dist/SHA256SUMS --clobber
             gh release edit "$GITHUB_REF_NAME" \
               --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
-              --notes-file client-go/CHANGELOG.md
+              --notes-file "$RUNNER_TEMP/notes-final.md"
           else
             gh release create "$GITHUB_REF_NAME" \
               --title "watchparty $GITHUB_REF_NAME (mpv $MPV_TAG)" \
-              --notes-file client-go/CHANGELOG.md dist/*.zip dist/SHA256SUMS
+              --notes-file "$RUNNER_TEMP/notes-final.md" \
+              dist/*.zip dist/SHA256SUMS
           fi
