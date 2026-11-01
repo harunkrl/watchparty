@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.9.1 — a room that answers to anyone in it
+
+- client (sync): a lone follower's pause now reaches the room —
+  PauseToggle used to return silently when no room snapshot existed
+  (no master connected), so ctrl+space was a dead key until the
+  master showed up; the toggle now derives its state from the local
+  player (a localPause kept beside polledPos), posts through the
+  same tail as every other pause, and an empty room gets a VISIBLE
+  refusal instead of silence. The mpv window's pause behaves the
+  same — behind a machinery gate: mpv's observer registration emits
+  an initial pause=false that a naive path relays as "play" at
+  startup (it raced the hello and could un-pause a room the joiner
+  just adopted — found by an instrumented 10-run flip hunt), so
+  pause events from an unloaded or freshly-loading player update
+  the local mirror silently and never post
+- server: hello now always carries the room's actual paused flag —
+  it used to travel only with a position, so a room paused by a lone
+  follower was silently un-paused by the first heartbeat of a
+  joining master, resuming the follower's player out from under
+  them; the client honors the flag without a position (additive
+  wire: the field already existed, old clients ignore it)
+- client (ui): unknown key sequences are no longer swallowed
+  silently — bubbletea hands them over as an internal message we
+  cannot type-switch (unexported upstream), so the update loop
+  recognizes them by name and prints a rate-limited system-pane
+  line with the raw sequence: the next "my key does nothing" report
+  names the terminal for us. shift+←/→ and alt+shift+←/→ join as
+  ±30s seek aliases for terminals that collapse or eat ctrl+shift
+- client (ui): the dashboard tells the truth about being alone — a
+  new Room flag on the UI state kills the fabricated "+0.0s" drift
+  chip a snapshot-less follower used to show, lets the
+  stale-heartbeat warning fire when the master dies mid-film (it
+  structurally could not before), and adds an "alone — no room"
+  indicator; seeking with nothing loaded is refused with a reason
+  instead of osd-ing a nudge that never happened
+- tests: the room's pause protocol is pinned end-to-end by a new pty
+  suite (room_pause.mjs): a lone follower's ctrl+space pauses the
+  room, a paused room STAYS paused when a master joins later, and
+  an unknown key sequence leaves a visible trace — each captured
+  red on v1.9.0 first; the server side gains four hello-shape pins
+  (red-first) and the client eight engine/ui pins including the
+  startup-phantom shape
+
 ## v1.9.0 — a keyboard that never waits for the player
 
 - client (sync): every hotkey is off the mpv pipe — tells ride a

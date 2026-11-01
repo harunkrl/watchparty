@@ -183,6 +183,7 @@ type Model struct {
 	sysOff      bool            // ctrl+g: system pane hidden
 	helpOpen    bool            // F1: passive keys overlay (every other key keeps working)
 	subInFlight map[subKey]bool // /sub probes still answering: duplicate guard
+	lastCSIHint time.Time       // unknown-key-sequence hint rate limit (F9)
 	resizing    bool            // A4: a resize storm is in flight (the settle re-syncs)
 	gone        []string        // departed nicks, shown offline (cap 5)
 	eq          []float64       // vibe equalizer bar heights 0..1
@@ -383,6 +384,13 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			return m.pickKeys(msg)
 		}
 		return m.inputKeys(msg)
+	default:
+		// shortcut: tea.unknownCSISequenceMsg is unexported upstream
+		// (bubbletea v1.3.10), so the match is by type NAME; revisit when
+		// the module exports the type.
+		if fmt.Sprintf("%T", msg) == "tea.unknownCSISequenceMsg" {
+			m = m.csiHint(fmt.Sprintf("%v", msg))
+		}
 	case spinner.TickMsg:
 		var sc tea.Cmd
 		m.spin, sc = m.spin.Update(msg)
@@ -539,17 +547,24 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if msg.String() == "ctrl+right" {
 				dt = seekStep
 			}
-			m.engine.SeekBy(dt)
+			if !m.engine.SeekBy(dt) {
+				return m.failf("nothing is playing — nothing to seek (use /play or /pick)")
+			}
 			m.osd(fmt.Sprintf("%+.0fs", dt)) // F6 D3: the mpv window shows the nudge
 		}
 		return m, nil
-	case "ctrl+shift+left", "ctrl+shift+right": // F5: the whole-movie cadence
+	case "ctrl+shift+left", "ctrl+shift+right",
+		"shift+left", "shift+right",
+		"alt+shift+left", "alt+shift+right": // F5 cadence; F9 aliases for
+		// terminals that collapse or eat the ctrl+shift chord
 		if m.engine != nil {
 			dt := -seekStepBig
-			if msg.String() == "ctrl+shift+right" {
+			if s := msg.String(); s == "ctrl+shift+right" || s == "shift+right" || s == "alt+shift+right" {
 				dt = seekStepBig
 			}
-			m.engine.SeekBy(dt)
+			if !m.engine.SeekBy(dt) {
+				return m.failf("nothing is playing — nothing to seek (use /play or /pick)")
+			}
 			m.osd(fmt.Sprintf("%+.0fs", dt))
 		}
 		return m, nil
@@ -564,7 +579,9 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if msg.String() == "alt+right" {
 				dt = seekStep
 			}
-			m.engine.SeekBy(dt)
+			if !m.engine.SeekBy(dt) {
+				return m.failf("nothing is playing — nothing to seek (use /play or /pick)")
+			}
 			m.osd(fmt.Sprintf("%+.0fs", dt))
 		}
 		return m, nil
@@ -901,6 +918,18 @@ func (m Model) enqueue(name string) (Model, tea.Cmd) {
 
 // failf reports a rejected input: red on the input row (where the user
 // is looking) plus the full line in the system log.
+// csiHint records an undecodable terminal sequence (F9 key honesty): the
+// line is the field self-diagnosis tool — the human reads off WHAT their
+// terminal sends. Rate limited: a stuck keyboard fires the same sequence
+// per keypress; one hint suffices.
+func (m Model) csiHint(seq string) Model {
+	if time.Since(m.lastCSIHint) < time.Second {
+		return m
+	}
+	m.lastCSIHint = time.Now()
+	return m.logf("unknown key sequence %s — if this was a key you pressed, tell us your terminal", seq)
+}
+
 func (m Model) failf(format string, args ...any) (Model, tea.Cmd) {
 	m.lastErr = fmt.Sprintf(format, args...)
 	return m.logf("> %s", m.lastErr), nil
@@ -1612,9 +1641,14 @@ func (m Model) nowPlayingLines(w int) []string {
 		if m.master {
 			clk := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 			stats = append(stats, clk.Render("◷ clock: master (reference)"))
-		} else {
+		} else if m.st.Room {
 			ds := lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift)))
 			stats = append(stats, ds.Render(driftChip(m.st.Drift)))
+		} else {
+			// F9 R1: no snapshot → no drift number exists; fabricating
+			// "+0.0s" was a lie. The honest alone-indicator instead.
+			as := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+			stats = append(stats, as.Render("alone — no room"))
 		}
 		if m.st.Cache > 0 {
 			bs := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
@@ -2396,9 +2430,11 @@ func (m Model) zenSyncChip() string {
 	}
 	if m.master {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("◷ master clock"))
-	} else {
+	} else if m.st.Room {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
 			Render(driftChip(m.st.Drift)))
+	} else { // F9 R1: alone — the drift chip would be fabricated data
+		parts = append(parts, dim.Render("alone — no room"))
 	}
 	return strings.Join(parts, dim.Render(" · "))
 }
@@ -2451,9 +2487,11 @@ func (m Model) footerLine(cw int) string {
 	right := ""
 	if m.master {
 		right = dim.Render(fmt.Sprintf("%d listening", len(m.peers)))
-	} else if m.st != nil && m.st.Pos != nil {
+	} else if m.st != nil && m.st.Pos != nil && m.st.Room {
 		right = lipgloss.NewStyle().Foreground(lipgloss.Color(driftColor(m.st.Drift))).
 			Render(driftChip(m.st.Drift))
+	} else if m.st != nil && m.st.Pos != nil {
+		right = dim.Render("alone — no room")
 	}
 	return joinLR(m.queuePreview(), right, cw)
 }

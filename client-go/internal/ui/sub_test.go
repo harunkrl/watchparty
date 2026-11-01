@@ -227,7 +227,7 @@ func TestDriftChipAtBandBoundaries(t *testing.T) {
 	for _, tc := range cases {
 		m := New("t", nil, nil, false, nil)
 		p := 65.0
-		m.st = &sync.UiState{Pos: &p, Drift: tc.d}
+		m.st = &sync.UiState{Pos: &p, Drift: tc.d, Room: true} // F9: synced
 		chip := m.zenSyncChip()
 		if !strings.Contains(chip, tc.text) {
 			t.Fatalf("drift %v: chip %q misses %q", tc.d, chip, tc.text)

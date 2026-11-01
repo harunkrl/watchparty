@@ -641,15 +641,23 @@ const server = http.createServer((req, res) => {
       invite: `http://${inviteHost}:${PORT}`,
     };
     if (inviteHostAlt) hello.inviteAlt = `http://${inviteHostAlt}:${PORT}`; // absent when there is no second address
+    // F9 item 2 (A9 S1 CASE B): the room's paused flag travels AS-IS and
+    // INDEPENDENTLY of the position. A room that is paused but has no
+    // position yet (a lone follower paused it; no clock owner ever beat)
+    // must still hand the pause to a joining client — otherwise the
+    // joiner's first heartbeat (p=false) erases the room's pause and the
+    // film resumes under the follower's feet. We CARRY the state, we never
+    // invent one: the "do not force p=true" intent below stands (forcing a
+    // pause would pause a RECONNECTING master, whose p=true heartbeats
+    // would then hold the room paused forever — gate regression:
+    // master_restart).
+    hello.p = state.paused;
     if (state.now && state.pos != null) {
       // M1-A: nobody is driving the room (ownerless after a clean bye or a
       // server restart, or the claim went stale on a half-open death) — do
       // not extrapolate a late joiner from a clock nobody is advancing
       // (m2-502: it would land them at EOF): serve the FROZEN last-known
-      // position. The paused flag travels AS-IS from the room state:
-      // forcing p=true here would pause a RECONNECTING master, whose p=true
-      // heartbeats would then hold the room paused forever (gate
-      // regression: master_restart).
+      // position.
       if (clockOwner === null || claimStale()) hello.pos = state.pos;
       // age-adjusted: where the master is right now, not at heartbeat time
       else hello.pos = state.pos + (state.paused ? 0 : (mono() - state.posAt) / 1000);
@@ -657,7 +665,6 @@ const server = http.createServer((req, res) => {
       if (state.dur != null) hello.pos = Math.min(hello.pos, state.dur - 1);
       // A3: never hand out a negative position
       hello.pos = Math.max(0, hello.pos);
-      hello.p = state.paused;
     }
     sseWrite(res, `data: ${JSON.stringify(hello)}\n\n`);
     // R9: replay chat history to first-time connections only (same-id

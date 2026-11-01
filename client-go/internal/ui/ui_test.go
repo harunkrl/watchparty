@@ -257,7 +257,7 @@ func TestHelloRosterSeedsWatchers(t *testing.T) {
 func TestFooterShowsDriftAndListeners(t *testing.T) {
 	p := 10.0
 	f := New("t", nil, nil, false, nil)
-	m := upd(t, f, sync.UiState{Drift: 0.42, Pos: &p})
+	m := upd(t, f, sync.UiState{Drift: 0.42, Pos: &p, Room: true}) // F9: synced
 	if !strings.Contains(m.footerLine(m.contentWidth()), "+0.4s") {
 		t.Fatalf("footer missing drift: %q", m.footerLine(m.contentWidth()))
 	}

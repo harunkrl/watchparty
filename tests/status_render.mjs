@@ -170,7 +170,12 @@ function readFrom(file, pos) {
 // ------------------------------------------------------- the mpv plumbing
 function mpvSocket(clientPid) {
   // scan every child: the pty command also runs a background stty loop
-  const pids = execSync(`pgrep -P ${clientPid}`).toString().trim().split('\n').filter(Boolean);
+  let pids = [];
+  try {
+    pids = execSync(`pgrep -P ${clientPid}`).toString().trim().split('\n').filter(Boolean);
+  } catch {
+    pids = []; // the mpv may not be spawned yet — the caller retries
+  }
   for (const pid of pids) {
     let cmdline;
     try {
@@ -212,17 +217,32 @@ function mpvCall(sockPath, command) {
 // waitUntil polls fn (it may be async) until it returns a truthy value.
 async function waitUntil(fn, ms, what) {
   const t0 = Date.now();
+  let last = null;
   for (;;) {
     let v;
     try {
       v = await fn();
     } catch (e) {
-      throw new Error(`${what}: ${e.message}`);
+      last = e; // the target may not exist yet (a spawn race) — retry
+      v = null;
     }
     if (v) return v;
-    if (Date.now() - t0 > ms) throw new Error('timeout: ' + what);
+    if (Date.now() - t0 > ms) throw new Error(`timeout: ${what}${last ? ` (${last.message})` : ''}`);
     await sleep(150);
   }
+}
+
+// childPid waits for the client's own process: script forks it a moment
+// after the spawn, so pgrep finds nothing until then.
+function childPid(parentPid, ms = 15000) {
+  return waitUntil(() => {
+    try {
+      const pids = execSync(`pgrep -P ${parentPid}`).toString().trim().split('\n').filter(Boolean);
+      return pids.length ? pids[0] : null;
+    } catch {
+      return null;
+    }
+  }, ms, 'the client process');
 }
 
 const master = spawn(BIN, ['--headless', '--master', '--name', 'M', BASE], {
@@ -269,7 +289,7 @@ try {
   await waitUntil(() => masterOut.includes('queue: [b.mp4]'), 10000, 'b.mp4 queued');
   log('the master plays a.mp4 and queues b.mp4');
 
-  const followerPid = execSync(`pgrep -P ${follower.pid}`).toString().trim().split('\n')[0];
+  const followerPid = await childPid(follower.pid);
   const fSock = await waitUntil(() => mpvSocket(followerPid), 15000, 'the follower mpv socket');
   await waitUntil(async () => {
     const p = await mpvCall(fSock, ['get_property', 'path']);

@@ -642,11 +642,16 @@ func hasLine(lines []string, want string) bool {
 }
 
 func TestFollowerNoSnapshotNeverPosts(t *testing.T) {
+	// F9 round-3 law: with NO LOADED FILE a lone follower's pause events
+	// are observer machinery (the observe_property INITIAL event) and
+	// never post; a seek never posts alone either (postScrub skips+logs).
+	// The LONE PAUSE WITH A LOADED FILE posts — pinned by
+	// TestF9MpvWindowLonePausePosts (the machinery window there is past).
 	e, _, po := newEngine(false)
-	e.OnMpvEvent("pause") // no master heartbeat yet: nothing to sync against
+	e.OnMpvEvent("pause")
 	e.OnMpvEvent("seek")
-	if len(po.all(t)) != 0 {
-		t.Fatalf("follower posted without snapshot: %v", evType(t, po.all(t)))
+	if got := evType(t, po.all(t)); len(got) != 0 {
+		t.Fatalf("follower posted without snapshot or file: %v", got)
 	}
 }
 

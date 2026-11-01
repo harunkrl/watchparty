@@ -49,7 +49,7 @@ func TestZenHeaderShowsSyncStrip(t *testing.T) {
 	m.now = "movie.mkv"
 	m.duration = 600
 	p := 65.0
-	m = upd(t, m, sync.UiState{Pos: &p, Drift: 0.4})
+	m = upd(t, m, sync.UiState{Pos: &p, Drift: 0.4, Room: true}) // F9: synced
 	l1, l2 := m.headerLines(m.contentWidth())
 	if l2 != "" {
 		t.Fatalf("zen header must stay one row: %q", l2)
@@ -77,7 +77,7 @@ func TestStatRowShowsMuted(t *testing.T) {
 func TestStatRowShowsStaleHeartbeat(t *testing.T) {
 	m := New("t", nil, nil, false, nil)
 	p := 10.0
-	m = upd(t, m, sync.UiState{Pos: &p, Stale: true})
+	m = upd(t, m, sync.UiState{Pos: &p, Stale: true, Room: true}) // F9: synced-but-stale
 	row := strings.Join(m.nowPlayingLines(60), "\n")
 	if !strings.Contains(row, "no room heartbeat") {
 		t.Fatalf("stat row missing the stale hint: %q", row)

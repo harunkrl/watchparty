@@ -143,6 +143,10 @@ type UiState struct {
 	Mechanical bool
 	Sub        string // language of the active subtitle track (personal only)
 	Layout     string // audio channel layout ("stereo"; "" = unknown)
+	// Room reports that a room snapshot exists (we are syncing to a
+	// master). F9 R1: without it the drift chip would fabricate "+0.0s"
+	// for a lone follower; the honest alone-indicator drives off it.
+	Room bool
 }
 
 type Engine struct {
@@ -164,9 +168,13 @@ type Engine struct {
 	lastPause bool
 	muted     bool     // last polled mpv mute flag: the mute log names the state we expect
 	polledPos *float64 // last polled mpv position: SeekBy's target without an IPC round trip (F6-A2)
-	wasActive bool
-	pausedBy  string    // who paused the room (the relay's nick); "" = our own action
-	snap      *snapshot // follower: latest master position heartbeat
+	// localPause is the follower-LOCAL pause truth (the poll mirror): a
+	// lone follower's ctrl+space toggles against it, because lastPause
+	// only tracks ROOM events and is frozen false when no master exists.
+	localPause bool
+	wasActive  bool
+	pausedBy   string    // who paused the room (the relay's nick); "" = our own action
+	snap       *snapshot // follower: latest master position heartbeat
 
 	loaded     string    // file our mpv is playing ("" = none; set on successful load)
 	loadedAt   time.Time // when mpv took the file: post-load seek posts are noise
@@ -747,6 +755,17 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 				e.setPause(true)
 				e.pausedBy = "" // the snapshot names no actor: honest empty
 			}
+		} else if ev.P {
+			// F9 CASE B (client half): the room's pause state arrives
+			// WITHOUT a position — adopt it. The setPause tell pauses the
+			// player and the ACTUATION gate (:1166) eats the echo of our
+			// own actuation; postedPause mirrors the adopted state — the
+			// room already knows it, so nothing is posted.
+			e.setPause(true)
+			e.localPause = true
+			p := true
+			e.postedPause = &p
+			e.pausedBy = "" // the snapshot names no actor: honest empty
 		}
 	case "load":
 		if ev.Name != e.loaded {
@@ -915,10 +934,27 @@ func (e *Engine) PauseToggle() {
 	if e.Master {
 		want = !e.lastPause
 		e.lastPause = want
-	} else {
-		if e.snap == nil {
+	} else if e.snap == nil {
+		// F9 lone follower: v1.9.0 legitimized lone playback (the S3
+		// local emit) — the key must work here too. Nothing loaded:
+		// refuse VISIBLY (the /skip law — silent no-ops are bugs).
+		if e.polledPos == nil {
+			e.OSDShow("nothing is playing — start with /play or /pick", 3000)
 			return
 		}
+		// our pending post is newer than any local sample: trust it
+		paused := e.localPause
+		if e.postedPause != nil && !e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+			paused = *e.postedPause
+		}
+		want = !paused
+		e.localPause = want
+		p := want
+		e.postedPause = &p
+		// no snap.paused mirror: there is no snapshot — postedPause
+		// carries the echo gate (:1187 reads it when our own pause event
+		// comes back); the common tail below fires the tell + the post
+	} else {
 		paused := e.snap.paused
 		// our pending post is newer than the room's last heartbeat: trust it
 		// over the snapshot, or the toggle repeats the state we just posted
@@ -946,11 +982,13 @@ func (e *Engine) PauseToggle() {
 // never re-posted. F6-A2: the target comes from the polled position field,
 // NOT a Pos() IPC round trip (a wedged mpv would hold e.mu for ≤5s per
 // keypress).
-func (e *Engine) SeekBy(dt float64) {
+// SeekBy reports whether the nudge was applied: false = nothing is
+// loaded — the caller refuses visibly instead of faking an OSD (F9).
+func (e *Engine) SeekBy(dt float64) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.polledPos == nil {
-		return
+		return false
 	}
 	t := max(0, *e.polledPos+dt)
 	e.seekTo(t)
@@ -959,6 +997,7 @@ func (e *Engine) SeekBy(dt float64) {
 	if e.Master {
 		e.lastPos = nil // scrub-check restarts fresh (no double post)
 	}
+	return true
 }
 
 // SeekTo jumps to an absolute position: the local player moves AND the
@@ -1064,6 +1103,14 @@ func (e *Engine) OnMpvp(s mpv.State) {
 		e.polledPos = &p
 	} else {
 		e.polledPos = nil
+	}
+	// F9: the lone-follower pause mirror. A sample taken while a fresh
+	// actuation was still landing is PRE-actuation (R-out1b): the
+	// actuation's own event handler owns the mirror then.
+	stale := e.actuatePause != nil && *e.actuatePause != s.Pause &&
+		e.Clock.Since(e.lastActuate) < 3*time.Second
+	if !stale {
+		e.localPause = s.Pause
 	}
 	e.muted = s.Muted // the mute log names the state we expect (F5)
 	// EOF transition (either role): at idle mpv keeps pause=false and drops
@@ -1184,7 +1231,36 @@ func (e *Engine) onMpvEventLocked(name string) (after func()) {
 		}
 		// follower: post only when the room does not know this state yet
 		// (a matching snapshot means this pause came from the room itself)
-		if e.snap == nil || e.snap.paused == wantPause {
+		if e.snap == nil {
+			// F9 lone follower: no master is listening, but a later one
+			// must not silently revert this pause — POST it. The
+			// value+recency gate eats the echo of our own actuation
+			// (same value inside the grace) while a NEW opposite pause
+			// still posts (a stale postedPause must not swallow it).
+			// Observer-machinery window: mpv's pause events before/at a
+			// file start (the observe_property INITIAL event fires at
+			// ENGINE START — loadedAt zero — and races the hello) are
+			// noise the engine never actuated; they must not reach the
+			// room. A genuine mpv-window pause REQUIRES a playing file,
+			// so the zero case is machinery too. The mirror still learns
+			// the local truth; after the window real events post.
+			if e.loadedAt.IsZero() || e.Clock.Since(e.loadedAt) < loadQuiet {
+				e.localPause = wantPause
+				return
+			}
+			if e.postedPause != nil && *e.postedPause == wantPause &&
+				!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+				e.localPause = wantPause
+				return
+			}
+			e.localPause = wantPause
+			p := wantPause
+			e.postedPause = &p
+			e.lastPost = e.Clock.Now()
+			e.postDiscrete(room.Event{Type: typ})
+			return
+		}
+		if e.snap.paused == wantPause {
 			return
 		}
 		// our own post is still pending: a heartbeat that was in flight
@@ -1236,7 +1312,10 @@ func (e *Engine) postScrub(master, hasSnap bool) {
 		return
 	}
 	if e.snap == nil && !hasSnap {
-		return // still nothing to sync against
+		// F9: the scrub itself already moved the local film — only the
+		// post was skipped; say so instead of a silent divergence.
+		e.logf("scrub stays local — no master to tell yet")
+		return
 	}
 	e.lastPost = e.Clock.Now()
 	e.postDiscrete(room.Event{Type: "seek", T: t})
@@ -1466,6 +1545,7 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 	if e.Ui == nil {
 		return
 	}
+	roomHasSnap := e.snap != nil // F9: honest has-snapshot (drift/alone chips)
 	// follower only: a heartbeat older than staleAge means the master's
 	// heartbeats stopped — the drift number below is then meaningless.
 	// The heartbeat age is measured on its own stamp (snap.beat): the
@@ -1481,7 +1561,7 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 		by = "" // playing: the chip is not shown, the actor is moot
 	}
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Mechanical: e.mechPause, Sub: s.Sub, Layout: s.Layout}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Mechanical: e.mechPause, Sub: s.Sub, Layout: s.Layout, Room: roomHasSnap}:
 	default:
 	}
 }

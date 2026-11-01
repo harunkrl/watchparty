@@ -167,6 +167,10 @@ jobs:
           # (the "▶ playing" chip) had zero coverage; this one drives the
           # real binary under a pty and reads the painted frame.
           tests/ci_retry.sh node tests/status_render.mjs
+          # F9: the pause paths — a LONE follower's ctrl+space must pause the
+          # room end to end, and a paused room must STAY paused when a
+          # master joins later (the hello.p handoff). Same pty harness.
+          tests/ci_retry.sh node tests/room_pause.mjs
 
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes.

@@ -472,6 +472,86 @@ await scenario('[w1-3 E2E] frozen master: takeover, silent claim, self-demotion 
   }
 });
 
+// [F9-2] CASE B (A9 S1): a room that is PAUSED but has NO position (a lone
+// follower paused it; no clock owner ever beat) must still hand the pause
+// to a joining client. Before the fix, pos AND p both lived inside the
+// `state.now && state.pos != null` block, so the joining master saw neither
+// — it started unpaused and its first heartbeat (p=false) erased the room's
+// pause: the follower's pause was lost and the film resumed.
+await scenario('[F9-2] a paused room hands p:true to a joiner even without a position', async () => {
+  const s = startServer(['a.mkv']);
+  try {
+    await waitReady(s.base);
+    // the room has a file, a pause, and NO position (no clock owner ever beat)
+    await post(s.base, { type: 'load', from: 'f', name: 'a.mkv' });
+    await post(s.base, { type: 'pause', from: 'f' });
+    const w = rawSse(s.base, 'joiner', 'joiner');
+    await waitUntil(() => w.events.length > 0, 3000, 'the joiner hello');
+    const hello = w.events.find((e) => e.type === 'hello');
+    assert.ok(hello, 'no hello for the joiner');
+    assert.equal(hello.p, true, `the paused room did not hand its pause over: ${JSON.stringify(hello)}`);
+    assert.equal(hello.pos, undefined, `the room has no position — the hello must not invent one: ${JSON.stringify(hello)}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [F9-2] the same room NOT paused hands p:false: we CARRY the state, we
+// never invent one (the "do not force p=true" intent of the old comment).
+await scenario('[F9-2] an unpaused room hands p:false (no forced pause)', async () => {
+  const s = startServer(['a.mkv']);
+  try {
+    await waitReady(s.base);
+    await post(s.base, { type: 'load', from: 'f', name: 'a.mkv' });
+    const w = rawSse(s.base, 'joiner', 'joiner');
+    await waitUntil(() => w.events.length > 0, 3000, 'the joiner hello');
+    const hello = w.events.find((e) => e.type === 'hello');
+    assert.ok(hello, 'no hello for the joiner');
+    assert.equal(hello.p, false, `the room did not hand its (false) paused flag: ${JSON.stringify(hello)}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [F9-2] the wire shape guard: the hello carries the same fields as before
+// plus the now-always-present p — no new/unknown fields (S6-style).
+await scenario('[F9-2] the hello payload shape: the known fields plus p', async () => {
+  const KNOWN = new Set(['type', 'now', 'queue', 'roster', 'invite', 'inviteAlt', 'pos', 'p']);
+  const s = startServer(['a.mkv']);
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'joiner', 'joiner');
+    await waitUntil(() => w.events.length > 0, 3000, 'the joiner hello');
+    const hello = w.events.find((e) => e.type === 'hello');
+    const unknown = Object.keys(hello).filter((k) => !KNOWN.has(k));
+    assert.deepEqual(unknown, [], `the hello grew an unknown field: ${JSON.stringify(hello)}`);
+    assert.ok('p' in hello, `the hello must always carry the room's paused flag: ${JSON.stringify(hello)}`);
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
+// [F9-2] the pause relay + persist behavior (probed in A9 S1) must stay
+// intact: a follower's pause reaches the room AND lands in the room state.
+await scenario('[F9-2] a follower pause is relayed and persisted', async () => {
+  const s = startServer(['a.mkv']);
+  try {
+    await waitReady(s.base);
+    const w = rawSse(s.base, 'obs', 'obs');
+    await sleep(150);
+    await post(s.base, { type: 'pause', from: 'f' });
+    await waitUntil(() => w.events.some((e) => e.type === 'pause'), 3000, 'the pause relayed');
+    const health = await (await fetch(`${s.base}/health`)).json();
+    assert.equal(health.paused, true, 'the room did not persist the follower pause');
+    w.close();
+  } finally {
+    await s.stop();
+  }
+});
+
 for (const [st, name] of results) console.log(`${st}  ${name}`);
 const fails = results.filter(([st]) => st === 'FAIL').length;
 console.log(`f2: ${results.length - fails}/${results.length} held`);
