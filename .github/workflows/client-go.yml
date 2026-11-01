@@ -38,6 +38,20 @@ jobs:
       # adversarial audit pins: used to live only in the local battery
       - run: ../tests/ci_retry.sh go test -tags audit3 ./internal/...
 
+      # F6/C3: the retry must not hide the flake — the failed run's logs
+      # become an artifact, so the flake hunt finally has eyes.
+      # A7 P2-2: this job had NO upload step at all, so the go retry logs
+      # (the windows flake class lives in go test) never left the
+      # runner. It is the last step of the job, and always() makes it
+      # fire even when the job was cancelled after a failure.
+      - name: upload the test logs on failure
+        if: always() && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wp-retry-*.log
+          if-no-files-found: ignore
+
   # execute windows code paths natively: cross-compile covered nothing,
   # so the named-pipe IPC layer had zero test coverage and go vet never
   # saw mpv_windows.go. shortcut: no -race (windows runners make the
@@ -61,10 +75,10 @@ jobs:
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes
       - name: upload the test logs on failure
-        if: failure()
+        if: always() && failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
+          name: test-logs-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wp-retry-*.log
           if-no-files-found: ignore
 
@@ -116,7 +130,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # A7-m2-04: Node 20 went EOL on 2026-04-30 — CI must run the
+          # same runtime the dev box runs (v22).
+          node-version: 22
       - run: tests/ci_retry.sh node tests/smoke.mjs
       - run: tests/ci_retry.sh node tests/persist.mjs
       # F6: the server pins (backpressure, stale gate, flush chain, backup)
@@ -132,16 +148,6 @@ jobs:
         with:
           go-version-file: client-go/go.mod
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
-
-      # F6/C3: the retry must not hide the flake — the failed run's logs
-      # become an artifact, so the flake hunt finally has eyes
-      - name: upload the test logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/wp-retry-*.log
-          if-no-files-found: ignore
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |
@@ -150,3 +156,17 @@ jobs:
           tests/ci_retry.sh node tests/stall_family.mjs
           tests/ci_retry.sh node tests/master_restart.mjs
           tests/ci_retry.sh node tests/soak.mjs
+
+      # F6/C3: the retry must not hide the flake — the failed run's logs
+      # become an artifact, so the flake hunt finally has eyes.
+      # A7 P2-2: this step used to sit BEFORE the mpv e2e suites, so a
+      # failure in exactly the timing-sensitive suites it exists for
+      # never reached the upload. It is LAST now, and always() makes it
+      # fire even when the job was cancelled after a failure.
+      - name: upload the test logs on failure
+        if: always() && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wp-retry-*.log
+          if-no-files-found: ignore

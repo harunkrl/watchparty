@@ -99,7 +99,12 @@ const chatHistorySent = new Set();
 // at /var/lib/watchparty — the deploy dir is read-only). posAt is
 // monotonic and resets between boots, so the age travels as wall-clock ms.
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
-let persistOK = true;
+// F7: a failed persist is NOT latched off for the process lifetime: the
+// disk can recover (a full volume that is emptied, a read-only mount that
+// is fixed). The failure stays loud and the next attempt happens again.
+const PERSIST_RETRY_MS = 5000;
+let persistFailed = false;
+let persistRetryTimer = null;
 let stateDirty = false;
 let stateTimer = null;
 function stateSnapshot() {
@@ -109,15 +114,18 @@ function stateSnapshot() {
   });
 }
 function persistFail(e) {
-  persistOK = false;
-  console.error(`watchparty: state persistence disabled (${e.message})`);
+  persistFailed = true;
+  console.error(`watchparty: state persistence failed (${e.message}) — retrying in ${PERSIST_RETRY_MS / 1000}s`);
+  if (!persistRetryTimer) {
+    persistRetryTimer = setTimeout(() => { persistRetryTimer = null; flushState(); }, PERSIST_RETRY_MS);
+  }
 }
 function saveState() {
   // debounced write-behind: heartbeats fire ~0.5/s and a synchronous
   // write per event leaked event-loop latency that destabilized the
   // clients' seek-echo gates (soak bisect, .pi-state/test-ci-audit-raw.md)
-  if (!persistOK) return;
   stateDirty = true;
+  if (persistFailed) return; // the retry timer owns the next attempt (no log spam)
   if (!stateTimer) stateTimer = setTimeout(flushState, 2000);
 }
 // B3: ONE in-flight flush chain. Two writers on the same .tmp path would
@@ -128,7 +136,7 @@ let stateFlush = Promise.resolve();
 
 function flushState() {
   stateTimer = null;
-  if (!stateDirty || !persistOK) return;
+  if (!stateDirty) return;
   stateDirty = false;
   stateFlush = stateFlush.then(async () => {
     const tmp = `${STATE_FILE}.tmp`;
@@ -143,23 +151,57 @@ function flushState() {
       if (e.code !== 'ENOENT') console.error(`watchparty: state backup failed (${e.message})`);
     }
     await fs.promises.rename(tmp, STATE_FILE);
-  }).catch((e) => persistFail(e));
+    persistFailed = false; // the disk is back: the normal path resumes
+  }).catch((e) => {
+    // F7: the snapshot we lost is still dirty -> the retry writes it
+    stateDirty = true;
+    persistFail(e);
+  });
 }
+// F7: the exit must not wait for a stuck flush. A hung fsync (a stalled
+// disk, a hung network mount) keeps a libuv threadpool thread busy
+// forever: process.exit() cannot complete while such a write is stuck
+// (master-2's probe: exit(0) called, the process still alive 9 s later).
+// The exit therefore races a drain timeout, SKIPS the write with a loud
+// log when the chain is still in flight, and hard-kills the process.
+// The normal path is unchanged: an empty chain -> the exit write runs ->
+// a clean exit.
+// EXIT_DRAIN_MS is a knob (like SSE_MAX_BUFFER): the pin drives it down so
+// the test does not depend on the wall clock of a loaded (shared) box.
+const EXIT_DRAIN_MS = Number(process.env.EXIT_DRAIN_MS) || 2000;
+const EXIT_WRITE_MS = 5000;
+let exiting = false;
 const persistAndExit = () => {
+  if (exiting) return; // one exit path (a second signal must not race the first)
+  exiting = true;
+  let phase = 'drain'; // drain -> write
+  const onExitTimeout = () => {
+    console.error(phase === 'drain'
+      ? 'watchparty: exit write skipped — the flush is still in flight'
+      : 'watchparty: the exit-time state write is stuck — hard kill');
+    process.kill(process.pid, 'SIGKILL'); // process.exit() cannot complete here
+  };
+  let timer = setTimeout(onExitTimeout, EXIT_DRAIN_MS);
+  // a pending flush must not race the exit write on the same .tmp
+  if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
   // B3: the exit write JOINS the flush chain instead of racing it on the
   // same .tmp. The chain is one write+fsync+rename, so the join cannot
   // hold the exit for long.
-  stateFlush.then(() => {
-    if (persistOK && stateDirty) {
+  const exitPath = async () => {
+    phase = 'write';
+    clearTimeout(timer);
+    timer = setTimeout(onExitTimeout, EXIT_WRITE_MS); // a stuck write must not hang the exit either
+    if (stateDirty) {
       try {
         // A5-4 (amendment): the exit-time write is the most important persist
-        // — the same atomic+durable dance as flushState, in sync form (a
-        // signal handler must finish before exit)
+        // — the same atomic+durable dance as flushState (a signal handler
+        // must finish before exit; the write is ASYNC so a stuck fsync
+        // cannot block the event loop and disable the hard kill above)
         const tmp = `${STATE_FILE}.tmp`;
-        fs.writeFileSync(tmp, stateSnapshot());
-        const fd = fs.openSync(tmp, 'r');
-        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-        fs.renameSync(tmp, STATE_FILE);
+        await fs.promises.writeFile(tmp, stateSnapshot());
+        const h = await fs.promises.open(tmp, 'r');
+        try { await h.sync(); } finally { await h.close(); }
+        await fs.promises.rename(tmp, STATE_FILE);
       } catch (e) {
         // C1: this was the ONLY empty catch in the file: a lost room state
         // (the dir vanished, the disk is full) was swallowed silently.
@@ -168,7 +210,8 @@ const persistAndExit = () => {
       }
     }
     process.exit(0);
-  });
+  };
+  stateFlush.then(exitPath, exitPath);
 };
 (function restoreState() {
   let saved;
@@ -356,6 +399,7 @@ function advanceQueue(byNick) {
 // (master-2 proved it re-opens the hole in two steps). Entries expire by
 // TTL, so the set stays bounded.
 const STALE_TTL_MS = Number(process.env.STALE_TTL_MS) || 60000;
+const STALE_MAX = Number(process.env.STALE_MAX) || 1024; // F7: the map's absolute cap
 const staleClients = new Map(); // client id -> mono() of the last gate hit
 
 const isStale = (from) => {
@@ -372,8 +416,13 @@ setInterval(() => {
 }, Math.max(1000, STALE_TTL_MS / 2)).unref();
 
 function handleCmd(cmd) {
+  // F7: every cmd type carries a nick -> normalize it through the same
+  // clean() the roster uses. A client-supplied nick is untrusted text:
+  // the probe showed ANSI escapes surviving on a position event (the
+  // position case was the odd one out — chat was cleaned, the steering
+  // types took the roster's nick).
+  cmd.nick = clean(cmd.nick || '', 32);
   if (cmd.type === 'chat') {
-    cmd.nick = clean(cmd.nick || '', 32);
     cmd.text = clean(cmd.text || '', 500); // mirrors client ChatMaxLen
   }
   // S-B/S-D: play/pause/seek/load relays name the actor (client renders
@@ -415,7 +464,13 @@ function handleCmd(cmd) {
       if (state.now !== null && typeof cmd.file === 'string' && cmd.file !== state.now) {
         // B2: the poster is an old master driving the previous film — it
         // loses its steering rights for STALE_TTL_MS
-        if (cmd.from) staleClients.set(cmd.from, mono());
+        if (cmd.from) {
+          // F7: the same cap-and-clear shape A5-3 gave impostorSeen: a
+          // forged POST-only id flood must not grow the map without bound
+          // (the TTL sweep only bounds the RATE, not a burst)
+          if (staleClients.size >= STALE_MAX) staleClients.clear();
+          staleClients.set(cmd.from, mono());
+        }
         if (mono() - lastMovedOnNotice > 10000) {
           lastMovedOnNotice = mono();
           // P2-1: state.now is a client-supplied FILENAME — same trust

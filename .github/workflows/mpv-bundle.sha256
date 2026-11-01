@@ -1,0 +1,19 @@
+# The vetted mpv-winbuild asset for the Windows bundle (A7-m2-03).
+#
+# The release workflow compares the downloaded asset against THIS value -
+# not against the digest in the upstream api response (which hands out the
+# url too, and would therefore vouch for a replaced asset).
+#
+# Format: <sha256>  <asset file name>   (one line, the rest are comments)
+#
+# ROTATION IS MANUAL: to ship a newer mpv, download the new asset, run
+# `sha256sum <asset>`, and update the line below AND MPV_TAG in
+# client-go-release.yml. The workflow fails loudly if the asset name does
+# not match this file (the tag moved) or if the bytes differ.
+#
+# Who: the maintainer. When: with any release that wants a newer mpv.
+#
+# MPV_TAG 20261021 -> mpv-x86_64-20261021-git-e471496c56.7z
+# (verified 2026-11-01: downloaded from the upstream release and hashed
+#  locally; it matches the digest the GitHub api reports for the asset)
+4a355f3e89c83fabc730d33fb4e759dfec747806ed2287b61a90d1681b83e8d3  mpv-x86_64-20261021-git-e471496c56.7z

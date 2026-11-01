@@ -33,10 +33,13 @@ function startServer(files, opts = {}) {
   return {
     base,
     stop: async () => {
-      proc.kill();
-      // wait for exit: the SIGTERM handler may still write state.json —
-      // removing the dir before that races it (ENOTEMPTY)
-      await new Promise((r) => proc.on('exit', r));
+      // F7: a process that has ALREADY exited never emits 'exit' again —
+      // the naive wait would hang the suite forever
+      if (proc.exitCode === null && proc.signalCode === null) {
+        const exited = new Promise((r) => proc.once('exit', r));
+        proc.kill();
+        await exited;
+      }
       rmSync(dir, { recursive: true, force: true });
     },
     stderr: () => err,

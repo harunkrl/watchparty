@@ -28,7 +28,10 @@ func TestLoadSettleRunsOffTheLock(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(500 * time.Millisecond):
+	// 2s, not 500ms: the pin guards the 5s lock-hold class, not
+	// microsecond latency — a loaded 2-core runner can pause the
+	// goroutines briefly (F7 budget widening)
+	case <-time.After(2 * time.Second):
 		t.Fatal("OnRoom blocked on the load chain (the settle did not go off the lock)")
 	}
 	var nStart, nAttach int

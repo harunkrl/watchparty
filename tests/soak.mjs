@@ -50,6 +50,12 @@ const server = spawn(process.execPath, [join(ROOT, 'server.js')], {
   env: { ...process.env, PORT: String(PORT), VIDEOS_DIR: dir, STATE_FILE: join(dir, 'state.json') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
+// F7: the server's own output is the evidence when a suite fails (a stale
+// server on this port answered /files with 200 and the suite died later
+// with a confusing mpv 404 — the EADDRINUSE was never shown)
+let serverOut = '';
+server.stdout.on('data', (d) => (serverOut += d));
+server.stderr.on('data', (d) => (serverOut += d));
 function client(name, extra) {
   const argv = [GO_BIN, '--headless', '--name', name, ...extra, BASE];
   const c = spawn(argv[0], argv.slice(1), {
@@ -127,6 +133,11 @@ try {
     try { up = (await fetch(`${BASE}/files`)).ok; } catch { await sleep(100); }
   }
   assert.ok(up, 'server did not come up');
+  // F7: the server we reached must be OURS: alive, and serving our
+  // fixture (a stale server on the same port answers /files with 200)
+  assert.ok(server.exitCode === null && server.signalCode === null, `the server died (port busy?):\n${serverOut}`);
+  const listed = await (await fetch(`${BASE}/files`)).json();
+  assert.ok(listed.includes('test.mp4'), `the server on this port serves another dir: ${JSON.stringify(listed)}\n${serverOut}`);
   observe().catch(() => {}); // a dead observer must fail the load guard below
   await sleep(2000);
 
@@ -174,6 +185,7 @@ try {
 } catch (e) {
   console.error('FAIL:', e.message);
   console.error(`counts: ${JSON.stringify(counts)}`);
+  console.error('--- server out ---\n' + serverOut);
   console.error('--- master out ---\n' + master.out);
   console.error('--- follower out ---\n' + follower.out);
   await cleanup(1);

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"math/rand"
 	"os"
@@ -372,3 +373,19 @@ func (m *freezeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 func (m *freezeModel) View() string { return "freeze" }
+
+// m2-01: the quit-time "post lost" verdict must reach the HUMAN. After
+// the TUI has ended, tea drops post-Run sends (measured 481ns), so the
+// logPump line never appears; stderr is where the user still is.
+func TestReportPostLost(t *testing.T) {
+	var buf bytes.Buffer
+	reportPostLost(&buf, false)
+	if !strings.Contains(buf.String(), "> post lost — the room did not answer") {
+		t.Fatalf("a lost flush must print the verdict: %q", buf.String())
+	}
+	buf.Reset()
+	reportPostLost(&buf, true)
+	if buf.Len() != 0 {
+		t.Fatalf("a delivered flush must print nothing: %q", buf.String())
+	}
+}

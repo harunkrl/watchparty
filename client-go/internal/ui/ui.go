@@ -135,7 +135,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /sub [sub] · /subdelay <±sec> · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+↑/↓ sub-delay ±0.5s · alt+m mute · F1 keys · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /sub [sub] · /subdelay <±sec> · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+↑/↓ sub-delay ±0.5s · alt+m mute · ctrl+p files · F1 keys · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -146,53 +146,54 @@ func nickStyle(nick string) lipgloss.Style {
 }
 
 type Model struct {
-	nick       string
-	master     bool
-	api        *room.Client
-	player     *mpv.Player
-	osdHook    func(string) // test seam for the OSD hint (nil = the mpv window)
-	engine     *sync.Engine
-	input      textinput.Model
-	spin       spinner.Model  // connecting screen (pre-WindowSizeMsg)
-	vp         viewport.Model // chat pane
-	sysVp      viewport.Model // system tail: events + engine lines
-	lastErr    string         // input-row feedback until the next keystroke
-	log        []entry
-	peers      map[string]bool
-	now        string
-	invite     string   // address to invite people to (server hello "invite")
-	inviteAlt  string   // second invite address (server hello "inviteAlt")
-	queue      []string // server queue state (hello/queue events)
-	files      []string // last known video list (typo guard, any filesMsg)
-	st         *sync.UiState
-	conn       string // connecting | connected | reconnecting | lost
-	connSince  time.Time
-	retry      int // reconnect attempts since the last connect
-	retryDelay int // current backoff in seconds
-	duration   float64
-	durCache   map[string]float64 // known file durations: a reload paints the bar instantly
-	lostAt     time.Time          // when the connection dropped (reconnect delta)
-	mode       mode
-	pickItems  []string
-	pickCursor int
-	pickAct    pickAction // what enter does in the picker: play or enqueue
-	hist       []string   // input history, newest last
-	histIdx    int        // -1 = live editing
-	draft      string     // saved while browsing history
-	zen        bool       // movie-night mode: one status line + input only
-	sysOff     bool       // ctrl+g: system pane hidden
-	helpOpen   bool       // F1: passive keys overlay (every other key keeps working)
-	resizing   bool       // A4: a resize storm is in flight (the settle re-syncs)
-	gone       []string   // departed nicks, shown offline (cap 5)
-	eq         []float64  // vibe equalizer bar heights 0..1
-	compOpen   bool       // Tab menu of command/file completions
-	compItems  []compItem
-	compCursor int
-	compFile   bool // completing a file argument (vs a verb)
-	compVerb   string
-	compWord   string
-	width      int
-	height     int
+	nick        string
+	master      bool
+	api         *room.Client
+	player      *mpv.Player
+	osdHook     func(string) // test seam for the OSD hint (nil = the mpv window)
+	engine      *sync.Engine
+	input       textinput.Model
+	spin        spinner.Model  // connecting screen (pre-WindowSizeMsg)
+	vp          viewport.Model // chat pane
+	sysVp       viewport.Model // system tail: events + engine lines
+	lastErr     string         // input-row feedback until the next keystroke
+	log         []entry
+	peers       map[string]bool
+	now         string
+	invite      string   // address to invite people to (server hello "invite")
+	inviteAlt   string   // second invite address (server hello "inviteAlt")
+	queue       []string // server queue state (hello/queue events)
+	files       []string // last known video list (typo guard, any filesMsg)
+	st          *sync.UiState
+	conn        string // connecting | connected | reconnecting | lost
+	connSince   time.Time
+	retry       int // reconnect attempts since the last connect
+	retryDelay  int // current backoff in seconds
+	duration    float64
+	durCache    map[string]float64 // known file durations: a reload paints the bar instantly
+	lostAt      time.Time          // when the connection dropped (reconnect delta)
+	mode        mode
+	pickItems   []string
+	pickCursor  int
+	pickAct     pickAction      // what enter does in the picker: play or enqueue
+	hist        []string        // input history, newest last
+	histIdx     int             // -1 = live editing
+	draft       string          // saved while browsing history
+	zen         bool            // movie-night mode: one status line + input only
+	sysOff      bool            // ctrl+g: system pane hidden
+	helpOpen    bool            // F1: passive keys overlay (every other key keeps working)
+	subInFlight map[subKey]bool // /sub probes still answering: duplicate guard
+	resizing    bool            // A4: a resize storm is in flight (the settle re-syncs)
+	gone        []string        // departed nicks, shown offline (cap 5)
+	eq          []float64       // vibe equalizer bar heights 0..1
+	compOpen    bool            // Tab menu of command/file completions
+	compItems   []compItem
+	compCursor  int
+	compFile    bool // completing a file argument (vs a verb)
+	compVerb    string
+	compWord    string
+	width       int
+	height      int
 }
 
 // compItem is one row of the Tab completion menu.
@@ -394,7 +395,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		st := msg
 		m.st = &st
 	case subMsg: // the /sub probe answered (off the update thread)
-		if msg.video != m.now { // the room moved on while the probe ran
+		delete(m.subInFlight, msg.key) // the guard clears on answer AND cancel
+		if msg.video != m.now {        // the room moved on while the probe ran
 			if msg.name == "" {
 				return m, nil // a stale list is noise
 			}
@@ -1024,11 +1026,22 @@ func (m Model) setSubDelay(arg string) (Model, tea.Cmd) {
 	return m, nil
 }
 
+// subKey identifies one in-flight /sub probe: the video it probes and the
+// requested name ("" = listing). Keyed — refusing a second /sub of a
+// DIFFERENT request would block a legitimate one (master-2 refinement);
+// mpv's sub-add is not idempotent, so a true duplicate would create a
+// second, identical subtitle track.
+type subKey struct {
+	video string
+	name  string
+}
+
 // subMsg is the /sub probe answer. The /subs HTTP probe rides a tea.Cmd
 // (the playFile precedent): a slow or unreachable server must never
 // freeze the update loop; the attach itself is a tell and fires when the
 // answer arrives.
 type subMsg struct {
+	key   subKey   // which probe this answers (clears the in-flight guard)
 	video string   // the file the probe ran for
 	name  string   // the requested sub ("" = listing)
 	subs  []string // the candidates for video
@@ -1036,14 +1049,33 @@ type subMsg struct {
 
 // requestSub runs /sub: bare, it lists the sidecar candidates for the
 // current file; with a name it attaches that one track — no reload, and
-// no room post (subtitle choice is personal, like the timing).
+// no room post (subtitle choice is personal, like the timing). A probe
+// for the SAME video+name that is still answering is refused: attaching
+// twice would duplicate the track in mpv.
 func (m Model) requestSub(name string) (Model, tea.Cmd) {
+	// the duplicate guard runs FIRST: a second /sub of the SAME video+name
+	// is refused even before the player check — mpv's sub-add is not
+	// idempotent and attaching twice would create a second, identical
+	// subtitle track (master-2 refinement: keyed, so a different request
+	// stays allowed)
+	key := subKey{m.now, name}
+	if m.subInFlight[key] {
+		suffix := ""
+		if name != "" {
+			suffix = " " + name
+		}
+		return m.logf("> /sub%s is already being looked up", suffix), nil
+	}
 	if m.now == "" || m.player == nil {
 		return m.failf("no file playing — /sub attaches to the current video")
 	}
+	if m.subInFlight == nil {
+		m.subInFlight = map[subKey]bool{}
+	}
+	m.subInFlight[key] = true
 	pl, video := m.player, m.now
 	return m, func() tea.Msg {
-		return subMsg{video: video, name: name, subs: pl.SubCandidates(video)}
+		return subMsg{key: key, video: video, name: name, subs: pl.SubCandidates(video)}
 	}
 }
 

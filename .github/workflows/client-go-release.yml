@@ -17,6 +17,12 @@ env:
   # pinned mpv daily build (shinchiro date tags): same tag => same bytes,
   # verified against the GitHub asset digest at download time. Bump the
   # tag to refresh the bundled player — never build from "latest".
+  # The Windows bundle's mpv build. ROTATION IS MANUAL: to ship a newer
+  # mpv, download the new mpv-winbuild asset, sha256 it, and update BOTH
+  # this tag AND the vetted digest in .github/workflows/mpv-bundle.sha256
+  # (the release check compares the download against THAT file, not against
+  # the upstream api's own claim). Who: the maintainer. When: with any
+  # release that wants a newer mpv (the tag below is from 2026-10-21).
   MPV_TAG: '20261021'
 
 permissions:
@@ -41,16 +47,6 @@ jobs:
       # contract, clean=0) skips without it (F2 review P2-2); ffmpeg
       # is only needed by the node e2e suites below
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
-
-      # F6/C3: the retry must not hide the flake — the failed run's logs
-      # become an artifact, so the flake hunt finally has eyes
-      - name: upload the test logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/wp-retry-*.log
-          if-no-files-found: ignore
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: ../tests/ci_retry.sh go test -race ./...
@@ -59,7 +55,9 @@ jobs:
       # the node battery gates releases too (mpv+ffmpeg ≈ 1-2 min)
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # A7-m2-04: Node 20 went EOL on 2026-04-30 — CI must run the
+          # same runtime the dev box runs (v22).
+          node-version: 22
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |
@@ -76,6 +74,20 @@ jobs:
         # the job default (client-go) does not contain tests/: run the
         # suites from the workspace root, like the CI node job
         working-directory: ${{ github.workspace }}
+
+      # F6/C3: the retry must not hide the flake — the failed run's logs
+      # become an artifact, so the flake hunt finally has eyes.
+      # A7 P2-2: this step used to sit BEFORE go vet / go test / the node
+      # battery, so in the release gate it could never upload anything.
+      # It is LAST now, and always() makes it fire even when the job was
+      # cancelled after a failure.
+      - name: upload the test logs on failure
+        if: always() && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wp-retry-*.log
+          if-no-files-found: ignore
 
   # m2-504: the gate never executed windows code paths — a Windows-only
   # break could ship from a tag even though main CI runs this job.
@@ -98,10 +110,10 @@ jobs:
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes
       - name: upload the test logs on failure
-        if: failure()
+        if: always() && failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ github.job_name }}-${{ github.run_attempt }}
+          name: test-logs-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wp-retry-*.log
           if-no-files-found: ignore
 
@@ -177,7 +189,8 @@ jobs:
             zip -j "dist/${plat}.zip" "$d"/watchparty* "$d/README.txt"
           done
           # friend bundle: portable mpv next to the exe (plan Q2), pinned to
-          # MPV_TAG and digest-verified — a repackaged download must fail
+          # MPV_TAG and checked against the digest vetted IN THE REPO — a
+          # repackaged download must fail
           sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
           tagged=$(curl -sL \
             "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/$MPV_TAG")
@@ -185,18 +198,31 @@ jobs:
           url=$(echo "$tagged" | jq -r --arg re "$pick" \
             '.assets[] | select(.name | test($re))
              | .browser_download_url' | head -1)
-          want=$(echo "$tagged" | jq -r --arg re "$pick" \
-            '.assets[] | select(.name | test($re))
-             | .digest' | head -1)
+          # A7-m2-03: the vetted digest lives IN THE REPO. The old check
+          # read the expected sha256 from the SAME api response that hands
+          # out the url, so a replaced upstream asset passed its own check;
+          # now the repo value is the only accepted truth.
+          digest_file=.github/workflows/mpv-bundle.sha256
+          want=$(awk '!/^#/ && NF {print $1; exit}' "$digest_file")
+          wantname=$(awk '!/^#/ && NF {print $2; exit}' "$digest_file")
           # m2-507: this used to be `test -n "$url" && test ...` — an
           # AND-list is exempt from set -e, so a missing asset failed
           # silently into a confusing curl/sha256 error below
-          if [ -z "$url" ] || [ -z "$want" ] || [ "$want" = "null" ]; then
+          if [ -z "$url" ]; then
             echo "no mpv asset matched tag=$MPV_TAG pick=$pick" >&2
             exit 1
           fi
+          if [ -z "$want" ] || [ -z "$wantname" ]; then
+            echo "no vetted mpv digest in $digest_file" >&2
+            exit 1
+          fi
+          if [ "$(basename "$url")" != "$wantname" ]; then
+            echo "the mpv asset changed: $(basename "$url") != $wantname" >&2
+            echo "re-vet it and update $digest_file" >&2
+            exit 1
+          fi
           curl -sL -o /tmp/mpv.7z "$url"
-          echo "${want#sha256:}  /tmp/mpv.7z" | sha256sum -c -
+          echo "$want  /tmp/mpv.7z" | sha256sum -c -
           7z x -y /tmp/mpv.7z -o/tmp/mpv-portable >/dev/null
           mkdir /tmp/bundle
           cp artifacts/watchparty-windows-amd64/watchparty.exe /tmp/bundle/
@@ -221,7 +247,10 @@ jobs:
           # F6 D4: a tag without a "## <tag>" section in the changelog
           # would ship a release nobody can read about. Fail the release
           # instead: the changelog entry is part of the release contract.
-          if ! grep -q "^## ${GITHUB_REF_NAME} " client-go/CHANGELOG.md; then
+          # A7 P3-5: the tag heading may carry a title ("## v1.8.1 — ...")
+          # or stand alone at EOL ("## v1.8.1") — both count.
+          tag_re=$(printf '%s' "$GITHUB_REF_NAME" | sed 's/[.[\*^$]/\\&/g')
+          if ! grep -qE "^## ${tag_re}( |$)" client-go/CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## ${GITHUB_REF_NAME}'" >&2
             exit 1
           fi
@@ -229,8 +258,15 @@ jobs:
         run: |
           # the whole changelog as release notes buries this release; the
           # notes are the tag's own section (+ the bundle facts)
-          awk -v head="## ${GITHUB_REF_NAME} " '
-            index($0, head) == 1 { on = 1; print; next }
+          # the same rule as the gate: the heading may carry a title or
+          # stand alone at EOL (A7 P3-5)
+          awk -v head="## ${GITHUB_REF_NAME}" '
+            function ishead(l) {
+              l = length(head)
+              return index($0, head) == 1 && \
+                (length($0) == l || substr($0, l + 1, 1) == " ")
+            }
+            ishead() { on = 1; print; next }
             on && /^## / { exit }
             on { print }
           ' client-go/CHANGELOG.md > "$RUNNER_TEMP/notes.md"

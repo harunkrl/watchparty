@@ -6,12 +6,13 @@
 // observable in a test — they default to the production values.
 
 import { strict as assert } from 'node:assert';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import { stopServer } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 18500 + Math.floor(Math.random() * 400);
@@ -31,8 +32,10 @@ function waitUntil(fn, ms = 5000, label = 'condition') {
 }
 
 // start boots a server with the given env overrides.
-function start(extraEnv = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'wp-f6-'));
+// A prepared dir can be passed in (the FIFO pin needs the state path
+// before the server writes to it).
+function start(extraEnv = {}, prepared = null) {
+  const dir = prepared || mkdtempSync(join(tmpdir(), 'wp-f6-'));
   writeFileSync(join(dir, 'movie one.mkv'), Buffer.alloc(4096, 1));
   writeFileSync(join(dir, 'movie two.mkv'), Buffer.alloc(4096, 2));
   const proc = spawn(process.execPath, [join(ROOT, 'server.js')], {
@@ -48,9 +51,15 @@ function start(extraEnv = {}) {
 // boot waits for the server to answer and shows its output when it does not.
 // A transient connection error is retried (the first fetch right after the
 // listen can fail) — it is not a test failure.
+// F7: the server must still be ALIVE: a stale server on the same port
+// answers /health with 200 and would send this suite into another
+// server's room (the port-busy class failed as a confusing 404).
 async function boot(s) {
   const t0 = Date.now();
   for (;;) {
+    if (s.proc.exitCode !== null || s.proc.signalCode !== null) {
+      throw new Error(`the server died (port busy?):\n${s.out()}`);
+    }
     try {
       const r = await fetch(`${BASE}/health`);
       if (r.ok) return;
@@ -70,9 +79,20 @@ async function post(obj) {
   assert.equal(res.status, 204);
 }
 
+// waitExit waits for a process that is still alive. A process that has
+// ALREADY exited never emits 'exit' again -> the naive wait hangs forever
+// (the port-busy class: the server died on EADDRINUSE).
+async function waitExit(proc) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  await new Promise((r) => proc.once('exit', r));
+}
+
 async function stop(s) {
-  s.proc.kill();
-  await new Promise((r) => s.proc.on('exit', r));
+  if (s.proc.exitCode === null && s.proc.signalCode === null) {
+    const exited = new Promise((r) => s.proc.once('exit', r));
+    s.proc.kill();
+    await exited;
+  }
   rmSync(s.dir, { recursive: true, force: true });
 }
 
@@ -95,8 +115,6 @@ await pin('B1 a client that stops reading is dropped', async () => {
     const stuck = net.connect(PORT, '127.0.0.1');
     await new Promise((r) => stuck.on('connect', r));
     stuck.write('GET /events?id=stuck&nick=Stuck HTTP/1.1\r\nHost: x\r\n\r\n');
-    let closed = false;
-    stuck.on('close', () => (closed = true));
     stuck.on('error', () => {});
     await waitUntil(async () => (await (await fetch(`${BASE}/health`)).json()).listeners >= 1, 5000, 'the stuck client joined');
     // flood the room over ONE keep-alive socket (the kernel buffers hold a
@@ -167,7 +185,7 @@ await pin('B3 the exit write lands and the state file stays valid', async () => 
     await post({ type: 'enqueue', from: 'm', name: 'movie two.mkv' });
     // kill right away: the exit-time write must land on its own
     s.proc.kill();
-    await new Promise((r) => s.proc.on('exit', r));
+    await waitExit(s.proc);
     const raw = readFileSync(join(s.dir, 'state.json'), 'utf8');
     const saved = JSON.parse(raw); // must be valid JSON: no interleaving
     assert.equal(saved.now, 'movie one.mkv', `the exit write lost the film: ${raw}`);
@@ -187,7 +205,7 @@ await pin('B4 a corrupted state.json falls back to the backup', async () => {
     await post({ type: 'position', from: 'm', t: 2, p: false, file: 'movie one.mkv' });
     await sleep(2500); // the second flush backs up the first snapshot
     s.proc.kill();
-    await new Promise((r) => s.proc.on('exit', r));
+    await waitExit(s.proc);
     const file = join(s.dir, 'state.json');
     writeFileSync(file, '{ broken');
     // a second boot must recover the room from the backup
@@ -199,13 +217,13 @@ await pin('B4 a corrupted state.json falls back to the backup', async () => {
     s2.stdout.on('data', (d) => (out += d));
     s2.stderr.on('data', (d) => (out += d));
     try {
-      await boot(s);
+      await boot({ proc: s2, dir: s.dir, out: () => out }); // the SECOND server: the first one is gone
       const health = await (await fetch(`${BASE}/health`)).json();
       assert.equal(health.now, 'movie one.mkv', `the backup did not restore the room: ${health.now}`);
       assert.ok(/backup/i.test(out), `the fallback was not logged loudly: ${out}`);
     } finally {
       s2.kill();
-      await new Promise((r) => s2.on('exit', r));
+      await waitExit(s2);
     }
   } finally { rmSync(s.dir, { recursive: true, force: true }); }
 });
@@ -220,9 +238,115 @@ await pin('C1 a failed exit-time write is logged', async () => {
     await post({ type: 'load', from: 'm', name: 'movie one.mkv' });
     rmSync(s.dir, { recursive: true, force: true }); // the dir vanishes under the server
     s.proc.kill();
-    await new Promise((r) => s.proc.on('exit', r));
+    await waitExit(s.proc);
     assert.ok(/exit-time state write failed/i.test(s.out()), `the failed exit write was silent:\n${s.out()}`);
   } finally { rmSync(s.dir, { recursive: true, force: true }); }
+});
+
+// --- F7-1: a stuck flush chain cannot hang the exit ---------------------
+
+// A hung fsync (a stalled disk, a hung network mount) keeps a libuv
+// threadpool thread busy forever: the exit write joins that chain and
+// the process used to ignore SIGTERM until the deploy timed out. The
+// exit now races a drain timeout, skips the write loudly and hard-kills.
+await pin('F7-1 a stuck flush chain cannot hang the exit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wp-f6-'));
+  // the flush writes ${STATE_FILE}.tmp — a FIFO with no reader blocks the
+  // write forever (the same shape as a hung fsync)
+  execFileSync('mkfifo', [join(dir, 'state.json.tmp')]);
+  const s = start({ EXIT_DRAIN_MS: '300' }, dir);
+  try {
+    await boot(s);
+    await post({ type: 'load', from: 'm', name: 'movie one.mkv' });
+    await sleep(2500); // the debounced flush fires and blocks on the FIFO
+    const t0 = Date.now();
+    const exited = new Promise((r) => s.proc.once('exit', r));
+    s.proc.kill('SIGTERM');
+    // a watchdog: a regression must FAIL, not hang the suite (the C1 spirit).
+    // The drain timeout is driven down to 300ms, so 5s is a 16x margin that
+    // survives a loaded (shared) box — the normal exit lands in ~0.3s.
+    const gone = await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]);
+    const took = Date.now() - t0;
+    assert.ok(gone, `the server did not exit within 5s (took ${took}ms) — the exit still hangs\n${s.out()}`);
+    assert.ok(/exit write skipped/i.test(s.out()), `the skipped exit write was silent:\n${s.out()}`);
+  } finally {
+    try { s.proc.kill('SIGKILL'); } catch {} // a failed pin must not leak the port
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F7-2: stopServer reaps a server that ignores SIGTERM ---------------
+
+// The wait for the exit must be BOUNDED: a stubborn server hung the
+// suite forever (8 of the suites have no watchdog of their own).
+await pin('F7-2 stopServer reaps a server that ignores SIGTERM', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wp-f6-'));
+  const stub = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);"], { stdio: ['ignore', 'pipe', 'inherit'] });
+  try {
+    await new Promise((r) => stub.stdout.once('data', r)); // the handler is armed
+    const t0 = Date.now();
+    await stopServer(stub, dir);
+    const took = Date.now() - t0;
+    assert.ok(took < 9000, `stopServer waited ${took}ms — a stubborn server hangs the suite`);
+    assert.equal(stub.signalCode, 'SIGKILL', `the stubborn server was not SIGKILLed: ${stub.signalCode}`);
+    assert.ok(!existsSync(dir), 'the temp dir survived the stop');
+  } finally {
+    try { stub.kill('SIGKILL'); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F7-3: a failed flush is retried when the disk recovers -------------
+
+// The failure used to latch persistence off for the process lifetime:
+// the room state was lost until the next restart.
+await pin('F7-3 a failed flush is retried when the disk recovers', async () => {
+  const s = start();
+  const file = join(s.dir, 'state.json');
+  try {
+    await boot(s);
+    chmodSync(s.dir, 0o500); // the state dir is read-only: the flush fails
+    await post({ type: 'load', from: 'm', name: 'movie one.mkv' });
+    await sleep(3000);
+    assert.ok(!existsSync(file), 'the read-only dir somehow took the write');
+    assert.ok(/state persistence failed/i.test(s.out()), `the failed persist was silent:\n${s.out()}`);
+    chmodSync(s.dir, 0o700); // the disk recovers
+    await waitUntil(() => existsSync(file), 20000, 'the retried flush wrote the state');
+    const saved = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(saved.now, 'movie one.mkv', `the retried flush wrote the wrong state: ${saved.now}`);
+  } finally {
+    chmodSync(s.dir, 0o700);
+    await stop(s); // the port must be free for the next pin
+  }
+});
+
+// --- F7-4: every cmd type normalizes the nick ---------------------------
+
+// The position event was the odd one out: a client-supplied nick was
+// relayed verbatim (ANSI escapes included).
+await pin('F7-4 every cmd type normalizes the nick', async () => {
+  const s = start();
+  try {
+    await boot(s);
+    // an observer: a poster never receives its own event
+    const obs = net.connect(PORT, '127.0.0.1');
+    await new Promise((r) => obs.on('connect', r));
+    obs.write('GET /events?id=obs7&nick=obs7 HTTP/1.1\r\nHost: x\r\n\r\n');
+    let buf = '';
+    obs.on('data', (d) => { buf += d.toString(); });
+    obs.on('error', () => {});
+    await sleep(300);
+    await post({ type: 'position', from: 'm', t: 1, p: false, file: 'movie one.mkv', nick: 'evil\u001b[2Jn' });
+    await waitUntil(() => buf.includes('"position"'), 5000, 'the position event was relayed');
+    const line = buf.split('\n').find((l) => l.includes('"position"'));
+    // the PARSED nick must be clean: the wire carries the ESC as the six
+    // chars "\u001b", so a raw-byte check would pass even unfixed
+    const ev = JSON.parse(line.slice(line.indexOf('data: ') + 6));
+    assert.ok(typeof ev.nick === 'string', `the position event lost its nick: ${JSON.stringify(ev)}`);
+    assert.ok(!ev.nick.includes('\u001b'), `the ANSI escape survived the relay: ${JSON.stringify(ev.nick)}`);
+    assert.ok(ev.nick.includes('evil'), `the nick was dropped instead of cleaned: ${JSON.stringify(ev.nick)}`);
+    obs.destroy();
+  } finally { await stop(s); }
 });
 
 if (failures.length) {

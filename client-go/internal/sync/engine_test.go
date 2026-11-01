@@ -146,7 +146,10 @@ func (f *fakePost) all(t *testing.T) []room.Event {
 		out := append([]room.Event(nil), f.events...)
 		at := f.at
 		f.mu.Unlock()
-		if time.Since(start) > 20*time.Millisecond && time.Since(at) > 20*time.Millisecond {
+		// 100ms, not 20ms: a loaded 2-core CI runner deschedules the post
+		// worker mid-burst, and a truncated list flaked the windows job;
+		// the 2s deadline still bounds pathological runs (F7)
+		if time.Since(start) > 100*time.Millisecond && time.Since(at) > 100*time.Millisecond {
 			return out
 		}
 		if time.Now().After(deadline) {

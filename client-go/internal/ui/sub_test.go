@@ -163,6 +163,47 @@ func TestSubProbeAnswerRendersAndRefuses(t *testing.T) {
 	}
 }
 
+// The in-flight guard (F7): a second /sub for the SAME video+name while
+// the probe is still answering is refused — mpv's sub-add is not
+// idempotent, so attaching twice creates a duplicate track; a DIFFERENT
+// request stays allowed, and the answer clears the key. The test model
+// has no concrete player, so the guard state is seeded the way
+// requestSub itself sets it.
+func TestSubInFlightGuard(t *testing.T) {
+	m, _, _, _ := subModel(t)
+	m.now = "movie.mkv"
+	key := subKey{video: "movie.mkv", name: "movie.tr.srt"}
+	m.subInFlight = map[subKey]bool{key: true}
+
+	m, c := m.requestSub("movie.tr.srt") // same key, still answering
+	if c != nil {
+		t.Fatal("a duplicate /sub must be refused while the probe runs")
+	}
+	logs := logTexts(m.log)
+	if !strings.Contains(logs[len(logs)-1], "already being looked up") {
+		t.Fatalf("the refusal is not honest: %q", logs[len(logs)-1])
+	}
+
+	m2, _ := m.requestSub("movie.es.srt") // a DIFFERENT request must pass the guard
+	last := logTexts(m2.log)
+	if strings.Contains(last[len(last)-1], "already being looked up") {
+		t.Fatal("the guard must be keyed: a different /sub stays allowed")
+	}
+	// ...and it must have reached the PLAYER check: the ui model's player
+	// is a real *mpv.Player (the windows CI job has no mpv), so the
+	// request stops there. That stop IS the proof that the guard let it
+	// through — the guard's message would have fired first.
+	if !strings.Contains(last[len(last)-1], "no file playing") {
+		t.Fatalf("the different /sub did not get past the guard: %q", last[len(last)-1])
+	}
+
+	// the probe answer clears the key — the stale-cancel path included
+	m = upd(t, m, subMsg{key: key, video: "old.mkv", name: "movie.tr.srt"})
+	if m.subInFlight[key] {
+		t.Fatal("the probe answer must clear the in-flight key")
+	}
+}
+
 func TestDriftChipAtBandBoundaries(t *testing.T) {
 	orig := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)

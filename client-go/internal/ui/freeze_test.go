@@ -35,9 +35,10 @@ func TestCtrlSpaceWithAFullLogChannelReturns(t *testing.T) {
 	m := New("ada", nil, nil, true, e)
 	start := time.Now()
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlAt}) // ctrl+space
-	// 2s, not 1s: a loaded CI runner can pause mid-assert; the pin
-	// guards the forever-deadlock, not microsecond latency
-	if el := time.Since(start); el > 2*time.Second {
+	// 3s, not 2s: a loaded CI runner can pause mid-assert (the v1.6.1
+	// widening already moved 1s→2s); the pin guards the forever-deadlock
+	// and the 5s wedged-player class, both far above 3s (F7 widening)
+	if el := time.Since(start); el > 3*time.Second {
 		t.Fatalf("the UI froze for %s with a full log channel", el)
 	}
 	if len(pl.pauses) != 1 {

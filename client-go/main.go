@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -162,7 +163,9 @@ func main() {
 			// next signal wins.
 			<-sigc
 		}
-		_ = engine.Drain(drainBudget) // the last action must reach the room
+		// F7: the signal path is an exit path too — the verdict goes to
+		// stderr like the other two (the TUI frame dies with the process)
+		reportPostLost(os.Stderr, engine.Drain(drainBudget)) // the last action must reach the room
 		player.Close()
 		os.Exit(1)
 	}()
@@ -282,7 +285,7 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		gate.beginClean() // this path owns the exit from here
-		_ = engine.Drain(drainBudget)
+		reportPostLost(os.Stderr, engine.Drain(drainBudget))
 		cancel()
 		player.Close()
 		if friendFlow {
@@ -290,10 +293,10 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	gate.beginClean()             // from here on the clean path owns the exit
-	_ = engine.Drain(drainBudget) // the last action must reach the room
-	cancel()                      // risk H: cancel ctx first, ...
-	player.Close()                // ...then reap mpv (TERM -> 2s -> Kill, risk C)
+	gate.beginClean()                                    // from here on the clean path owns the exit
+	reportPostLost(os.Stderr, engine.Drain(drainBudget)) // the last action must reach the room
+	cancel()                                             // risk H: cancel ctx first, ...
+	player.Close()                                       // ...then reap mpv (TERM -> 2s -> Kill, risk C)
 	if note := mpvExitNotice(friendFlow, mpvExited.Load()); note != "" {
 		// the console closes with the process: the reason must be read
 		fmt.Fprintln(os.Stderr, note)
@@ -301,6 +304,17 @@ func main() {
 	}
 	if mpvExited.Load() {
 		os.Exit(1) // python parity: mpv-exited clients exit nonzero
+	}
+}
+
+// reportPostLost is the quit-time verdict for the human: after the TUI
+// has ended, tea drops post-Run sends (measured 481ns — m2-01), so the
+// logPump's "post: N event(s) lost" line never reaches the TUI user. The
+// verdict goes to stderr, where the user still is, like the friend-flow
+// notice. w is os.Stderr in production, a buffer in the pin.
+func reportPostLost(w io.Writer, delivered bool) {
+	if !delivered {
+		fmt.Fprintln(w, "> post lost — the room did not answer")
 	}
 }
 

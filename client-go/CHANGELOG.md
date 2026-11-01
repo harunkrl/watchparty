@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.8.1 — the client does not swallow its own verdicts
+
+- client: the quit-time "post lost" verdict now reaches the human — after
+  the TUI has ended, tea drops post-Run sends (measured 481ns), so the
+  notice printed into the log pump never appeared; every exit path that
+  drains the post queue now prints "> post lost — the room did not
+  answer" to stderr, where the user still is (the log line stays for
+  diagnostics; headless prints it through its own logger)
+- client (ui): /sub while a probe for the SAME video+name is still
+  answering is refused with a local notice instead of creating a
+  duplicate subtitle track in mpv (sub-add is not idempotent — probed:
+  two adds, two tracks); a different video or name stays allowed, and
+  the answer clears the guard
+- client (tests): the wall-clock budgets that could flake on loaded
+  2-core CI runners got headroom — the post-queue settle window
+  20ms→100ms (a mid-burst deschedule truncated event lists), the
+  off-lock assert 500ms→2s, the freeze pty budget 2s→3s; each still
+  catches exactly what it pinned (the failure classes are 5s+ or
+  forever — the budgets stay far below them)
+- client (ui): /help's reference line lists ctrl+p (the file browser)
+  like the F1 sheet and the README already do
+- server: the exit no longer waits for a stuck state flush — a 2s
+  drain race skips the exit write (loudly) and hard-kills a server
+  whose fsync is hung (Node's libuv threadpool makes process.exit()
+  impossible mid-write), so a suite or a deploy can never hang on a
+  stuck disk; the normal exit path is unchanged
+- server: a failed state write no longer latches persistence off for
+  the process lifetime — it stays loud and retries every 5s,
+  recovering when the disk comes back
+- server: every room event's nick is normalized through the roster's
+  clean() (a client-supplied ANSI escape could ride a position event
+  to every TUI — position was the last uncleaned type)
+- server: the stale-client gate map gets an absolute cap (1024), the
+  same shape the impostor set already had
+- tests/CI: the suite helpers bound every server stop (5s → SIGKILL)
+  and log every rm retry; the suites now prove the server they reached
+  is theirs (alive + serving their fixture) and print the server's own
+  output on failure; the retry-log upload finally sits AFTER the gate
+  steps it exists for (in every job, including the linux go-test job
+  that had none), the changelog gate accepts a bare "## <tag>" heading,
+  the Windows bundle's mpv digest is vetted IN the repo (not re-vouched
+  by the same api response that hands out the url), and CI runs on
+  node 22 (20 went EOL 2026-04-30)
+
 ## v1.8.0 — subtitles you can actually align
 
 - client (ui): alt+↑/↓ nudge your subtitle timing ±0.5s and /subdelay
