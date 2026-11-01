@@ -30,12 +30,27 @@ func (p *recPlayer) SetPause(v bool) error      { p.pauses = append(p.pauses, v)
 func (p *recPlayer) Seek(t float64) error       { p.seeks = append(p.seeks, t); return nil }
 func (p *recPlayer) Speed(float64) error        { return nil }
 func (p *recPlayer) ShowText(string, int) error { return nil }
+func (p *recPlayer) ShowSubDelayHint() error    { p.hints++; return nil }
 func (p *recPlayer) SetVolume(delta float64) error {
 	p.vols = append(p.vols, delta)
 	return nil
 }
-func (p *recPlayer) ToggleMute() error                { p.mutes++; return nil }
-func (p *recPlayer) Pos() (float64, bool)             { return p.pos, p.hasPos }
+func (p *recPlayer) ToggleMute() error    { p.mutes++; return nil }
+func (p *recPlayer) Pos() (float64, bool) { return p.pos, p.hasPos }
+
+// waitTells waits for the engine's F8 tell worker to execute everything
+// queued so far: the UI never waits on the pipe (the F8 law), so the
+// tests asserting on the recPlayer call log are the ones that wait.
+func waitTells(t *testing.T, e *sync.Engine) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !e.TellsIdle() {
+		if time.Now().After(deadline) {
+			t.Fatalf("tells never drained")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 func (p *recPlayer) StartLoad(string) (string, error) { return "", nil }
 func (p *recPlayer) WaitLive(string, time.Time) bool  { return true }
 func (p *recPlayer) AttachSubs(string)                {}
@@ -52,6 +67,7 @@ func TestNulRuneTogglesPause(t *testing.T) {
 	}
 	m := New("ada", nil, nil, true, e)
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0}})
+	waitTells(t, e)
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("ctrl+space (NUL) did not toggle the room: pauses=%v", pl.pauses)
 	}
@@ -77,6 +93,7 @@ func TestBarClickSeeksTheLocalPlayer(t *testing.T) {
 	m.st = &sync.UiState{Pos: &pos}
 	// the stacked layout draws the bar on row 3, from column 3 to 3+cw
 	m.barClick(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 41, Y: 3})
+	waitTells(t, e)
 	if len(pl.seeks) != 1 {
 		t.Fatalf("the click did not seek the local player: %v", pl.seeks)
 	}
@@ -109,6 +126,7 @@ func TestDashBarClickMapsToTheClickedCell(t *testing.T) {
 	barW := m.width - 4 - lipgloss.Width(elapsed) - lipgloss.Width(total) - 4
 	x := left + barW/2
 	m.dashBarClick(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: x, Y: 5})
+	waitTells(t, e)
 	if len(pl.seeks) != 1 {
 		t.Fatalf("the click did not seek the local player: %v", pl.seeks)
 	}

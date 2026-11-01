@@ -20,6 +20,10 @@ jobs:
   # linux test run for every cross-compile target (5x)
   test:
     runs-on: ubuntu-latest
+    # F8 item 6: this job had NO timeout (the siblings do: windows 15,
+    # node 15, the release gate's test 20) — a hung step burned the
+    # 360-minute default. Same scale as the release gate's test job.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: client-go
@@ -85,6 +89,9 @@ jobs:
   build:
     needs: [test, test-windows]
     runs-on: ubuntu-latest
+    # F8 item 6: the build job had no timeout either (the release gate's
+    # build job uses 10) — same scale.
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: client-go
@@ -156,6 +163,10 @@ jobs:
           tests/ci_retry.sh node tests/stall_family.mjs
           tests/ci_retry.sh node tests/master_restart.mjs
           tests/ci_retry.sh node tests/soak.mjs
+          # F8: the ONE non-headless client suite — the TUI's render path
+          # (the "▶ playing" chip) had zero coverage; this one drives the
+          # real binary under a pty and reads the painted frame.
+          tests/ci_retry.sh node tests/status_render.mjs
 
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes.

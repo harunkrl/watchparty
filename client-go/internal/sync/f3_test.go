@@ -68,13 +68,14 @@ func TestRoomMovedOnNoticeDoesNotReload(t *testing.T) {
 	e, pl, _ := newEngine(true)
 	e.loaded = "movie.mkv"
 	e.OnRoom(room.Event{Type: "notice", Text: "the room moved on"})
-	if len(pl.loads) != 0 {
-		t.Fatalf("the notice reloaded the player: %v", pl.loads)
+	if len(pl.loadsSnapshot()) != 0 {
+		t.Fatalf("the notice reloaded the player: %v", pl.loadsSnapshot())
 	}
 	if e.loaded != "movie.mkv" {
 		t.Fatalf("the notice changed our file: %q", e.loaded)
 	}
-	if len(pl.showText) != 1 || pl.showText[0] != "the room moved on" {
-		t.Fatalf("the notice was not shown: %v", pl.showText)
+	waitTells(t, e)
+	if len(pl.showTextSnapshot()) != 1 || pl.showTextSnapshot()[0] != "the room moved on" {
+		t.Fatalf("the notice was not shown: %v", pl.showTextSnapshot())
 	}
 }

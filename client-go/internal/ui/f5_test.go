@@ -42,12 +42,19 @@ func TestF5SeekCadenceAndAliases(t *testing.T) {
 	m, pl := f5Model(t)
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlShiftRight}) // +30
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlShiftLeft})  // 10-30 -> clamp 0
-	if len(pl.seeks) != 2 || pl.seeks[0] != 40 || pl.seeks[1] != 0 {
-		t.Fatalf("ctrl+shift+arrows seek: %v, want [40 0]", pl.seeks)
+	waitTells(t, m.engine)
+	// F8 tell law: a backlog collapses seeks to the LATEST target (0), a
+	// fast writer executes both ([40 0]) — schedule-dependent, so the pin
+	// asserts the FINAL target: the clamp to 0 is the last word.
+	if n := len(pl.seeks); n == 0 || pl.seeks[n-1] != 0 {
+		t.Fatalf("ctrl+shift+arrows seek: %v, want the clamped 0 last", pl.seeks)
 	}
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyLeft, Alt: true}) // -5 (conhost-proof alias)
-	if len(pl.seeks) != 3 || pl.seeks[2] != 5 {
-		t.Fatalf("alt+left seek: %v, want [... 5]", pl.seeks)
+	waitTells(t, m.engine)
+	// the -5 must be the LAST seek; the first two may or may not coalesce
+	// depending on how fast the (healthy) writer drained between keys
+	if n := len(pl.seeks); n == 0 || pl.seeks[n-1] != 5 {
+		t.Fatalf("alt+left seek: %v, want the -5 target last", pl.seeks)
 	}
 	if v := m.input.Value(); v != "" {
 		t.Fatalf("an alias leaked into the chat input: %q", v)
@@ -57,6 +64,7 @@ func TestF5SeekCadenceAndAliases(t *testing.T) {
 func TestF5PauseAlias(t *testing.T) {
 	m, pl := f5Model(t)
 	m = upd(t, m, runeKey('p', true)) // alt+p
+	waitTells(t, m.engine)
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("alt+p did not toggle the room: %v", pl.pauses)
 	}
@@ -70,6 +78,7 @@ func TestF5LocalVolumeKeys(t *testing.T) {
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlUp})   // +5
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlDown}) // -5
 	m = upd(t, m, runeKey('m', true))                // alt+m mute
+	waitTells(t, m.engine)
 	if len(pl.vols) != 2 || pl.vols[0] != 5 || pl.vols[1] != -5 {
 		t.Fatalf("volume keys: %v, want [5 -5]", pl.vols)
 	}
@@ -121,10 +130,12 @@ func TestF1OverlayPassivityWire(t *testing.T) {
 		t.Fatal("F1 did not open the overlay")
 	}
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0}}) // ctrl+space (NUL)
+	waitTells(t, m.engine)
 	if len(pl.pauses) != 1 || !pl.pauses[0] {
 		t.Fatalf("ctrl+space is dead while the overlay is up: %v", pl.pauses)
 	}
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlShiftRight}) // +30 over pos 10
+	waitTells(t, m.engine)
 	if len(pl.seeks) != 1 || pl.seeks[0] != 40 {
 		t.Fatalf("the seek cadence is dead while the overlay is up: %v", pl.seeks)
 	}

@@ -79,11 +79,12 @@ func TestAudit3HelloPosIsClampedToTheLocalDuration(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(1), Dur: 600}) // the local player knows the duration
 	pos := 3610.0
 	e.OnRoom(room.Event{Type: "hello", Pos: &pos})
-	if len(pl.seeks) != 1 {
-		t.Fatalf("the clamped position was not applied: %v", pl.seeks)
+	waitTells(t, e) // F8: the seek rides the tell worker now
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("the clamped position was not applied: %v", pl.seeksSnapshot())
 	}
-	if pl.seeks[0] > 599 {
-		t.Fatalf("applied position %v is past the end of the file (dur 600)", pl.seeks[0])
+	if pl.seeksSnapshot()[0] > 599 {
+		t.Fatalf("applied position %v is past the end of the file (dur 600)", pl.seeksSnapshot()[0])
 	}
 }
 
@@ -95,16 +96,17 @@ func TestAudit3HelloPosWaitsForTheUnknownDuration(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	pos := 3610.0
 	e.OnRoom(room.Event{Type: "hello", Pos: &pos})
-	if len(pl.seeks) != 0 {
-		t.Fatalf("seeked with an unknown duration: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("seeked with an unknown duration: %v", pl.seeksSnapshot())
 	}
 	// the first sample that knows the duration applies it, clamped
 	e.OnMpvp(mpv.State{Pos: ptr(1), Dur: 600})
-	if len(pl.seeks) == 0 {
-		t.Fatalf("the held-back position was never applied: %v", pl.seeks)
+	waitTells(t, e) // F8: the seek rides the tell worker now
+	if len(pl.seeksSnapshot()) == 0 {
+		t.Fatalf("the held-back position was never applied: %v", pl.seeksSnapshot())
 	}
-	if pl.seeks[0] > 599 {
-		t.Fatalf("applied position %v is past the end of the file (dur 600)", pl.seeks[0])
+	if pl.seeksSnapshot()[0] > 599 {
+		t.Fatalf("applied position %v is past the end of the file (dur 600)", pl.seeksSnapshot()[0])
 	}
 }
 
@@ -114,16 +116,16 @@ func TestAudit3HelloPosWaitsForTheUnknownDuration(t *testing.T) {
 // the relay carries -5 and is dropped).
 func TestAudit3SeekTargetIsNeverNegative(t *testing.T) {
 	e, pl, po := newEngine(false)
-	pl.pos = ptr(0)
+	pl.setPos(0)
 	e.SeekBy(-5) // ctrl+left at the very head
 	for _, ev := range po.all(t) {
 		if ev.T < 0 {
 			t.Fatalf("a negative seek target was posted: %+v", ev)
 		}
 	}
-	for _, s := range pl.seeks {
+	for _, s := range pl.seeksSnapshot() {
 		if s < 0 {
-			t.Fatalf("a negative seek was applied locally: %v", pl.seeks)
+			t.Fatalf("a negative seek was applied locally: %v", pl.seeksSnapshot())
 		}
 	}
 }

@@ -120,9 +120,11 @@ type Player interface {
 	ToggleMute() error
 	// v1.8.0: LOCAL subtitle timing — same personal law as volume. The
 	// nudge is mpv's relative add (read-add-set inside mpv), the set pins
-	// the absolute value; both are tell-only.
+	// the absolute value; both are tell-only. The hint is the template mpv
+	// expands itself (F8: it rides the tell worker like every other write).
 	AddSubDelay(delta float64) error
 	SetSubDelay(v float64) error
+	ShowSubDelayHint() error
 }
 
 // UiState feeds the M4 status bar (drift etc); non-blocking send, dropped
@@ -154,6 +156,9 @@ type Engine struct {
 
 	postOnce sync.Once  // the post worker starts with the first event
 	posts    *postQueue // the events waiting for the network (ISSUE-6)
+
+	tellOnce sync.Once  // the tell worker starts with the first tell (F8)
+	tells    *tellQueue // the mpv writes waiting for the player (F8)
 
 	lastPos   *float64
 	lastPause bool
@@ -379,13 +384,264 @@ func (e *Engine) Drain(timeout time.Duration) bool {
 	}
 }
 
+// tellKind splits the mpv tells into the two F8 classes:
+//   - room-synced (pause/seek/speed): coalesce to the LATEST, never drop
+//     (a lost pause is a lost room state — the postQueue F6-A3 precedent)
+//   - personal (volume/mute/subdelay/OSD): local-only surfaces, bounded
+//     drop-oldest with a rate-limited log line; never posted to the room
+type tellKind uint8
+
+const (
+	tellPause tellKind = iota
+	tellSeek
+	tellSpeed
+	tellVolume
+	tellMute
+	tellSubDelay
+	tellOSDText
+	tellOSDHint
+)
+
+func (k tellKind) String() string {
+	switch k {
+	case tellPause:
+		return "pause"
+	case tellSeek:
+		return "seek"
+	case tellSpeed:
+		return "speed"
+	case tellVolume:
+		return "volume"
+	case tellMute:
+		return "mute"
+	case tellSubDelay:
+		return "subdelay"
+	case tellOSDText:
+		return "osd"
+	case tellOSDHint:
+		return "osd-hint"
+	}
+	return "tell"
+}
+
+type tell struct {
+	kind tellKind
+	b    bool    // pause state
+	f    float64 // seek target / speed / volume delta / subdelay value
+	ms   int     // OSD show duration
+	s    string  // OSD text
+	add  bool    // subdelay: relative add (true) vs absolute set (false)
+}
+
+// tellQueue is the mpv side of the F8 contract: ONE writer goroutine owns
+// every pipe write, so no interactive path (hotkey in the UI thread, room
+// event in the dispatcher, self-heal in the poll tick) ever holds e.mu
+// across a write (ISSUE-6 residual closed; measured: alt+up froze the TUI
+// 4.02s on a wedged player — A8 worker2-raw B1.1).
+const (
+	tellPersonalCap = 8 // four keypresses × (action tell + OSD hint): a tighter
+	// cap drops tells on the HEALTHY fast path (3 keys = 6 tells beat the
+	// writer; vol+5 was dropped — F8 probe). A wedged writer still
+	// overflows and drops oldest, logged.
+	tellDropLogEvery = time.Second // the drop log rate limit (a held key must not spam)
+)
+
+type tellQueue struct {
+	mu      sync.Mutex
+	items   []tell
+	sig     chan struct{}
+	busy    bool      // a tell is executing (the writer owns the pipe for it)
+	lastLog time.Time // last drop-log emission (rate limit)
+}
+
+func newTellQueue() *tellQueue { return &tellQueue{sig: make(chan struct{}, 1)} }
+
+// push enqueues one tell. Returns true when a drop should be logged now
+// (rate-limited inside: the caller's logf stays off the hot path).
+func (q *tellQueue) push(t tell) bool {
+	logDrop := false
+	q.mu.Lock()
+	switch t.kind {
+	case tellPause, tellSeek, tellSpeed:
+		// coalesce-to-latest, landed at the tail: the newest of the kind
+		// wins, the other kinds keep their relative order (F6-A3 precedent)
+		keep := q.items[:0]
+		for _, it := range q.items {
+			if it.kind != t.kind {
+				keep = append(keep, it)
+			}
+		}
+		q.items = append(keep, t)
+	default:
+		q.items = append(q.items, t)
+		dropped := false
+		for q.personalLocked() > tellPersonalCap {
+			q.dropOldestPersonalLocked()
+			dropped = true
+		}
+		if dropped && time.Since(q.lastLog) >= tellDropLogEvery {
+			q.lastLog = time.Now()
+			logDrop = true
+		}
+	}
+	// no absolute-cap loop: the synced kinds coalesce to <=3 items and the
+	// personal kinds cap at tellPersonalCap, so the queue can never hold
+	// more than 11 items (3 synced + 8 personal) — a pause/seek can NEVER
+	// be dropped from the head.
+	q.mu.Unlock()
+	select {
+	case q.sig <- struct{}{}:
+	default:
+	}
+	return logDrop
+}
+
+func (q *tellQueue) personalLocked() int {
+	n := 0
+	for _, it := range q.items {
+		if it.kind >= tellVolume {
+			n++
+		}
+	}
+	return n
+}
+
+func (q *tellQueue) dropOldestPersonalLocked() {
+	for i, it := range q.items {
+		if it.kind >= tellVolume {
+			q.items = append(q.items[:i], q.items[i+1:]...)
+			return
+		}
+	}
+}
+
+// pop takes the next tell, waiting for one to arrive. The busy flag is
+// set for the execution window so idle() is a true drain signal.
+func (q *tellQueue) pop() tell {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			t := q.items[0]
+			q.items = q.items[1:]
+			q.busy = true
+			q.mu.Unlock()
+			return t
+		}
+		q.mu.Unlock()
+		<-q.sig
+	}
+}
+
+// done marks the in-flight tell as finished.
+func (q *tellQueue) done() {
+	q.mu.Lock()
+	q.busy = false
+	q.mu.Unlock()
+}
+
+// idle reports that nothing is queued or executing. A test/exit sync
+// point — the interactive paths NEVER wait here (the F8 contract).
+func (q *tellQueue) idle() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items) == 0 && !q.busy
+}
+
+// tell queues one mpv write for the single tell worker. NO caller waits
+// on the pipe here: the hotkey paths run in the UI thread, the room
+// dispatcher fans SSE out, the poll tick self-heals — none of them may
+// hold e.mu across a write (the F8 law). Safe from any goroutine.
+func (e *Engine) tell(t tell) {
+	e.tellOnce.Do(func() {
+		e.tells = newTellQueue()
+		go e.tellLoop()
+	})
+	if e.tells.push(t) {
+		e.logf("mpv: %s tell dropped — the player stopped reading (personal, next keypress wins)", t.kind)
+	}
+}
+
+// tellLoop is the single writer: it owns the pipe outside the engine lock
+// and the UI thread. A wedged write costs the worker its 2s deadline
+// (player.go writeLocked), never a keypress or the room.
+func (e *Engine) tellLoop() {
+	for {
+		e.execTell(e.tells.pop())
+		e.tells.done()
+	}
+}
+
+// TellsIdle reports that the tell worker has executed everything queued
+// so far. Test/exit sync point ONLY — a hotkey, a room event, or the poll
+// tick must never wait on the writer (the F8 law); the UI thread in
+// particular never touches this.
+func (e *Engine) TellsIdle() bool {
+	if e.tells == nil {
+		return true
+	}
+	return e.tells.idle()
+}
+
+func (e *Engine) execTell(t tell) {
+	var err error
+	switch t.kind {
+	case tellPause:
+		err = e.Player.SetPause(t.b)
+	case tellSeek:
+		err = e.Player.Seek(t.f)
+	case tellSpeed:
+		err = e.Player.Speed(t.f)
+	case tellVolume:
+		err = e.Player.SetVolume(t.f)
+	case tellMute:
+		err = e.Player.ToggleMute()
+	case tellSubDelay:
+		if t.add {
+			err = e.Player.AddSubDelay(t.f)
+		} else {
+			err = e.Player.SetSubDelay(t.f)
+		}
+	case tellOSDText:
+		err = e.Player.ShowText(t.s, t.ms)
+	case tellOSDHint:
+		err = e.Player.ShowSubDelayHint()
+	}
+	if err != nil {
+		e.logf("mpv: %s (%s tell)", err, t.kind)
+	}
+}
+
+// OSDShow queues the movie-window hint (the movie window is often hidden
+// behind the TUI): the UI thread called this directly and a wedged mpv
+// froze Update for the write deadline. Personal class: never posted.
+func (e *Engine) OSDShow(text string, ms int) {
+	if e.Player == nil {
+		return
+	}
+	e.tell(tell{kind: tellOSDText, s: text, ms: ms})
+}
+
+// OSDSubDelayHint queues the expand-properties hint (v1.8.0): the template
+// is mpv's to expand, the value never enters the client. Personal class.
+func (e *Engine) OSDSubDelayHint() {
+	if e.Player == nil {
+		return
+	}
+	e.tell(tell{kind: tellOSDHint})
+}
+
 // setPause/seekTo mark lastActuate so the mpv events they trigger are
-// recognized as our own echoes and never re-posted.
+// recognized as our own echoes and never re-posted. F8: the tells ride
+// the tell worker — no caller (hotkey, room event, follower self-heal)
+// holds e.mu across the pipe write anymore. The echo gates are stamped
+// at ENQUEUE time; a late echo (queue delay past actuateQuiet) is still
+// deduped by the mirrors — snap.paused/lastPause/postedPause — so it
+// never double-posts (OnMpvEvent's own gates).
 func (e *Engine) setPause(paused bool) {
 	e.lastActuate = e.Clock.Now()
 	p := paused
 	e.actuatePause = &p
-	_ = e.Player.SetPause(paused)
+	e.tell(tell{kind: tellPause, b: paused})
 }
 
 func (e *Engine) seekTo(t float64) {
@@ -396,7 +652,7 @@ func (e *Engine) seekTo(t float64) {
 	e.actuatePause = nil // seek echo arrives as a "seek" mpv event
 	e.lastSeekAt = e.lastActuate
 	e.seekEcho = true // swallow exactly one echo (see OnMpvEvent)
-	_ = e.Player.Seek(t)
+	e.tell(tell{kind: tellSeek, f: t})
 }
 
 // setSpeed applies a tempo nudge once per distinct value; repeated ticks
@@ -416,25 +672,22 @@ func (e *Engine) setSpeedLocked(f float64) {
 	}
 	e.speedSet = true
 	e.lastSpeed = f
-	_ = e.Player.Speed(f)
+	e.tell(tell{kind: tellSpeed, f: f})
 }
 
 // OnRoom feeds one SSE event through the engine (client.py on_event parity;
 // position is stored, discrete events are applied to the player).
 func (e *Engine) OnRoom(ev room.Event) {
 	e.mu.Lock()
-	deferred := e.onRoomLocked(ev)
+	e.onRoomLocked(ev)
 	e.mu.Unlock()
-	// F6-A1 condition 4: the OSD tells run AFTER the unlock — a wedged mpv
-	// must not hold the engine lock (or the UI thread) for a chat bubble.
-	for _, f := range deferred {
-		f()
-	}
 }
 
-// onRoomLocked is OnRoom under e.mu; player calls that may block are
-// returned as deferred closures and run after the unlock.
-func (e *Engine) onRoomLocked(ev room.Event) (deferred []func()) {
+// onRoomLocked is OnRoom under e.mu. F8: every player call here is a
+// tell enqueue (non-blocking) — the OSD tells used to be deferred to
+// after the unlock because ShowText blocked (F6-A1 condition 4); now
+// nothing under the lock touches the pipe at all.
+func (e *Engine) onRoomLocked(ev room.Event) {
 	switch ev.Type {
 	case "position":
 		now := e.Clock.Now()
@@ -478,7 +731,14 @@ func (e *Engine) onRoomLocked(ev room.Event) (deferred []func()) {
 			// past the end of the film (EOF). Wait for the first sample
 			// that knows the duration.
 			if e.dur > 0 {
-				e.applySnapshot(*ev.Pos, ev.P)
+				// F8: the local position rides the last poll sample (polledPos,
+				// ≤2s old here — the hello lands on the dispatcher, not the poll
+				// tick). On a blip where mpv drifted 1-2s since that sample this
+				// can issue a ≤2s corrective seek where a fresh Pos() would have
+				// skipped — convergent, and the file identity (no reload) is
+				// unaffected. The pre-F8 wiring paid two Pos() round trips under
+				// e.mu instead (~10s wedged on join/reconnect, A8 master-2).
+				e.applySnapshot(*ev.Pos, ev.P, e.polledPos)
 			} else {
 				p := *ev.Pos
 				e.pendingPos, e.pendingPause = &p, ev.P
@@ -524,10 +784,10 @@ func (e *Engine) onRoomLocked(ev room.Event) (deferred []func()) {
 		e.seekTo(ev.T)
 		e.lastPos = nil // the applied seek moved us: the scrub baseline is stale
 	case "chat":
-		// chat OSD over the video (client.py parity: 3s show-text) — F6-A1:
-		// the tell runs after the unlock (condition 4)
+		// chat OSD over the video (client.py parity: 3s show-text) — F8: a
+		// tell enqueue, nothing blocks (the pipe write belongs to the worker)
 		osd := fmt.Sprintf("%s: %s", ev.Nick, ev.Text)
-		deferred = append(deferred, func() { _ = e.Player.ShowText(osd, 3000) })
+		e.tell(tell{kind: tellOSDText, s: osd, ms: 3000})
 	case "notice":
 		// room-level warning (server election, R7). If it names US, a second
 		// --master is running: demote to follower instead of dueling — the
@@ -536,12 +796,11 @@ func (e *Engine) onRoomLocked(ev room.Event) (deferred []func()) {
 			e.Master = false
 			e.logf("> demoted to follower: another master owns the clock")
 		}
-		// OSD so both users see it even with the TUI window hidden —
-		// F6-A1: after the unlock (condition 4)
+		// OSD so both users see it even with the TUI window hidden — F8: a
+		// tell enqueue, nothing blocks
 		osd := ev.Text
-		deferred = append(deferred, func() { _ = e.Player.ShowText(osd, 4000) })
+		e.tell(tell{kind: tellOSDText, s: osd, ms: 4000})
 	}
-	return deferred
 }
 
 // startLoad is the lock-held half of a file change (F6-A1): the
@@ -614,7 +873,11 @@ func (e *Engine) OwnLoad(name string) {
 // applySnapshot anchors the room's live position, clamped to the file we
 // actually have: the room's position can be past the end of our file
 // (a stale room snapshot), and seeking there would EOF the player.
-func (e *Engine) applySnapshot(pos float64, paused bool) {
+// localPos is the freshest LOCAL position the caller already holds — the
+// poll sample at the pendingPos flush, the last sample on the hello path.
+// F8: the pre-F8 wiring read Pos() twice UNDER e.mu here (~10s of wedged
+// IPC on join/reconnect, A8 master-2); nil means unknown → always seek.
+func (e *Engine) applySnapshot(pos float64, paused bool, localPos *float64) {
 	if e.dur > 0 && pos > e.dur-1 {
 		pos = e.dur - 1
 	}
@@ -627,15 +890,16 @@ func (e *Engine) applySnapshot(pos float64, paused bool) {
 	// deadline must not be moved by a hello — a reconnect storm would
 	// keep it alive forever and the room could never pause (master-2
 	// P2-1). The unresolved jump is the per-file cap: no new episode
-	// until the follower converges.
-	if t, ok := e.Player.Pos(); ok && pos-t > resumeJump && !e.resumed && !e.resumeSeen {
+	// until the follower converges. Unknown local position: no seed.
+	if localPos != nil && pos-*localPos > resumeJump && !e.resumed && !e.resumeSeen {
 		e.resumed = true
 		e.resumeSeen = true
 		e.resumeTil = now.Add(resumeBound)
 	}
 	// skip the seek when already there: on an SSE blip this is a
-	// sub-second rewind that would flash the same frame (F3)
-	if t, ok := e.Player.Pos(); !ok || abs(t-pos) > Tolerance {
+	// sub-second rewind that would flash the same frame (F3). Unknown
+	// local position: seek (the old !ok branch did the same).
+	if localPos == nil || abs(*localPos-pos) > Tolerance {
 		e.seekTo(pos)
 	}
 }
@@ -727,10 +991,10 @@ func (e *Engine) volumeNudge(delta float64) {
 	if e.Player == nil {
 		return
 	}
-	if err := e.Player.SetVolume(delta); err != nil {
-		e.logf("> vol: mpv refused (%v)", err)
-		return
-	}
+	// F8: the write rides the tell worker — the log names the EXPECTED
+	// value (the next poll names the real one; a worker-side error is
+	// logged there as "mpv: ... (volume tell)").
+	e.tell(tell{kind: tellVolume, f: delta})
 	e.logf("> vol %+.0f", delta)
 }
 
@@ -742,10 +1006,7 @@ func (e *Engine) VolumeMute() {
 	if e.Player == nil {
 		return
 	}
-	if err := e.Player.ToggleMute(); err != nil {
-		e.logf("> mute: mpv refused (%v)", err)
-		return
-	}
+	e.tell(tell{kind: tellMute})
 	e.muted = !e.muted
 	if e.muted {
 		e.logf("> muted")
@@ -756,20 +1017,20 @@ func (e *Engine) VolumeMute() {
 
 // SubDelayBy/SubDelaySet are LOCAL subtitle-timing keys (v1.8.0): timing
 // is personal, the room is never told — the F5 volume law again. Lock
-// discipline: both take e.mu and fire a tell-only player call, exactly the
-// volumeNudge pattern — no engine field holds the value (mpv owns it; the
-// nudge is mpv's relative add), so there is no cross-goroutine state to
-// race and no round trip to hold the lock on a wedged mpv.
+// discipline (F8): both take e.mu for the bookkeeping and ENQUEUE the
+// tell — the single writer owns the pipe, so neither the UI thread nor
+// e.mu ever waits on a wedged mpv (the old "tell-only, no round trip"
+// comment was half-true: a tell still WRITES, and the write had the 2s
+// deadline — measured alt+up 4.02s frozen, A8 worker2-raw B1.1). No
+// engine field holds the value (mpv owns it; the nudge is mpv's relative
+// add), so there is no cross-goroutine state to race.
 func (e *Engine) SubDelayBy(delta float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.Player == nil {
 		return
 	}
-	if err := e.Player.AddSubDelay(delta); err != nil {
-		e.logf("> subdelay: mpv refused (%v)", err)
-		return
-	}
+	e.tell(tell{kind: tellSubDelay, f: delta, add: true})
 	e.logf("> subdelay %+.1f", delta)
 }
 
@@ -779,10 +1040,7 @@ func (e *Engine) SubDelaySet(v float64) {
 	if e.Player == nil {
 		return
 	}
-	if err := e.Player.SetSubDelay(v); err != nil {
-		e.logf("> subdelay: mpv refused (%v)", err)
-		return
-	}
+	e.tell(tell{kind: tellSubDelay, f: v})
 	e.logf("> subdelay %.1f", v)
 }
 
@@ -839,7 +1097,8 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	if e.pendingPos != nil && e.dur > 0 {
 		pos := *e.pendingPos
 		e.pendingPos = nil
-		e.applySnapshot(pos, e.pendingPause)
+		// F8: the poll sample IS the freshest local position — no Pos() round trip
+		e.applySnapshot(pos, e.pendingPause, s.Pos)
 	}
 	if e.Master {
 		e.masterTick(s)
@@ -847,6 +1106,17 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	}
 	if s.Pos != nil && e.snap != nil {
 		e.followerTick(s)
+		return
+	}
+	// F8 (A8 B2 root cause 1): no room snapshot — a queue advance cleared
+	// it (S2: every loadfile until the next heartbeat) or the master is
+	// silent before/at a film boundary (S3). The UI still needs a LOCAL
+	// sample: our own pause flag + position, drift 0 (unknowable without
+	// the room), never stale (no beat age to judge). Without this the TUI
+	// sat on the last pre-gap sample — a stale "⏸ paused" while the video
+	// visibly played.
+	if s.Pos != nil {
+		e.emitUi(s, 0)
 	}
 }
 
@@ -864,7 +1134,18 @@ func (e *Engine) OnMpvEvent(name string) {
 		return
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	after := e.onMpvEventLocked(name)
+	e.mu.Unlock()
+	if after != nil {
+		after()
+	}
+}
+
+// onMpvEventLocked is OnMpvEvent under e.mu. F8: it returns the user-scrub
+// post as a closure — the settle sleep + time-pos read run OUTSIDE the
+// lock (the pre-F8 wiring held e.mu for seekSettle + the full write
+// deadline per scrub, starving every hotkey behind it).
+func (e *Engine) onMpvEventLocked(name string) (after func()) {
 	if name == "seek" {
 		if !e.lastSeekAt.IsZero() && e.Clock.Since(e.lastSeekAt) > 5*time.Second {
 			e.seekEcho = false // the echo never came (or is ancient): never eat a user scrub
@@ -930,22 +1211,35 @@ func (e *Engine) OnMpvEvent(name string) {
 			// the window self-heal via the master heartbeat
 			return
 		}
-		time.Sleep(seekSettle) // posts only: let time-pos reach the scrub target
-		t, ok := e.Player.Pos()
-		if !ok {
-			return
-		}
-		if e.Master {
-			e.postDiscrete(room.Event{Type: "seek", T: t})
-			e.lastPos = nil // poll scrub-check restarts fresh (no double post)
-			return
-		}
-		if e.snap == nil {
-			return // nothing to sync against yet
-		}
-		e.lastPost = e.Clock.Now()
-		e.postDiscrete(room.Event{Type: "seek", T: t})
+		// capture what the post needs; the settle + read run off the lock
+		master, hasSnap := e.Master, e.snap != nil
+		after = func() { e.postScrub(master, hasSnap) }
 	}
+	return
+}
+
+// postScrub settles (time-pos must reach the scrub target) and reads the
+// reached position OFF the engine lock, then posts. The snapshot is
+// re-checked at post time: a heartbeat that landed during the settle is
+// fine — the scrub post is still the user's intent.
+func (e *Engine) postScrub(master, hasSnap bool) {
+	time.Sleep(seekSettle) // posts only: let time-pos reach the scrub target
+	t, ok := e.Player.Pos()
+	if !ok {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if master {
+		e.postDiscrete(room.Event{Type: "seek", T: t})
+		e.lastPos = nil // poll scrub-check restarts fresh (no double post)
+		return
+	}
+	if e.snap == nil && !hasSnap {
+		return // still nothing to sync against
+	}
+	e.lastPost = e.Clock.Now()
+	e.postDiscrete(room.Event{Type: "seek", T: t})
 }
 
 // postDiscrete posts one discrete event and mirrors it in the local log:
@@ -1162,7 +1456,8 @@ func (e *Engine) stallBlock(s mpv.State) {
 		// for the network, ISSUE-6).
 		e.postDiscrete(room.Event{Type: "pause", Mechanical: true})
 		e.mechPause = true // mechanical: nobody pressed anything (m2-S2)
-		_ = e.Player.ShowText("buffering - room paused; press play when ready", 4000)
+		// F8: the OSD rides the tell queue — no direct player call under e.mu
+		e.tell(tell{kind: tellOSDText, s: "buffering - room paused; press play when ready", ms: 4000})
 	}
 	e.emitUi(s, *s.Pos-expected)
 }

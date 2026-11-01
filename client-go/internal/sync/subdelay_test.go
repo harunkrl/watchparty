@@ -34,6 +34,7 @@ func TestSubDelayChangesReachMpvAndNeverPost(t *testing.T) {
 	e.SubDelayBy(-0.5)
 	e.SubDelaySet(0.35)
 	e.SubDelaySet(0)
+	waitTells(t, e)
 	adds, sets := pl.subDelayCalls()
 	if len(adds) != 2 || adds[0] != 0.5 || adds[1] != -0.5 {
 		t.Fatalf("sub-delay nudges: %v, want [0.5 -0.5]", adds)

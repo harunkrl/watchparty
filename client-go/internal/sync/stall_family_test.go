@@ -29,8 +29,8 @@ func TestSilentMasterDoesNotPauseTheRoom(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("the follower paused the room for a silent master: %v", evType(t, po.all(t)))
 	}
-	if len(pl.seeks) != 0 {
-		t.Fatalf("the follower chased a stale snapshot: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("the follower chased a stale snapshot: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -62,11 +62,12 @@ func TestResumeDriftSeeksWithoutPausing(t *testing.T) {
 	e.OnRoom(masterAt(100, false)) // the master is at 100s
 	e.Clock = stepClock{now: t0.Add(2 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false}) // we are 62s behind: a resume
-	if len(pl.seeks) != 1 {
-		t.Fatalf("the resume did not re-seek: %v", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("the resume did not re-seek: %v", pl.seeksSnapshot())
 	}
-	if pl.seeks[0] < 100 || pl.seeks[0] > 103 {
-		t.Fatalf("re-seek to %v, want the live position (~102)", pl.seeks[0])
+	if pl.seeksSnapshot()[0] < 100 || pl.seeksSnapshot()[0] > 103 {
+		t.Fatalf("re-seek to %v, want the live position (~102)", pl.seeksSnapshot()[0])
 	}
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("the resume paused the room: %v", evType(t, po.all(t)))
@@ -74,8 +75,8 @@ func TestResumeDriftSeeksWithoutPausing(t *testing.T) {
 	// the settle window: no seek storm, no pause
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(40), Pause: false})
-	if len(pl.seeks) != 1 {
-		t.Fatalf("seek storm after the resume: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("seek storm after the resume: %v", pl.seeksSnapshot())
 	}
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("the resume paused the room: %v", evType(t, po.all(t)))
@@ -168,8 +169,9 @@ func TestSilentMasterPausedRoomStillConverges(t *testing.T) {
 	e.OnRoom(masterAt(10, true)) // the room is paused
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)}
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // we are still playing
-	if len(pl.pauses) != 1 || !pl.pauses[0] {
-		t.Fatalf("the follower did not converge to the pause: %v", pl.pauses)
+	waitTells(t, e)
+	if len(pl.pausesSnapshot()) != 1 || !pl.pausesSnapshot()[0] {
+		t.Fatalf("the follower did not converge to the pause: %v", pl.pausesSnapshot())
 	}
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("the follower posted to the wire: %v", evType(t, po.all(t)))

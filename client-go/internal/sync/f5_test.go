@@ -49,6 +49,7 @@ func TestVolumeKeysNudgeLocallyAndNeverPost(t *testing.T) {
 	e.VolumeUp()
 	e.VolumeDown()
 	e.VolumeMute()
+	waitTells(t, e)
 	vols, mutes := pl.volumeCalls(), pl.muteCalls()
 	if len(vols) != 2 || vols[0] != 5 || vols[1] != -5 {
 		t.Fatalf("volume nudges: %v, want [5 -5]", vols)

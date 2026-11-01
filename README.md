@@ -148,6 +148,10 @@ restart clears history).
 "listeners":<n>}` — a cheap diagnostic probe (curl only, no SSE join
 needed). It carries room state, never a name or an id.
 
+`GET /library` is the same diagnostic in a friendlier shape: every video
+with its subtitle siblings (`[{"name":"a.mkv","subs":["a.tr.srt"]}]`).
+The client does not call it — it pairs the subtitles itself from `/subs`.
+
 ## Test
 
 ```sh

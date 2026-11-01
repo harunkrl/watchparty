@@ -722,6 +722,7 @@ func TestClickBarSeeks(t *testing.T) {
 	click := tea.MouseMsg(tea.MouseEvent{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 50, Y: 3})
 	m.Update(click)
 	// G1: the click moves the clicker's own player AND tells the room
+	waitTells(t, e)
 	if len(pl.seeks) != 1 {
 		t.Fatalf("bar click produced no local seek: %v", pl.seeks)
 	}
@@ -1248,6 +1249,7 @@ func TestDashboardBarClickSeeks(t *testing.T) {
 	m.Update(click)
 	// G1: the clicker's own player moves too (the server never echoes a
 	// poster's own event back)
+	waitTells(t, eng)
 	if len(pl.seeks) != 1 {
 		t.Fatalf("the dashboard bar click did not seek the local player: %v", pl.seeks)
 	}

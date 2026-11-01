@@ -66,7 +66,8 @@ jobs:
           # still fail twice
           for s in smoke persist audit_server audit2_server audit3_server \
                    f2_server f1_server integration pause_sync \
-                   stall_family master_restart soak f6_server; do
+                   stall_family master_restart soak f6_server \
+                   status_render; do
             # this block runs from the repo ROOT (see working-directory
             # below) — NOT the ../tests path the client-go steps use
             tests/ci_retry.sh node tests/$s.mjs || exit 1
@@ -238,6 +239,32 @@ jobs:
             done
           fi
           test -f /tmp/bundle/mpv.exe
+          # F8 item 4: the bundle must NOT ship mpv's self-updater. A
+          # double-click on updater.bat replaces the pinned mpv.exe with an
+          # upstream build and voids the digest story (mpv-bundle.sha256)
+          # with no undo. EXACTLY two files go (the human's scope: no other
+          # trim) — the other .bat files are mpv's own portable helpers.
+          rm -f /tmp/bundle/updater.bat /tmp/bundle/installer/updater.ps1
+          # the file-set assertion: the bundle is the vetted tree MINUS the
+          # updater pair. A changed upstream layout must fail HERE, not in
+          # a friend's folder.
+          for f in mpv.exe watchparty.exe README-friend.txt; do
+            if [ ! -f "/tmp/bundle/$f" ]; then
+              echo "the bundle is missing $f" >&2
+              exit 1
+            fi
+          done
+          if find /tmp/bundle -iname '*updat*' | grep -q .; then
+            echo "a self-updater file is still in the bundle:" >&2
+            find /tmp/bundle -iname '*updat*' >&2
+            exit 1
+          fi
+          count=$(find /tmp/bundle -type f | wc -l)
+          echo "bundle files: $count"
+          if [ "$count" -lt 10 ] || [ "$count" -gt 20 ]; then
+            echo "the bundle file count moved ($count) — re-vet the tree" >&2
+            exit 1
+          fi
           cd /tmp/bundle
           zip -r "$GITHUB_WORKSPACE/dist/watchparty-windows-bundle.zip" .
           cd "$GITHUB_WORKSPACE/dist"

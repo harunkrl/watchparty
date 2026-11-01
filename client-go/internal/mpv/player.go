@@ -181,9 +181,14 @@ const mpvQuiet = "--quiet"
 // mpvArgs are the flags the client always passes to mpv. --quiet (not
 // --really-quiet) keeps mpv's error messages: the friend must see WHY
 // mpv failed. --quiet still silences the status line.
+// F8 (human request #3): no --force-window — the TUI paints first and the
+// video window appears at the FIRST PLAYBACK (startLoad), not at boot.
+// --idle stays: the IPC socket must exist before anything plays. Headless
+// clients (tests) already override everything via WATCHPARTY_MPV, whose
+// extras append LAST (later flag wins).
 func mpvArgs(sock string, extra []string) []string {
 	return append([]string{
-		"--idle", "--force-window", mpvQuiet, "--title=Watchparty",
+		"--idle", mpvQuiet, "--title=Watchparty",
 		"--input-ipc-server=" + sock,
 		"--cache=yes",
 		fmt.Sprintf("--demuxer-readahead-secs=%d", demuxerReadaheadSecs),

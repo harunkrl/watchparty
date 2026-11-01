@@ -82,6 +82,7 @@ func TestAltArrowsNudgeSubDelayLocally(t *testing.T) {
 	m, pl, osd, posted := subModel(t)
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyUp, Alt: true})   // +0.5
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyDown, Alt: true}) // -0.5
+	waitTells(t, m.engine)
 	adds, sets := pl.subDelayCalls()
 	if len(adds) != 2 || adds[0] != 0.5 || adds[1] != -0.5 {
 		t.Fatalf("alt+arrows nudges: %v, want [0.5 -0.5]", adds)
@@ -102,6 +103,7 @@ func TestSubDelayCommandSetsAndResets(t *testing.T) {
 	m, pl, osd, posted := subModel(t)
 	m = submitLine(t, m, "/subdelay +0.35")
 	m = submitLine(t, m, "/subdelay 0")
+	waitTells(t, m.engine)
 	_, sets := pl.subDelayCalls()
 	if len(sets) != 2 || sets[0] != 0.35 || sets[1] != 0 {
 		t.Fatalf("/subdelay sets: %v, want [0.35 0]", sets)

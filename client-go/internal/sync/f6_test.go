@@ -36,7 +36,7 @@ func TestLoadSettleRunsOffTheLock(t *testing.T) {
 	}
 	var nStart, nAttach int
 	pl.mu.Lock()
-	nStart, nAttach = pl.startLoads, pl.attachCalls
+	nStart, nAttach = pl.startLoads, pl.attachCalls // raw: pl.mu held
 	pl.mu.Unlock()
 	if nStart != 1 {
 		t.Fatalf("the loadfile tell did not fire: %d", nStart)
@@ -51,7 +51,7 @@ func TestLoadSettleRunsOffTheLock(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		pl.mu.Lock()
-		n := pl.attachCalls
+		n := pl.attachCalls // raw: pl.mu held
 		pl.mu.Unlock()
 		if n == 1 {
 			break
@@ -59,7 +59,7 @@ func TestLoadSettleRunsOffTheLock(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	pl.mu.Lock()
-	n := pl.attachCalls
+	n := pl.attachCalls // raw: pl.mu held
 	pl.mu.Unlock()
 	if n != 1 {
 		t.Fatal("the settle never completed after the signal")
@@ -78,11 +78,12 @@ func TestSeekByUsesThePolledPosition(t *testing.T) {
 	pos := 10.0
 	e.OnMpvp(mpv.State{Pos: &pos, At: time.Now()})
 	e.SeekBy(30)
-	if pl.posCalls != 0 {
-		t.Fatalf("SeekBy paid %d Pos() round trips, want 0", pl.posCalls)
+	if pl.posCallsCount() != 0 {
+		t.Fatalf("SeekBy paid %d Pos() round trips, want 0", pl.posCallsCount())
 	}
-	if len(pl.seeks) != 1 || pl.seeks[0] != 40 {
-		t.Fatalf("the seek went to %v, want 40 (polled 10 + 30)", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 40 {
+		t.Fatalf("the seek went to %v, want 40 (polled 10 + 30)", pl.seeksSnapshot())
 	}
 }
 

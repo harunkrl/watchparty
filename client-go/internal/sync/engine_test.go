@@ -31,6 +31,10 @@ type fakePlayer struct {
 	wedgeWait   chan struct{}
 	startLoads  int
 	attachCalls int
+
+	// F8: when non-nil, Pos() blocks until the channel is closed — the
+	// wedged-round-trip probe for the lock-free pins.
+	posBlock chan struct{}
 }
 
 // pauseCount reads the recorded pauses safely: the post worker can apply
@@ -47,6 +51,32 @@ func (f *fakePlayer) pausesSnapshot() []bool {
 	defer f.mu.Unlock()
 	return append([]bool(nil), f.pauses...)
 }
+
+// F8: the tell writer executes on its own goroutine, so every log read
+// below is a locked snapshot (the tests assert on these logs).
+func (f *fakePlayer) seeksSnapshot() []float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]float64(nil), f.seeks...)
+}
+func (f *fakePlayer) speedsSnapshot() []float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]float64(nil), f.speeds...)
+}
+func (f *fakePlayer) showTextSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.showText...)
+}
+func (f *fakePlayer) loadsSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.loads...)
+}
+func (f *fakePlayer) startLoadCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.startLoads }
+func (f *fakePlayer) posCallsCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return f.posCalls }
+func (f *fakePlayer) setPos(v float64)    { f.mu.Lock(); f.pos = &v; f.mu.Unlock() }
 
 func (f *fakePlayer) Load(name string) error {
 	f.mu.Lock()
@@ -74,8 +104,14 @@ func (f *fakePlayer) Speed(v float64) error {
 }
 func (f *fakePlayer) Pos() (float64, bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.posCalls++ // F6-A2: SeekBy must not pay this round trip
+	block := f.posBlock
+	f.mu.Unlock()
+	if block != nil {
+		<-block // F8 wedged-round-trip probe: hold the caller
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.pos == nil {
 		return 0, false
 	}
@@ -116,6 +152,10 @@ func (f *fakePlayer) ShowText(s string, ms int) error {
 	f.showText = append(f.showText, s)
 	return nil
 }
+
+// v1.8.0: the sub-delay OSD hint rides the expand-properties prefix (the
+// template is mpv's to expand).
+func (f *fakePlayer) ShowSubDelayHint() error { return nil }
 
 // fakePost records the engine's events. The engine hands them to a post
 // worker (the caller must never wait for the network — ISSUE-6), so the
@@ -163,6 +203,22 @@ func (f *fakePost) all(t *testing.T) []room.Event {
 type fakeClock struct {
 	now   time.Time
 	since time.Duration
+}
+
+// waitTells waits for the F8 tell worker to execute everything queued so
+// far (2s bound). The writer is asynchronous by contract — no interactive
+// path waits on it — and this suite asserts on the fake's call log, so it
+// is the tests that wait for the tail. TellsIdle==true means execTell
+// returned: the fake's record is already on the ground.
+func waitTells(t *testing.T, eng *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !eng.TellsIdle() {
+		if time.Now().After(deadline) {
+			t.Fatalf("tells never drained")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func (c fakeClock) Now() time.Time                  { return c.now }
@@ -347,11 +403,12 @@ func TestFollowerSelfHealPauseState(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(masterAt(5, true))                    // master paused
 	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: false}) // we are still playing
-	if len(pl.pauses) != 1 || !pl.pauses[0] {
-		t.Fatalf("pauses = %v, want [true]", pl.pauses)
+	waitTells(t, e)
+	if len(pl.pausesSnapshot()) != 1 || !pl.pausesSnapshot()[0] {
+		t.Fatalf("pauses = %v, want [true]", pl.pausesSnapshot())
 	}
-	if len(pl.seeks) != 0 {
-		t.Fatalf("no seek expected during self-heal, got %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("no seek expected during self-heal, got %v", pl.seeksSnapshot())
 	}
 }
 
@@ -361,8 +418,9 @@ func TestFollowerDriftSeek(t *testing.T) {
 	e.OnRoom(masterAt(10, false))
 	// Since = 5s -> expected 15; we are at 10: drift -5 > TOLERANCE
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
-	if len(pl.seeks) != 1 || pl.seeks[0] != 15 {
-		t.Fatalf("seeks = %v, want [15]", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 15 {
+		t.Fatalf("seeks = %v, want [15]", pl.seeksSnapshot())
 	}
 }
 
@@ -370,8 +428,8 @@ func TestFollowerSmallDriftHolds(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // expected 12: drift 0.3
-	if len(pl.seeks) != 0 {
-		t.Fatalf("seek fired on drift 0.3: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("seek fired on drift 0.3: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -382,19 +440,21 @@ func TestFollowerMidDriftSpeedNudges(t *testing.T) {
 	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 3 * time.Second}
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(12.5), Pause: false}) // expected 13: drift -0.5 -> 1.05
-	if len(pl.speeds) != 1 || pl.speeds[0] != 1.05 {
-		t.Fatalf("speeds = %v, want [1.05]", pl.speeds)
+	waitTells(t, e)
+	if len(pl.speedsSnapshot()) != 1 || pl.speedsSnapshot()[0] != 1.05 {
+		t.Fatalf("speeds = %v, want [1.05]", pl.speedsSnapshot())
 	}
-	if len(pl.seeks) != 0 {
-		t.Fatalf("no seek inside the band: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("no seek inside the band: %v", pl.seeksSnapshot())
 	}
 
 	e2, pl2, _ := newEngine(false)
 	e2.Clock = fakeClock{now: time.Unix(1000, 0), since: 3 * time.Second}
 	e2.OnRoom(masterAt(10, false))
 	e2.OnMpvp(mpv.State{Pos: ptr(13.5), Pause: false}) // drift +0.5 -> 0.95
-	if len(pl2.speeds) != 1 || pl2.speeds[0] != 0.95 {
-		t.Fatalf("ahead speeds = %v, want [0.95]", pl2.speeds)
+	waitTells(t, e2)
+	if len(pl2.speedsSnapshot()) != 1 || pl2.speedsSnapshot()[0] != 0.95 {
+		t.Fatalf("ahead speeds = %v, want [0.95]", pl2.speedsSnapshot())
 	}
 }
 
@@ -405,8 +465,9 @@ func TestFollowerSpeedNudgeCached(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // drift 0.3 -> 0.97
 	e.OnRoom(masterAt(12, false))                     // heartbeat advances too
 	e.OnMpvp(mpv.State{Pos: ptr(14.3), Pause: false}) // same drift again
-	if len(pl.speeds) != 1 {                          // [0.97] only — second tick is silent
-		t.Fatalf("speeds = %v, want exactly [0.97]", pl.speeds)
+	waitTells(t, e)
+	if len(pl.speedsSnapshot()) != 1 { // [0.97] only — second tick is silent
+		t.Fatalf("speeds = %v, want exactly [0.97]", pl.speedsSnapshot())
 	}
 }
 
@@ -416,8 +477,9 @@ func TestFollowerBigDriftSeeksAndPauseResetsSpeed(t *testing.T) {
 	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 5 * time.Second}
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // drift -5 -> seek 15
-	if len(pl.seeks) != 1 || pl.seeks[0] != 15 {
-		t.Fatalf("seeks = %v, want [15]", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 15 {
+		t.Fatalf("seeks = %v, want [15]", pl.seeksSnapshot())
 	}
 
 	// master pauses; follower converges and the nudge must clear
@@ -425,7 +487,8 @@ func TestFollowerBigDriftSeeksAndPauseResetsSpeed(t *testing.T) {
 	e.OnRoom(room.Event{Type: "pause"})
 	e.OnMpvp(mpv.State{Pos: ptr(15), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(15), Pause: true}) // both paused: baseline speed
-	last := pl.speeds[len(pl.speeds)-1]
+	waitTells(t, e)
+	last := pl.speedsSnapshot()[len(pl.speedsSnapshot())-1]
 	if last != 1 {
 		t.Fatalf("speed after pause = %v, want 1", last)
 	}
@@ -439,7 +502,7 @@ func waitSettle(t *testing.T, pl *fakePlayer, attaches int) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		pl.mu.Lock()
-		n := pl.attachCalls
+		n := pl.attachCalls // raw read: the helper holds pl.mu
 		pl.mu.Unlock()
 		if n >= attaches {
 			return
@@ -447,7 +510,7 @@ func waitSettle(t *testing.T, pl *fakePlayer, attaches int) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	pl.mu.Lock()
-	n := pl.attachCalls
+	n := pl.attachCalls // raw read: the helper holds pl.mu
 	pl.mu.Unlock()
 	t.Fatalf("the load settle never finished (attaches=%d, want ≥%d)", n, attaches)
 }
@@ -458,7 +521,7 @@ func TestLoadResetsSpeed(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: ptr(12.3), Pause: false}) // nudge 0.97
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"})
 	waitSettle(t, pl, 1) // F6-A1: the speed reset rides the background settle
-	last := pl.speeds[len(pl.speeds)-1]
+	last := pl.speedsSnapshot()[len(pl.speedsSnapshot())-1]
 	if last != 1 {
 		t.Fatalf("speed after load = %v, want 1", last)
 	}
@@ -468,15 +531,15 @@ func TestFollowerExpectedFrozenWhileMasterPaused(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(masterAt(5, true))
 	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: true}) // both paused: hold
-	if len(pl.seeks) != 0 || len(pl.pauses) != 0 {
-		t.Fatalf("both-paused must hold: seeks=%v pauses=%v", pl.seeks, pl.pauses)
+	if len(pl.seeksSnapshot()) != 0 || len(pl.pausesSnapshot()) != 0 {
+		t.Fatalf("both-paused must hold: seeks=%v pauses=%v", pl.seeksSnapshot(), pl.pausesSnapshot())
 	}
 }
 
 func TestFollowerNeedsSnapshot(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnMpvp(mpv.State{Pos: ptr(5), Pause: false}) // no master heartbeat yet
-	if len(pl.seeks)+len(pl.pauses)+len(pl.loads) != 0 {
+	if len(pl.seeksSnapshot())+len(pl.pausesSnapshot())+len(pl.loadsSnapshot()) != 0 {
 		t.Fatal("follower acted without a master snapshot")
 	}
 }
@@ -489,16 +552,20 @@ func TestOnRoomAppliesDiscreteEvents(t *testing.T) {
 	e.OnRoom(room.Event{Type: "pause"})
 	e.OnRoom(room.Event{Type: "play"})
 	e.OnRoom(room.Event{Type: "seek", T: 42})
+	waitTells(t, e)
 	// F6-A1: the load is claimed speculatively at startLoad (the settle
 	// continues in the background)
 	if e.loaded != "a.mkv" {
 		t.Fatalf("loaded = %q", e.loaded)
 	}
-	if len(pl.pauses) != 2 || !pl.pauses[0] || pl.pauses[1] {
-		t.Fatalf("pauses = %v, want [true false]", pl.pauses)
+	if len(pl.pausesSnapshot()) != 1 || pl.pausesSnapshot()[0] {
+		// F8 tell law: pause coalesces to the LATEST — the player lands in
+		// the final state; the ROOM still hears both transitions (the wire
+		// posts are never dropped, only the local writes coalesce).
+		t.Fatalf("pauses = %v, want [false] (coalesced to latest)", pl.pausesSnapshot())
 	}
-	if len(pl.seeks) != 1 || pl.seeks[0] != 42 {
-		t.Fatalf("seeks = %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 42 {
+		t.Fatalf("seeks = %v", pl.seeksSnapshot())
 	}
 }
 
@@ -544,7 +611,7 @@ func TestInstantPauseNoDoublePost(t *testing.T) {
 func TestInstantSeekSinglePost(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // lastPos = 10
-	pl.pos = ptr(60)                                // user scrubbed
+	pl.setPos(60)                                   // user scrubbed
 	e.OnMpvEvent("seek")                            // instant path posts 60
 	e.OnMpvp(mpv.State{Pos: ptr(60), Pause: false}) // poll scrub-check skipped
 	if n := countType(t, po.all(t), "seek"); n != 1 {
@@ -630,14 +697,15 @@ func TestFollowerPausePostsAndGrace(t *testing.T) {
 	// master has not applied it; heartbeat still says playing
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: true}) // within grace: no revert
-	if len(pl.pauses) != 0 {
-		t.Fatalf("reverted during grace: %v", pl.pauses)
+	if len(pl.pausesSnapshot()) != 0 {
+		t.Fatalf("reverted during grace: %v", pl.pausesSnapshot())
 	}
 	// grace expires, master still playing -> failsafe revert (authority)
 	e.Clock = fakeClock{now: time.Unix(1000, 0), since: 5 * time.Second}
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: true})
-	if len(pl.pauses) != 1 || pl.pauses[0] {
-		t.Fatalf("no failsafe resume after grace: %v", pl.pauses)
+	waitTells(t, e)
+	if len(pl.pausesSnapshot()) != 1 || pl.pausesSnapshot()[0] {
+		t.Fatalf("no failsafe resume after grace: %v", pl.pausesSnapshot())
 	}
 }
 
@@ -657,7 +725,7 @@ func TestFollowerSeekPosts(t *testing.T) {
 	e.Logf = sink
 	e.Clock = fakeClock{since: 10 * time.Second}
 	e.OnRoom(masterAt(10, false))
-	pl.pos = ptr(60)
+	pl.setPos(60)
 	e.OnMpvEvent("seek") // user scrubbed
 	if n := countType(t, po.all(t), "seek"); n != 1 || po.all(t)[0].T != 60 {
 		t.Fatalf("seek post wrong: %v", po.all(t))

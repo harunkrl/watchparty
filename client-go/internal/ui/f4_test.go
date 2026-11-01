@@ -160,6 +160,7 @@ func TestCtrlSpaceDoesNotFreezeOnAHungServer(t *testing.T) {
 	if el := time.Since(start); el > 2*time.Second {
 		t.Fatalf("the UI froze for %s on a hung server", el)
 	}
+	waitTells(t, e)
 	if len(pl.pauses) != 1 {
 		t.Fatalf("the room was not paused: %v", pl.pauses)
 	}
@@ -178,6 +179,7 @@ func (p *matrixPlayer) SetPause(v bool) error            { p.pauses = append(p.p
 func (p *matrixPlayer) Seek(t float64) error             { p.seeks = append(p.seeks, t); return nil }
 func (p *matrixPlayer) Speed(float64) error              { return nil }
 func (p *matrixPlayer) ShowText(string, int) error       { return nil }
+func (p *matrixPlayer) ShowSubDelayHint() error          { return nil }
 func (p *matrixPlayer) Pos() (float64, bool)             { return 30, true } // the seek needs a position
 func (p *matrixPlayer) SetVolume(float64) error          { return nil }
 func (p *matrixPlayer) ToggleMute() error                { return nil }
@@ -391,6 +393,7 @@ func TestCtrlShortcutMatrix(t *testing.T) {
 			before := m
 			beforePl := *pl
 			m = upd(t, m, key)
+			waitTells(t, e)
 			got := k.effect(before, m, pl)
 			_ = beforePl
 			if got != row.want {

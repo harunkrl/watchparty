@@ -19,10 +19,17 @@ Optional, to check the download was not corrupted: in PowerShell run
   Get-FileHash watchparty-windows-bundle.zip -Algorithm SHA256
 and compare with the matching line in SHA256SUMS on the release page.
 
+When you start the app, only the black window appears — the mpv window
+opens once a film actually starts playing.
+
 The movie plays in a separate mpv window. The black window is the remote
 control — just type your message there and press Enter to talk.
 Commands start with "/": /list | /pick | /play <file> | /queue <file> |
 /skip | /help   (everything else you type goes to the room as chat)
+
+The bundled mpv is the build we tested and shipped: never replace mpv.exe
+with another one — an untested mpv can break playback. New mpv builds
+arrive with a new watchparty release.
 
 Keys: press F1 in the client for the full sheet (pause, seek, volume,
 mute, the file picker). F1 works while you type — every other key keeps

@@ -8,8 +8,9 @@ import "testing"
 func TestSeekToSeeksLocalAndPosts(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.SeekTo(42)
-	if len(pl.seeks) != 1 || pl.seeks[0] != 42 {
-		t.Fatalf("local seek = %v, want [42]", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 42 {
+		t.Fatalf("local seek = %v, want [42]", pl.seeksSnapshot())
 	}
 	if len(po.all(t)) != 1 || po.all(t)[0].Type != "seek" || po.all(t)[0].T != 42 {
 		t.Fatalf("posted = %v, want one seek at 42s", po.all(t))
@@ -20,8 +21,9 @@ func TestSeekToSeeksLocalAndPosts(t *testing.T) {
 func TestSeekToClampsNegative(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.SeekTo(-5)
-	if len(pl.seeks) != 1 || pl.seeks[0] != 0 {
-		t.Fatalf("local seek = %v, want [0]", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 0 {
+		t.Fatalf("local seek = %v, want [0]", pl.seeksSnapshot())
 	}
 	if len(po.all(t)) != 1 || po.all(t)[0].T != 0 {
 		t.Fatalf("posted = %v, want a seek at 0s", po.all(t))

@@ -21,10 +21,11 @@ func TestMasterDoesNotRepostAppliedSeek(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10)})         // baseline heartbeat
 	e.OnRoom(room.Event{Type: "seek", T: 60}) // a follower scrubbed: we apply it
-	if len(pl.seeks) != 1 || pl.seeks[0] != 60 {
-		t.Fatalf("applied seek not applied: %v", pl.seeks)
+	waitTells(t, e)
+	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 60 {
+		t.Fatalf("applied seek not applied: %v", pl.seeksSnapshot())
 	}
-	pl.pos = ptr(60)                  // our player is now at the target
+	pl.setPos(60)                     // our player is now at the target
 	e.OnMpvp(mpv.State{Pos: ptr(60)}) // the poll must not call this a local scrub
 	if n := countType(t, po.all(t), "seek"); n != 0 {
 		t.Fatalf("applied seek re-posted %d times: %v", n, evType(t, po.all(t)))
@@ -38,7 +39,7 @@ func TestMasterDoesNotPostPhantomSeekAfterLoad(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(300)})                // the old film's position
 	e.OnRoom(room.Event{Type: "load", Name: "b.mkv"}) // the room moves on
-	pl.pos = ptr(0.2)
+	pl.setPos(0.2)
 	e.OnMpvp(mpv.State{Pos: ptr(0.2)}) // the new file starts at the head
 	if n := countType(t, po.all(t), "seek"); n != 0 {
 		t.Fatalf("phantom seek after load: %v", evType(t, po.all(t)))
@@ -48,7 +49,7 @@ func TestMasterDoesNotPostPhantomSeekAfterLoad(t *testing.T) {
 	e2, pl2, po2 := newEngine(true)
 	e2.OnMpvp(mpv.State{Pos: ptr(300)})
 	e2.OwnLoad("c.mkv")
-	pl2.pos = ptr(0.2)
+	pl2.setPos(0.2)
 	e2.OnMpvp(mpv.State{Pos: ptr(0.2)})
 	if n := countType(t, po2.all(t), "seek"); n != 0 {
 		t.Fatalf("phantom seek after own load: %v", evType(t, po2.all(t)))

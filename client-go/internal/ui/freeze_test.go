@@ -41,6 +41,7 @@ func TestCtrlSpaceWithAFullLogChannelReturns(t *testing.T) {
 	if el := time.Since(start); el > 3*time.Second {
 		t.Fatalf("the UI froze for %s with a full log channel", el)
 	}
+	waitTells(t, e)
 	if len(pl.pauses) != 1 {
 		t.Fatalf("the room was not paused: %v", pl.pauses)
 	}

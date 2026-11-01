@@ -1,5 +1,55 @@
 # Changelog
 
+## v1.9.0 — a keyboard that never waits for the player
+
+- client (sync): every hotkey is off the mpv pipe — tells ride a
+  single-writer bounded queue (pause/seek/speed coalesce to the latest
+  and are never dropped; volume/mute/subdelay/OSD are personal,
+  drop-oldest at cap 8, drops logged at most once a second), so a slow
+  or wedged mpv can no longer stall the TUI: the scrub-hold freeze
+  (measured 5114ms — the seek settle + Pos() round trip under the
+  engine lock) and the full-pipe key press (4018ms) now return in
+  0.0ms, and a HELD key on a hung player — which used to queue ~10
+  minutes of 2s writes after release — cannot wedge the UI at all
+  (StartLoad keeps its sanctioned blocking step; the stall
+  "buffering" OSD rides the queue too)
+- client (sync): the seek-event settle and applySnapshot make no IPC
+  round trips under the engine lock anymore (postScrub runs off-lock;
+  applySnapshot reads the local position) — join and reconnect no
+  longer inherit a ~10s lock hold from a slow mpv
+- client (sync): a follower without a room snapshot still gets an
+  honest status — when a position exists but no snapshot does, the UI
+  state is emitted from the LOCAL player (pause flag + position, no
+  drift fields); before, every queue advance showed a stale "⏸ paused"
+  for the heartbeat gap and a master dying at a film boundary left the
+  follower playing the next film with "⏸ paused" forever — the field
+  report
+- client (mpv): --force-window is gone — the TUI paints at startup
+  and the video window opens at first playback (--idle stays;
+  WATCHPARTY_MPV extras still win as the later arguments)
+- release: the Windows bundle no longer ships mpv's self-updater
+  (updater.bat + installer/updater.ps1) — its 9s auto-default could
+  replace the digest-vetted mpv.exe (dropping ffmpeg/yt-dlp/7zr
+  beside it) with no watchparty-side warning; the assembly asserts
+  the file set now (the three must-haves present, no *updat* file,
+  count 10..20)
+- tests: the TUI render path has its first end-to-end pin —
+  status_render.mjs drives the real binary under a pty (terminal
+  capability queries answered, a SIGWINCH nudge forces full repaints)
+  through the dead-master queue-advance scenario and asserts the
+  rendered "▶ playing" chip; it was red on v1.8.1 with the field
+  symptom verbatim. Eight new engine pins beside it (hotkey latency
+  vs a wedged player, the coalescing laws, the mpv argv, the local
+  emit), all demonstrated red on the old wiring
+- tests: master_restart's teardown tells the truth again — kill now
+  WAITS for the three processes to exit (bounded 5s + SIGKILL) before
+  rmWithRetry walks the tree; the server's exit-time state flush used
+  to race the walk and exit 1 after the PASS line (deterministic,
+  reproduced 3x)
+- CI: client-go.yml's test and build jobs get the timeout-minutes
+  every other job already had (20/10); README documents /library as
+  the human diagnostic endpoint it is
+
 ## v1.8.1 — the client does not swallow its own verdicts
 
 - client: the quit-time "post lost" verdict now reaches the human — after

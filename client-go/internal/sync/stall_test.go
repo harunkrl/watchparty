@@ -39,8 +39,8 @@ func TestStallNoSeekStorm(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("paused before stallTicks: %v", evType(t, po.all(t)))
 	}
-	if len(pl.seeks) != 1 {
-		t.Fatalf("probe seek: got %v, want exactly 1", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("probe seek: got %v, want exactly 1", pl.seeksSnapshot())
 	}
 
 	liveTick(e, t0.Add(8*time.Second), 20, 12, false) // behind 2: stall -> one pause, no seek
@@ -54,8 +54,8 @@ func TestStallNoSeekStorm(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 1 {
 		t.Fatalf("auto-pause repeated: %v", evType(t, po.all(t)))
 	}
-	if len(pl.seeks) != 1 {
-		t.Fatalf("seek-storm during stall: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("seek-storm during stall: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -79,8 +79,8 @@ func TestResumeDoesNotJump(t *testing.T) {
 	e.OnRoom(room.Event{Type: "play"})                 // resume: snapshot re-anchored NOW
 	e.Clock = stepClock{now: t0.Add(10*time.Second + 100*time.Millisecond)}
 	e.OnMpvp(mpv.State{Pos: ptr(12.05), Pause: false})
-	if len(pl.seeks) != 0 {
-		t.Fatalf("resume raced into a seek (jump): %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("resume raced into a seek (jump): %v", pl.seeksSnapshot())
 	}
 	if len(po.all(t)) != 0 {
 		t.Fatalf("unexpected posts on resume: %v", evType(t, po.all(t)))
@@ -103,8 +103,8 @@ func TestBufferingCountsTowardStall(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 1 {
 		t.Fatalf("buffering did not stall after the runway: %v", evType(t, po.all(t)))
 	}
-	if len(pl.seeks) != 0 {
-		t.Fatalf("seek while buffering: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("seek while buffering: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -125,11 +125,11 @@ func TestShortStallNoPause(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 0 {
 		t.Fatalf("pause after short stall: %v", evType(t, po.all(t)))
 	}
-	if len(pl.speeds) == 0 {
-		t.Fatalf("normal drift handling did not resume: speeds=%v seeks=%v", pl.speeds, pl.seeks)
+	if len(pl.speedsSnapshot()) == 0 {
+		t.Fatalf("normal drift handling did not resume: speeds=%v seeks=%v", pl.speedsSnapshot(), pl.seeksSnapshot())
 	}
-	if len(pl.seeks) != 1 {
-		t.Fatalf("expected only the probe seek: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("expected only the probe seek: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -139,7 +139,7 @@ func TestShortStallNoPause(t *testing.T) {
 func TestHelloBlipNoReload(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(room.Event{Type: "load", Name: "x.mkv"})
-	pl.pos = ptr(30.5) // ~0.5s from the hello position: inside Tolerance
+	pl.setPos(30.5) // ~0.5s from the hello position: inside Tolerance
 	// the local duration must be known before a hello position can be
 	// clamped to it (F1): mpv reports the duration a moment after a load
 	e.OnMpvp(mpv.State{Pos: ptr(30.5), Dur: 300})
@@ -149,13 +149,13 @@ func TestHelloBlipNoReload(t *testing.T) {
 	// F6-A1: the load claim is speculative at StartLoad — a hello for the
 	// SAME file must not reload (startLoads stays 1)
 	pl.mu.Lock()
-	starts := pl.startLoads
+	starts := pl.startLoads // raw: pl.mu held
 	pl.mu.Unlock()
 	if starts != 1 {
 		t.Fatalf("hello blip reloaded the file: startLoads=%d", starts)
 	}
-	if len(pl.seeks) != 0 {
-		t.Fatalf("hello blip seeked: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 0 {
+		t.Fatalf("hello blip seeked: %v", pl.seeksSnapshot())
 	}
 	if e.snap == nil || e.snap.t != 30.0 {
 		t.Fatalf("hello did not set snap: %+v", e.snap)
@@ -168,8 +168,8 @@ func TestHelloDifferentFileLoads(t *testing.T) {
 	e.OnRoom(room.Event{Type: "load", Name: "x.mkv"})
 	e.OnRoom(room.Event{Type: "hello", Now: "y.mkv"})
 	// F6-A1: both loads claim speculatively at StartLoad
-	if pl.startLoads != 2 || e.loaded != "y.mkv" {
-		t.Fatalf("loads = %d loaded = %q, want 2 loads ending at y.mkv", pl.startLoads, e.loaded)
+	if pl.startLoadCount() != 2 || e.loaded != "y.mkv" {
+		t.Fatalf("loads = %d loaded = %q, want 2 loads ending at y.mkv", pl.startLoadCount(), e.loaded)
 	}
 }
 
@@ -180,8 +180,8 @@ func TestOwnLoadPreventsHelloReload(t *testing.T) {
 	e, pl, _ := newEngine(true) // the master is the affected side
 	e.OwnLoad("x.mkv")
 	e.OnRoom(room.Event{Type: "hello", Now: "x.mkv"})
-	if len(pl.loads) != 0 {
-		t.Fatalf("hello reloaded the own-played file: loads=%v", pl.loads)
+	if len(pl.loadsSnapshot()) != 0 {
+		t.Fatalf("hello reloaded the own-played file: loads=%v", pl.loadsSnapshot())
 	}
 }
 
@@ -215,8 +215,8 @@ func TestStallPauseResetsOnPlay(t *testing.T) {
 	if n := countType(t, po.all(t), "pause"); n != 2 {
 		t.Fatalf("stall pause did not reset on play: %d pauses (events: %v)", n, evType(t, po.all(t)))
 	}
-	if len(pl.seeks) != 2 {
-		t.Fatalf("expected exactly the two probe seeks: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 2 {
+		t.Fatalf("expected exactly the two probe seeks: %v", pl.seeksSnapshot())
 	}
 }
 
@@ -246,7 +246,7 @@ func TestLoadQuietSuppressesSeekPost(t *testing.T) {
 	e, pl, po := newEngine(true)
 	e.ID = "m-1"
 	e.OwnLoad("x.mkv")
-	pl.pos = ptr(1.4)
+	pl.setPos(1.4)
 	e.OnMpvEvent("seek") // load echo: suppressed
 	if len(po.all(t)) != 0 {
 		t.Fatalf("post-load head seek reached the room: %v", evType(t, po.all(t)))
@@ -268,13 +268,13 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 	e.OnRoom(masterAt(12, false))
 
 	e.OnRoom(room.Event{Type: "seek", T: 40}) // remote seek applied: echo pending
-	pl.pos = ptr(40)
+	pl.setPos(40)
 	e.OnMpvEvent("seek") // the echo itself: swallowed, never posted
 	if len(po.all(t)) != 0 {
 		t.Fatalf("echo reached the room: %v", evType(t, po.all(t)))
 	}
 
-	pl.pos = ptr(20)                                  // user scrub
+	pl.setPos(20)                                     // user scrub
 	e.Clock = stepClock{now: t0.Add(4 * time.Second)} // soak timing: past actuateQuiet, inside the echo window
 	e.OnMpvEvent("seek")
 	if n := countType(t, po.all(t), "seek"); n != 1 {
@@ -284,7 +284,7 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 	// expiry: a pending echo that never arrives must not eat a later scrub
 	e.OnRoom(room.Event{Type: "seek", T: 40})
 	e.Clock = stepClock{now: t0.Add(10 * time.Second)} // 6s past the fresh pending echo
-	pl.pos = ptr(25)
+	pl.setPos(25)
 	e.OnMpvEvent("seek")
 	if n := countType(t, po.all(t), "seek"); n != 2 {
 		t.Fatalf("expired pending echo ate a scrub: %v", evType(t, po.all(t)))
@@ -326,10 +326,11 @@ func TestPauseToggleAndSeekBy(t *testing.T) {
 	// master: pause flips, posts pause; seek posts the clamped target
 	e, pl, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
-	pl.pos = ptr(10) // SeekBy reads the player, not the poll state
+	pl.setPos(10) // SeekBy reads the player, not the poll state
 	e.PauseToggle()
-	if len(pl.pauses) != 1 || !pl.pauses[0] {
-		t.Fatalf("master PauseToggle did not pause locally: %v", pl.pauses)
+	waitTells(t, e)
+	if len(pl.pausesSnapshot()) != 1 || !pl.pausesSnapshot()[0] {
+		t.Fatalf("master PauseToggle did not pause locally: %v", pl.pausesSnapshot())
 	}
 	if countType(t, po.all(t), "pause") != 1 {
 		t.Fatalf("master PauseToggle did not post: %v", evType(t, po.all(t)))
@@ -343,8 +344,8 @@ func TestPauseToggleAndSeekBy(t *testing.T) {
 	if last.Type != "seek" || last.T != 0 {
 		t.Fatalf("seek clamp: %+v", last)
 	}
-	if len(pl.seeks) != 1 {
-		t.Fatalf("local seek missing: %v", pl.seeks)
+	if len(pl.seeksSnapshot()) != 1 {
+		t.Fatalf("local seek missing: %v", pl.seeksSnapshot())
 	}
 
 	// follower: needs a snapshot; toggle mirrors it and posts
@@ -354,7 +355,8 @@ func TestPauseToggleAndSeekBy(t *testing.T) {
 	if countType(t, fpo.all(t), "pause") != 1 {
 		t.Fatalf("follower PauseToggle post missing: %v", evType(t, fpo.all(t)))
 	}
-	if len(fpl.pauses) != 1 || !fpl.pauses[0] {
-		t.Fatalf("follower local pause missing: %v", fpl.pauses)
+	waitTells(t, f)
+	if len(fpl.pausesSnapshot()) != 1 || !fpl.pausesSnapshot()[0] {
+		t.Fatalf("follower local pause missing: %v", fpl.pausesSnapshot())
 	}
 }

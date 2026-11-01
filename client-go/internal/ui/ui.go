@@ -480,10 +480,15 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 // inputKeys handles typing plus history browsing and viewport scrolling.
 // osd shows a short hint in the mpv window: the movie window is often
 // hidden behind the TUI, so the log line alone is invisible feedback.
-// LOCAL ONLY — the OSD never touches the room (F6 D3).
+// LOCAL ONLY — the OSD never touches the room (F6 D3). F8: the hint rides
+// the engine's tell worker — Update never waits on the pipe.
 func (m Model) osd(text string) {
 	if m.osdHook != nil {
 		m.osdHook(text)
+		return
+	}
+	if m.engine != nil {
+		m.engine.OSDShow(text, 1500)
 		return
 	}
 	if m.player == nil {
@@ -1001,10 +1006,15 @@ func firstLine(err error) string {
 // expand-properties prefix — the IPC array API expands nothing by
 // default), so the client never guesses the value and even z/Z pressed
 // in the player window cannot make the hint lie. The hook seam records
-// the ask; the wire form is pinned in the mpv package.
+// the ask; the wire form is pinned in the mpv package. F8: queued via
+// the engine's tell worker when one exists — Update never touches the pipe.
 func (m Model) osdSubDelay() {
 	if m.osdHook != nil {
 		m.osdHook("sub-delay ${sub-delay}")
+		return
+	}
+	if m.engine != nil {
+		m.engine.OSDSubDelayHint()
 		return
 	}
 	if m.player != nil {
@@ -1652,11 +1662,13 @@ func (m Model) nowPlayingLines(w int) []string {
 	return []string{style.Render(icon) + " " + name, "", bar, "", strings.Join(stats, statLbl.Render(" · "))}
 }
 
-// roomPaused: the ROOM is paused — by a human, or by a stall we detected
-// (the mechanical flag). Our own player can still be running for a tick
-// (a stall pause reaches us a moment later), so the state chips follow
-// the ROOM, not our local player (A5 W10: the UI claimed "playing" for
-// two seconds while the room was already paused).
+// roomPaused: what the state chip shows. m.st.Paused is the LOCAL mpv
+// pause flag as of the last UiState: for the master that IS the room's
+// state; a follower's own player self-heals to the room within a tick and
+// every engine branch emits local truth — so the chip honestly follows
+// OUR player, and the ⚠ stale chip covers a diverged or dead room (the
+// old comment claimed ROOM-following; the data never did — F8 item 2,
+// A8 B2-RC3 honesty fix: align the comment, keep the local truth).
 func (m Model) roomPaused() bool {
 	return m.st != nil && (m.st.Paused || m.st.Mechanical)
 }

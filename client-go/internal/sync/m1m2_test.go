@@ -87,7 +87,7 @@ func TestReconnectStormDoesNotExtendTheDeadline(t *testing.T) {
 	e, pl, po := newEngine(false)
 	e.dur = 100            // we know the duration: the hello is applied at once
 	e.loaded = "movie.mkv" // the same file: the hello does not reload it
-	pl.pos = ptr(40)       // our position is known: the hello jump is measurable
+	pl.setPos(40)          // our position is known: the hello jump is measurable
 	t0 := time.Unix(5000, 0)
 	e.Clock = stepClock{now: t0}
 	e.OnRoom(masterAt(100, false))
@@ -172,7 +172,7 @@ func TestHelloMidResumeDoesNotPauseTheRoom(t *testing.T) {
 	e, pl, po := newEngine(false)
 	e.dur = 100            // we know the duration: the hello is applied at once
 	e.loaded = "movie.mkv" // the same file: the hello does not reload it
-	pl.pos = ptr(40)       // our position is known: the hello jump is measurable
+	pl.setPos(40)          // our position is known: the hello jump is measurable
 	t0 := time.Unix(5000, 0)
 	e.Clock = stepClock{now: t0}
 	e.OnRoom(masterAt(100, false))

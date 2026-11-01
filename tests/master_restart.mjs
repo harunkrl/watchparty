@@ -6,7 +6,7 @@
 
 import { strict as assert } from 'node:assert';
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -94,11 +94,26 @@ const mpvGet = (sockPath, prop) =>
   });
 
 const cleanup = async (code) => {
-  for (const p of [master, follower, server]) {
+  // F8: kill -> WAIT for the exits -> rm. The server's exit-time state
+  // flush (state.json + state.json.tmp) must land BEFORE the tree walk:
+  // a raw rmSync raced that write and hit ENOTEMPTY after the PASS line,
+  // so the exit code lied (the F6/C1 shape, helpers.stopServer).
+  const procs = [master, follower, server];
+  for (const p of procs) {
     try { execSync(`pkill -TERM -P ${p.pid}`); } catch {}
     p.kill();
   }
-  rmSync(dir, { recursive: true, force: true });
+  for (const p of procs) {
+    if (p.exitCode !== null || p.signalCode !== null) continue;
+    const exited = new Promise((r) => p.once('exit', r));
+    await Promise.race([exited, sleep(5000)]);
+    if (p.exitCode === null && p.signalCode === null) {
+      const killed = new Promise((r) => p.once('exit', r));
+      p.kill('SIGKILL');
+      await Promise.race([killed, sleep(2000)]);
+    }
+  }
+  rmWithRetry(dir);
   process.exit(code);
 };
 
