@@ -26,6 +26,10 @@ type fakePlayer struct {
 	posCalls int   // F6-A2: SeekBy must not pay IPC round trips
 	loadErr  error // returned by Load to simulate a failed loadfile
 
+	// F10 C4: the /sub attach records the ask (the interface grew the
+	// method; the tell lane owns the write).
+	subAttaches []string
+
 	// F6-A1: the load settle — WaitLive blocks until wedgeWait is closed
 	// (the guaranteed signal), then the sub attach runs exactly once.
 	wedgeWait   chan struct{}
@@ -145,6 +149,14 @@ func (f *fakePlayer) AttachSubs(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attachCalls++
+}
+
+// AttachSub records the ask (F10 C4): the write itself is the tell lane's.
+func (f *fakePlayer) AttachSub(name string) error {
+	f.mu.Lock()
+	f.subAttaches = append(f.subAttaches, name)
+	f.mu.Unlock()
+	return nil
 }
 func (f *fakePlayer) ShowText(s string, ms int) error {
 	f.mu.Lock()

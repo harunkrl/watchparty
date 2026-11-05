@@ -42,6 +42,9 @@ func (b *blockingPlayer) block() error {
 		return fmt.Errorf("wedged (f8 probe timeout)")
 	}
 }
+
+// AttachSub satisfies the F10 C4 interface growth (the tell lane owns the write).
+func (b *blockingPlayer) AttachSub(string) error { return nil }
 func (b *blockingPlayer) recordVols(d float64) {
 	b.mu.Lock()
 	b.vols = append(b.vols, d)

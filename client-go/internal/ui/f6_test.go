@@ -39,14 +39,27 @@ func TestF6LocalActionsShowAnOSDHint(t *testing.T) {
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlDown})  // volume -
 	m = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlRight}) // seek +5s
 	m = upd(t, m, runeKey('m', true))                 // mute
+	waitTells(t, e)                                   // F10 C6: the volume OSD rides the async action tell
 
-	want := []string{"vol +5%", "vol -5%", "+5s", "muted"}
+	want := []string{"+5s", "muted"}
 	if len(hints) != len(want) {
 		t.Fatalf("OSD hints: %v, want %v", hints, want)
 	}
 	for i := range want {
 		if hints[i] != want[i] {
 			t.Fatalf("OSD hints: %v, want %v", hints, want)
+		}
+	}
+	// F10 C6 (A10 W2-06): the volume OSD rides the ACTION tell now (mpv-side
+	// ShowText, shown only when the volume actually changed) — the pin keeps
+	// asserting that every local action announces itself, on its new lane.
+	wantVol := []string{"vol +5%", "vol -5%"}
+	if len(pl.mpvOsd) != len(wantVol) {
+		t.Fatalf("volume OSD hints: %v, want %v", pl.mpvOsd, wantVol)
+	}
+	for i := range wantVol {
+		if pl.mpvOsd[i] != wantVol[i] {
+			t.Fatalf("volume OSD hints: %v, want %v", pl.mpvOsd, wantVol)
 		}
 	}
 	// the volume/mute are local: the room may only have heard the seek

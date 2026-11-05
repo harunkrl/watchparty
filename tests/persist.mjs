@@ -88,6 +88,17 @@ const restart = async () => {
   await waitUp();
 };
 
+// restartWith: kill the server FIRST, then write the state file, then
+// start — the exit-time write of a running server would otherwise
+// overwrite the hand-written snapshot (the write happens on the kill).
+const restartWith = async (saved) => {
+  server.kill();
+  await waitDown();
+  writeFileSync(STATE_FILE, JSON.stringify(saved));
+  server = start();
+  await waitUp();
+};
+
 const cleanup = async (code) => {
   try { chmodSync(dir, 0o700); } catch {} // a locked dir would block the rm
   await stopServer(server, dir); // kill -> wait for the exit -> rm (F6/C1)
@@ -154,6 +165,27 @@ try {
   } else {
     console.log('SKIP: the m2-503 scenario needs a non-root runner (root reads through a locked dir)');
   }
+
+  // F10 S3 (B1-1 + M2-02): the paused flag restores INDEPENDENTLY of the
+  // position. A room that was paused while it had no position yet (a lone
+  // follower paused it; no clock owner ever beat) must come back PAUSED.
+  // The strict compare also kills the coercion nit: a hand-corrupted
+  // paused:"false" must NOT become a pause.
+  await restartWith({ now: 'x.mp4', queue: [], pos: null, paused: true, wall: Date.now() });
+  const h6 = await grabHello();
+  assert.equal(h6.p, true, `the paused room lost its pause across the restart: ${JSON.stringify(h6)}`);
+  assert.equal(h6.pos, undefined, `the room has no position — the hello must not invent one: ${JSON.stringify(h6)}`);
+
+  // a numeric position keeps the pause and the position
+  await restartWith({ now: 'x.mp4', queue: [], pos: 12, paused: true, wall: Date.now() });
+  const h7 = await grabHello();
+  assert.equal(h7.p, true, `the restored room lost its pause: ${JSON.stringify(h7)}`);
+  assert.equal(h7.pos, 12, `the restored position moved: ${JSON.stringify(h7)}`);
+
+  // a hand-corrupted paused:"false" is not a pause (the strict compare)
+  await restartWith({ now: 'x.mp4', queue: [], pos: 12, paused: 'false', wall: Date.now() });
+  const h8 = await grabHello();
+  assert.equal(h8.p, false, `the string "false" was coerced into a pause: ${JSON.stringify(h8)}`);
 
   console.log('PASS: room state persisted across restarts, vanished files filtered');
   await cleanup(0);

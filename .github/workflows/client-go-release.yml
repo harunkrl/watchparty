@@ -66,7 +66,7 @@ jobs:
           # still fail twice
           for s in smoke persist audit_server audit2_server audit3_server \
                    f2_server f1_server integration pause_sync \
-                   stall_family master_restart soak f6_server \
+                   stall_family master_restart soak f6_server f10_server \
                    status_render room_pause; do
             # this block runs from the repo ROOT (see working-directory
             # below) — NOT the ../tests path the client-go steps use
@@ -82,8 +82,12 @@ jobs:
       # battery, so in the release gate it could never upload anything.
       # It is LAST now, and always() makes it fire even when the job was
       # cancelled after a failure.
+      # B3-3: failure() is FALSE on a CANCELLED (timeout) run, so the
+      # flake forensics logs vanished exactly when they were needed.
+      # always() alone keeps them; a clean first try rm's its own log
+      # (tests/ci_retry.sh), so a green run uploads nothing.
       - name: upload the test logs on failure
-        if: always() && failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ github.job }}-${{ github.run_attempt }}
@@ -110,8 +114,12 @@ jobs:
 
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes
+      # B3-3: failure() is FALSE on a CANCELLED (timeout) run, so the
+      # flake forensics logs vanished exactly when they were needed.
+      # always() alone keeps them; a clean first try rm's its own log
+      # (tests/ci_retry.sh), so a green run uploads nothing.
       - name: upload the test logs on failure
-        if: always() && failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ github.job }}-${{ github.run_attempt }}

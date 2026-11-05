@@ -1,5 +1,59 @@
 # Changelog
 
+## v1.9.2 — a room that hears every pause
+
+- client (sync): a pause pressed in the mpv window during the first
+  seconds after a load now reaches the room — v1.9.1's flat 5-second
+  machinery gate swallowed it silently, and a master joining later
+  resumed the film over the user's head; the gate now HOLDS the claim
+  and lets the next poll prove it against the player's real state (a
+  genuine pause posts, loadfile noise is discarded), and the same gate
+  no longer lets mpv's delayed start-up "play" un-pause a paused room
+- client (sync): a pause/play whose POST never reached the room (a dead
+  link) no longer sticks — the engine rolls its mirrors back and the
+  system pane says "try again"; v1.9.1 left you locally paused against
+  a playing room with no self-heal
+- client (sync): a load that mpv refuses no longer keeps a poisoned
+  memory of "what we are playing" — a reconnect with the same file
+  retries the load now instead of promising a heal that could not happen
+- client (sync): a master that joins a paused room adopts the room's
+  direction as its own toggle baseline — pressing play now posts play
+  (v1.9.1 posted "pause", visible in the room as the wrong-direction
+  "> pause by M" line)
+- client (ui): the /sub attach rides the engine's tell lane — a wedged
+  mpv can no longer freeze the whole TUI for the 2-second write deadline
+  while attaching a subtitle
+- client (ui): the volume OSD rides the volume change itself — a dropped
+  keypress can no longer leave an on-screen "vol +5%" for a change that
+  never happened
+- client (ui): a queue advance clears the old film's clock — the bar
+  shows the honest "no position yet" instead of the previous film's
+  position painted under the new file's name
+- client (sync): a postQueue overflow during an outage now LOGS every
+  dropped event instead of discarding silently, and its comment states
+  the real semantics (the in-flight post survives, a queued position
+  collapses to the tail — discrete events are the casualties)
+- client (sync): a scrub landing in the load window says so in the log
+  instead of vanishing without a word
+- server: a seek from a stale or wrong-file client can no longer steer
+  the room — seek was the only steering command with no gates
+- server: typed garbage on a known wire field (p, dur, file, from,
+  name…) is dropped with a log line instead of committing garbage state
+  AND broadcasting it — the Go client used to drop the whole event on
+  the type error, so the room moved on without its listeners
+- server: a paused room stays paused across a restart, even when it
+  has no position yet (a lone follower's pause used to vanish), and a
+  hand-corrupted paused:"false" no longer reads as a pause
+- server: a follower's seek now lands in the room state — a late
+  joiner starts at the seek target instead of the pre-seek position
+- server: a newly loaded file starts playing — the old film's pause no
+  longer rides into the next one for the first heartbeat's window
+- server: PORT=0 picks an ephemeral port instead of silently becoming
+  8090
+- ci: the retry-log artifacts now upload on cancelled runs too — the
+  windows-flake forensics used to vanish exactly when a timeout
+  cancelled the job
+
 ## v1.9.1 — a room that answers to anyone in it
 
 - client (sync): a lone follower's pause now reaches the room —

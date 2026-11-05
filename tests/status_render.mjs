@@ -312,6 +312,13 @@ try {
   master.kill('SIGKILL');
   log('the master is dead');
 
+  // F10 C5 (A10 tiebreak): everything painted from here until the NEW
+  // file's first position is the honest-gap window — v1.9.1 kept the OLD
+  // film's clock/bar alive under the new name for ~1.8s (the UI kept m.st
+  // while the engine had already moved on). setFile now clears the stale
+  // UiState, so the gap MUST paint the honest blank.
+  const fromGap = follower.bytes;
+
   // a.mp4 ends -> the follower posts 'ended' -> the queue advances -> the
   // follower loads b.mp4 (snap stays nil: no master sends heartbeats)
   const bPath = await waitUntil(async () => {    try {
@@ -322,6 +329,16 @@ try {
     }
   }, 45000, 'the queue advanced to b.mp4');
   log(`the queue advanced to ${bPath}`);
+
+  // the honest gap: between the load event and the new file's first poll,
+  // the TUI must have painted "no position yet" — not the old film's clock
+  const gapTail = flat(readFrom(outFile, fromGap));
+  assert.ok(
+    gapTail.includes('no position yet'),
+    `the load-to-first-poll gap did not paint the honest blank (a stale clock/bar survived the file change)\n` +
+      `--- gap frames ---\n${gapTail.slice(-1200)}`
+  );
+  log('the load gap painted the honest blank (no stale clock)');
 
   // the film really plays (the mpv position advances)
   const pos1 = await mpvCall(fSock, ['get_property', 'time-pos']);

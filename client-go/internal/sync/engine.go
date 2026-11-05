@@ -109,6 +109,9 @@ type Player interface {
 	StartLoad(name string) (string, error)
 	WaitLive(name string, deadline time.Time) bool
 	AttachSubs(name string)
+	// F10 C4 (A10 W2-03): the /sub attach rides the personal tell lane —
+	// never a raw write on the caller's thread.
+	AttachSub(name string) error
 	SetPause(paused bool) error
 	Seek(t float64) error
 	Speed(f float64) error
@@ -172,9 +175,15 @@ type Engine struct {
 	// lone follower's ctrl+space toggles against it, because lastPause
 	// only tracks ROOM events and is frozen false when no master exists.
 	localPause bool
-	wasActive  bool
-	pausedBy   string    // who paused the room (the relay's nick); "" = our own action
-	snap       *snapshot // follower: latest master position heartbeat
+	// F10 C1 (A10 W2-01+M2-09): a pause/unpause claimed inside the load's
+	// machinery window, awaiting a poll that proves mpv's real state.
+	// Match = a genuine user action, posted; mismatch = loadfile noise,
+	// discarded. heldAt is WALL time (mpv.State.At is wall-stamped).
+	heldPause *bool
+	heldAt    time.Time
+	wasActive bool
+	pausedBy  string    // who paused the room (the relay's nick); "" = our own action
+	snap      *snapshot // follower: latest master position heartbeat
 
 	loaded     string    // file our mpv is playing ("" = none; set on successful load)
 	loadedAt   time.Time // when mpv took the file: post-load seek posts are noise
@@ -233,7 +242,7 @@ func (e *Engine) post1(ev room.Event) error {
 		return nil
 	}
 	e.postOnce.Do(func() {
-		e.posts = newPostQueue()
+		e.posts = newPostQueue(e.logf)
 		go e.postLoop()
 	})
 	e.posts.push(ev)
@@ -249,7 +258,7 @@ func (e *Engine) postLoop() {
 		}
 		if err := e.Post(ev); err != nil {
 			e.logf("post: %s", err)
-			e.onPostFailed(ev)
+			e.onPostFailed(ev, err)
 		}
 		e.posts.done()
 	}
@@ -260,7 +269,20 @@ func (e *Engine) postLoop() {
 // the EXPECTED one there: re-arm, or the follower never seeks again and
 // never pauses the room: it would stay behind forever while the room
 // plays on (W3).
-func (e *Engine) onPostFailed(ev room.Event) {
+func (e *Engine) onPostFailed(ev room.Event, postErr error) {
+	if (ev.Type == "pause" || ev.Type == "play") && !ev.Mechanical {
+		// F10 C2 (A10 M2-05): a failed HUMAN pause/play must not leave the
+		// mirrors stuck — v1.9.1 kept postedPause set and nothing ever
+		// retried, so a lone follower stayed locally paused against a
+		// playing room with no self-heal. Roll the post mirrors back (the
+		// next toggle re-posts freely) and refuse visibly (the UI law).
+		e.mu.Lock()
+		e.postedPause = nil
+		e.lastPost = time.Time{}
+		e.mu.Unlock()
+		e.OSDShow(fmt.Sprintf("the %s didn't reach the room — try again", ev.Type), 3000)
+		e.logf("room: the %s never reached the room (%v) — try again", ev.Type, postErr)
+	}
 	if ev.Type != "pause" || !ev.Mechanical {
 		return
 	}
@@ -279,27 +301,30 @@ func (e *Engine) onPostFailed(ev room.Event) {
 	e.mechPause = false
 }
 
-// postQueue is an unbounded FIFO of events waiting for the network. It
-// never blocks its producer: the room's events must not be dropped (a
-// lost pause is a lost room state), and the queue only grows while the
-// server is unreachable.
+// postQueue is a bounded FIFO of events waiting for the network. It
+// never blocks its producer; when an outage piles more than postQueueMax
+// events, the oldest PENDING item dies — loudly, since F10 (A10 W2-02):
+// a silently lost pause/load is a room state the human never hears about.
 type postQueue struct {
 	mu    sync.Mutex
 	items []room.Event
 	busy  bool // a post is in flight
 	sig   chan struct{}
+	logf  func(format string, a ...any) // the engine's system pane (F10/W2-02)
 }
 
-func newPostQueue() *postQueue {
-	return &postQueue{sig: make(chan struct{}, 1)}
+func newPostQueue(logf func(format string, a ...any)) *postQueue {
+	return &postQueue{sig: make(chan struct{}, 1), logf: logf}
 }
 
 // push appends an event and wakes the worker.
 // F6-A3: a queued position is superseded by any newer one — the heartbeat
 // flood collapses to exactly the latest position, landed at the TAIL so
 // the discrete events (seeks/pauses, which keep their order) execute
-// first; a pure discrete flood clamps at postQueueMax (the oldest item
-// dies, a queued position dying before any discrete).
+// first. A pure discrete flood clamps at postQueueMax: the oldest
+// PENDING item dies (the IN-FLIGHT one is exempt — the worker already
+// owns it), and a coalesced position therefore SURVIVES while a discrete
+// is the casualty. F10 (A10 W2-02): the drop is logged, not silent.
 func (q *postQueue) push(ev room.Event) {
 	q.mu.Lock()
 	if ev.Type == "position" {
@@ -317,8 +342,12 @@ func (q *postQueue) push(ev room.Event) {
 		q.items = append(q.items, ev)
 	}
 	for len(q.items) > postQueueMax {
+		dropped := q.items[0]
 		q.items = q.items[1:] // F6-A3: the oldest dies; the coalesced tail
 		// position only reaches here once 64 newer events made it stale
+		if q.logf != nil {
+			q.logf("post: queue overflow dropped the oldest %s (cap %d) — it may never reach the room", dropped.Type, postQueueMax)
+		}
 	}
 	q.mu.Unlock()
 	select {
@@ -376,7 +405,7 @@ func (e *Engine) Drain(timeout time.Duration) bool {
 	// the Once gives the happens-before: the queue is created (and the
 	// worker started) exactly once, whoever gets here first
 	e.postOnce.Do(func() {
-		e.posts = newPostQueue()
+		e.posts = newPostQueue(e.logf)
 		go e.postLoop()
 	})
 	deadline := time.Now().Add(timeout)
@@ -408,6 +437,7 @@ const (
 	tellSubDelay
 	tellOSDText
 	tellOSDHint
+	tellSubAttach // F10 C4: the /sub attach rides the personal lane (W2-03)
 )
 
 func (k tellKind) String() string {
@@ -428,6 +458,8 @@ func (k tellKind) String() string {
 		return "osd"
 	case tellOSDHint:
 		return "osd-hint"
+	case tellSubAttach:
+		return "sub-attach"
 	}
 	return "tell"
 }
@@ -601,6 +633,13 @@ func (e *Engine) execTell(t tell) {
 		err = e.Player.Speed(t.f)
 	case tellVolume:
 		err = e.Player.SetVolume(t.f)
+		// F10 C6 (A10 W2-06): the OSD rides the SAME tell as the action —
+		// drop-oldest can no longer kill the action and keep an OSD that
+		// claims a change that never happened. Only a successful change
+		// is announced.
+		if err == nil && t.s != "" {
+			err = e.Player.ShowText(t.s, t.ms)
+		}
 	case tellMute:
 		err = e.Player.ToggleMute()
 	case tellSubDelay:
@@ -613,6 +652,8 @@ func (e *Engine) execTell(t tell) {
 		err = e.Player.ShowText(t.s, t.ms)
 	case tellOSDHint:
 		err = e.Player.ShowSubDelayHint()
+	case tellSubAttach:
+		err = e.Player.AttachSub(t.s)
 	}
 	if err != nil {
 		e.logf("mpv: %s (%s tell)", err, t.kind)
@@ -767,6 +808,11 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 			e.postedPause = &p
 			e.pausedBy = "" // the snapshot names no actor: honest empty
 		}
+		// F10 C6 (A10 M2-06): the adopted room truth is also the master's
+		// toggle baseline — without it the first toggle posted the WRONG
+		// direction (the "> pause by M" signature: a master joins a paused
+		// room, presses play, and the room hears pause).
+		e.lastPause = ev.P
 	case "load":
 		if ev.Name != e.loaded {
 			e.startLoad(ev.Name)
@@ -849,8 +895,14 @@ func (e *Engine) startLoad(name string) {
 	// the room could be paused for a "stall" that is just the new head)
 	e.snap = nil
 	e.pendingPos = nil
+	e.heldPause = nil // a new file's window starts clean: the old claim is stale
 	if _, err := e.Player.StartLoad(name); err != nil {
 		e.logf("mpv: %s", err)
+		// F10 C3 (A10 W2-05): the claim above was SPECULATIVE — a failed
+		// load must not keep it, or a same-file hello can never reload
+		// (ev.Now != e.loaded stays false) and the promised heal is dead.
+		e.loaded = ""
+		e.loadedAt = time.Time{}
 		return
 	}
 	go e.continueLoad(name, e.Clock.Now().Add(loadSettle))
@@ -1033,7 +1085,10 @@ func (e *Engine) volumeNudge(delta float64) {
 	// F8: the write rides the tell worker — the log names the EXPECTED
 	// value (the next poll names the real one; a worker-side error is
 	// logged there as "mpv: ... (volume tell)").
-	e.tell(tell{kind: tellVolume, f: delta})
+	// F10 C6 (A10 W2-06): the OSD text rides the SAME tell (execTell
+	// shows it only when the volume actually changed).
+	text := fmt.Sprintf("vol %+.0f%%", delta)
+	e.tell(tell{kind: tellVolume, f: delta, s: text, ms: 1500})
 	e.logf("> vol %+.0f", delta)
 }
 
@@ -1083,6 +1138,20 @@ func (e *Engine) SubDelaySet(v float64) {
 	e.logf("> subdelay %.1f", v)
 }
 
+// SubAttach queues one /sub attach on the personal tell lane. F10 C4
+// (A10 W2-03): the UI thread used to raw-write the sub-add command — a
+// wedged mpv held the whole TUI for the 2s write deadline. Enqueue-only,
+// personal (never posted to the room), errors logged by the worker.
+func (e *Engine) SubAttach(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Player == nil {
+		return
+	}
+	e.tell(tell{kind: tellSubAttach, s: name})
+	e.logf("> sub %s queued to the player", name)
+}
+
 // OnMpvp is the poll tick (POLL_SECS cadence), client.py poll_loop parity.
 func (e *Engine) OnMpvp(s mpv.State) {
 	e.mu.Lock()
@@ -1111,6 +1180,26 @@ func (e *Engine) OnMpvp(s mpv.State) {
 		e.Clock.Since(e.lastActuate) < 3*time.Second
 	if !stale {
 		e.localPause = s.Pause
+	}
+	// F10 C1: reconcile a held window claim against mpv's REAL sampled
+	// state. Match = a genuine user pause/unpause: post it through the
+	// follower rules. Mismatch = loadfile noise (the claimed state never
+	// happened): discard. A sample older than the claim is pre-change —
+	// keep the hold for the next poll. A PRE-ACTUATION sample (master-2's
+	// race: the sample disagrees with a pending SetPause) is not the true
+	// state — proving the claim against it matched "playing" and posted
+	// play to a paused room; skip and keep the hold for the post-actuation
+	// poll.
+	if !stale && e.heldPause != nil && (s.At.IsZero() || !s.At.Before(e.heldAt)) {
+		// shortcut: `stale` is a 3s time box from the tell ENQUEUE — two or
+		// more wedged tells can delay the actuation past it and re-open the
+		// race; upgrade to a pending flag cleared on tell completion if the
+		// field ever reports it
+		held := *e.heldPause
+		e.heldPause = nil
+		if held == s.Pause {
+			e.postFollowerPauseLocked(held)
+		}
 	}
 	e.muted = s.Muted // the mute log names the state we expect (F5)
 	// EOF transition (either role): at idle mpv keeps pause=false and drops
@@ -1229,62 +1318,39 @@ func (e *Engine) onMpvEventLocked(name string) (after func()) {
 			}
 			return
 		}
-		// follower: post only when the room does not know this state yet
-		// (a matching snapshot means this pause came from the room itself)
-		if e.snap == nil {
-			// F9 lone follower: no master is listening, but a later one
-			// must not silently revert this pause — POST it. The
-			// value+recency gate eats the echo of our own actuation
-			// (same value inside the grace) while a NEW opposite pause
-			// still posts (a stale postedPause must not swallow it).
-			// Observer-machinery window: mpv's pause events before/at a
-			// file start (the observe_property INITIAL event fires at
-			// ENGINE START — loadedAt zero — and races the hello) are
-			// noise the engine never actuated; they must not reach the
-			// room. A genuine mpv-window pause REQUIRES a playing file,
-			// so the zero case is machinery too. The mirror still learns
-			// the local truth; after the window real events post.
-			if e.loadedAt.IsZero() || e.Clock.Since(e.loadedAt) < loadQuiet {
-				e.localPause = wantPause
-				return
-			}
-			if e.postedPause != nil && *e.postedPause == wantPause &&
-				!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
-				e.localPause = wantPause
-				return
-			}
+		// F10 C1 (A10 W2-01+M2-09): the observer-registration initial event
+		// at ENGINE START names no file — pure machinery, discard — but ONLY
+		// with no room snapshot: a snapshot + no file means the room's own
+		// truth is live and a pause event is a genuine action (the
+		// simultaneous-pause pin).
+		if e.snap == nil && e.loadedAt.IsZero() {
+			e.localPause = wantPause
+			return
+		}
+		// F10 C1: the machinery window — mpv's loadfile/observer noise AND
+		// a genuine window-key pause both land here before the file's first
+		// position. HOLD the claim: the next poll proves it against mpv's
+		// real state (match = post, mismatch = noise, discarded). The old
+		// flat 5s swallow ate genuine pauses forever (W2-01) while the
+		// snap!=nil side posted machinery "play" at a paused room (M2-09).
+		// No file (loadedAt zero) is handled above / never a window.
+		if !e.loadedAt.IsZero() && e.Clock.Since(e.loadedAt) < loadQuiet {
 			e.localPause = wantPause
 			p := wantPause
-			e.postedPause = &p
-			e.lastPost = e.Clock.Now()
-			e.postDiscrete(room.Event{Type: typ})
+			e.heldPause = &p
+			e.heldAt = time.Now()
 			return
 		}
-		if e.snap.paused == wantPause {
-			return
-		}
-		// our own post is still pending: a heartbeat that was in flight
-		// overwrote the snapshot mirror, and the late echo of our own
-		// apply must not post the same state again (the room would
-		// apply it twice)
-		if e.postedPause != nil && *e.postedPause == wantPause &&
-			!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
-			return
-		}
-		e.lastPost = e.Clock.Now()
-		// mirror our post into the snapshot: the next heartbeat still carries
-		// the pre-post state, and without the mirror a quick opposite-direction
-		// user move is swallowed by the check above (python room_pause parity)
-		e.snap.paused = wantPause
-		p := wantPause
-		e.postedPause = &p
-		e.postDiscrete(room.Event{Type: typ})
+		e.postFollowerPauseLocked(wantPause)
 	case "seek":
 		if !e.loadedAt.IsZero() && e.Clock.Since(e.loadedAt) < loadQuiet {
 			// a fresh loadfile makes mpv emit a seek at the file head;
 			// posting it would rewind the room to ~0 (late-join race, a
 			// demoted impostor's own /play). shortcut: user scrubs inside
 			// the window self-heal via the master heartbeat
+			// F10 C6 (A10 W2-04): the swallow is now LOGGED — a silent
+			// no-op explains nothing (the lone-scrub skip logs the same way)
+			e.logf("scrub stays local — the file is still settling (loadQuiet)")
 			return
 		}
 		// capture what the post needs; the settle + read run off the lock
@@ -1292,6 +1358,51 @@ func (e *Engine) onMpvEventLocked(name string) (after func()) {
 		after = func() { e.postScrub(master, hasSnap) }
 	}
 	return
+}
+
+// postFollowerPauseLocked applies the follower's pause-post rules for a
+// pause/unpause mpv event or a reconciled hold: the value+recency dedup
+// eats the echo of our own actuation (same value inside the grace), a
+// matching snapshot means the room already knows, everything else posts.
+// Extracted by F10 C1 — the machinery window and the reconciliation both
+// funnel here. Caller holds e.mu.
+func (e *Engine) postFollowerPauseLocked(wantPause bool) {
+	typ := "pause" // wire types are play/pause, mpv says pause/unpause
+	if !wantPause {
+		typ = "play"
+	}
+	if e.snap == nil {
+		if e.postedPause != nil && *e.postedPause == wantPause &&
+			!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+			e.localPause = wantPause
+			return
+		}
+		e.localPause = wantPause
+		p := wantPause
+		e.postedPause = &p
+		e.lastPost = e.Clock.Now()
+		e.postDiscrete(room.Event{Type: typ})
+		return
+	}
+	if e.snap.paused == wantPause {
+		return
+	}
+	// our own post is still pending: a heartbeat that was in flight
+	// overwrote the snapshot mirror, and the late echo of our own
+	// apply must not post the same state again (the room would
+	// apply it twice)
+	if e.postedPause != nil && *e.postedPause == wantPause &&
+		!e.lastPost.IsZero() && e.Clock.Since(e.lastPost) < followerGrace {
+		return
+	}
+	e.lastPost = e.Clock.Now()
+	// mirror our post into the snapshot: the next heartbeat still carries
+	// the pre-post state, and without the mirror a quick opposite-direction
+	// user move is swallowed by the check above (python room_pause parity)
+	e.snap.paused = wantPause
+	p := wantPause
+	e.postedPause = &p
+	e.postDiscrete(room.Event{Type: typ})
 }
 
 // postScrub settles (time-pos must reach the scrub target) and reads the

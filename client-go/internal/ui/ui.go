@@ -313,6 +313,11 @@ func (m Model) fetchDuration(name string) tea.Cmd {
 // background.
 func (m Model) setFile(name string) (Model, tea.Cmd) {
 	m.now = name
+	// F10 C5 (A10 tiebreak): the old film's clock must not paint under the
+	// new name — no UiState exists for this file yet, so every frame in the
+	// gap renders the honest "no position yet" until the engine's first
+	// sample lands.
+	m.st = nil
 	if d, ok := m.durCache[name]; ok {
 		// known duration: the bar renders instantly, but the file behind
 		// the name may have been replaced (a new cut of the same film) —
@@ -423,7 +428,12 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		if !slices.Contains(msg.subs, msg.name) {
 			return m.failf("no such subtitle for %s (try bare /sub)", msg.video)
 		}
-		if err := m.player.AttachSub(msg.name); err != nil {
+		// F10 C4 (A10 W2-03): the attach rides the personal tell lane — a
+		// wedged mpv can no longer hold the Update thread for the 2s write
+		// deadline. Worker-side errors land in the system pane.
+		if m.engine != nil {
+			m.engine.SubAttach(msg.name)
+		} else if err := m.player.AttachSub(msg.name); err != nil {
 			return m.failf("sub attach failed: %v", err)
 		}
 		m.osd("sub " + msg.name)
@@ -587,12 +597,13 @@ func (m Model) inputKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+up", "ctrl+down": // F5: LOCAL volume — never posted to the room
 		if m.engine != nil {
+			// F10 C6 (A10 W2-06): the OSD text rides the SAME tell as the
+			// action (volumeNudge carries it) — a dropped action can no
+			// longer leave an OSD claiming a change that never happened.
 			if msg.String() == "ctrl+up" {
 				m.engine.VolumeUp()
-				m.osd(fmt.Sprintf("vol %+.0f%%", volStepUI))
 			} else {
 				m.engine.VolumeDown()
-				m.osd(fmt.Sprintf("vol %+.0f%%", -volStepUI))
 			}
 		}
 		return m, nil

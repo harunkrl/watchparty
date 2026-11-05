@@ -48,8 +48,12 @@ jobs:
       # (the windows flake class lives in go test) never left the
       # runner. It is the last step of the job, and always() makes it
       # fire even when the job was cancelled after a failure.
+      # B3-3: failure() is FALSE on a CANCELLED (timeout) run, so the
+      # flake forensics logs vanished exactly when they were needed.
+      # always() alone keeps them; a clean first try rm's its own log
+      # (tests/ci_retry.sh), so a green run uploads nothing.
       - name: upload the test logs on failure
-        if: always() && failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ github.job }}-${{ github.run_attempt }}
@@ -78,8 +82,12 @@ jobs:
 
       # F6/C3: the retry must not hide the flake — the failed run's logs
       # become an artifact, so the flake hunt finally has eyes
+      # B3-3: failure() is FALSE on a CANCELLED (timeout) run, so the
+      # flake forensics logs vanished exactly when they were needed.
+      # always() alone keeps them; a clean first try rm's its own log
+      # (tests/ci_retry.sh), so a green run uploads nothing.
       - name: upload the test logs on failure
-        if: always() && failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ github.job }}-${{ github.run_attempt }}
@@ -144,6 +152,10 @@ jobs:
       - run: tests/ci_retry.sh node tests/persist.mjs
       # F6: the server pins (backpressure, stale gate, flush chain, backup)
       - run: tests/ci_retry.sh node tests/f6_server.mjs
+      # F10: the v1.9.2 server pins (seek gates, the p type gate, the
+      # paused restore, the seek persist, the file-change pause reset,
+      # PORT=0)
+      - run: tests/ci_retry.sh node tests/f10_server.mjs
       - run: |
           # adversarial audit pins (server-only, no mpv needed)
           tests/ci_retry.sh node tests/audit_server.mjs
@@ -178,8 +190,12 @@ jobs:
       # failure in exactly the timing-sensitive suites it exists for
       # never reached the upload. It is LAST now, and always() makes it
       # fire even when the job was cancelled after a failure.
+      # B3-3: failure() is FALSE on a CANCELLED (timeout) run, so the
+      # flake forensics logs vanished exactly when they were needed.
+      # always() alone keeps them; a clean first try rm's its own log
+      # (tests/ci_retry.sh), so a green run uploads nothing.
       - name: upload the test logs on failure
-        if: always() && failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ github.job }}-${{ github.run_attempt }}

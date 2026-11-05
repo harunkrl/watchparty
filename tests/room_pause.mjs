@@ -395,6 +395,63 @@ await scenario('[F9-3] an unknown key sequence leaves a VISIBLE reason', async (
   }
 });
 
+// ---------------------------------------------------------------- D
+await scenario('[F10-1] an mpv-window pause 2s after the load reaches the room and survives a master join', async () => {
+  // A10 W2-01: v1.9.1's flat 5s machinery gate swallowed THIS pause
+  // forever (the room stayed playing and a later master silently resumed
+  // the user's mpv — the round's headline). The C1 hold must post it at
+  // the proving poll. Scenario independence: B left the room paused —
+  // resume first (B's own rule).
+  await post({ type: 'play', from: 'F-2', nick: 'f' });
+  const outFile = join(dir, 'followerD.tui');
+  const follower = startFollower(outFile, 'F');
+  procs.push(follower);
+  let master = null;
+  try {
+    const clientPid = await childPid(follower.pid);
+    const fSock = await waitUntil(() => mpvSocket(clientPid), 15000, 'the follower mpv socket');
+    await waitUntil(async () => (await mpvCall(fSock, ['get_property', 'time-pos'])) > 0.5, 20000, 'the follower plays');
+    await sleep(2000); // ≈2s after the load: inside the machinery window
+    log('D: SPACE in the mpv window (2s after the load, inside loadQuiet)');
+    await mpvCall(fSock, ['set_property', 'pause', true]);
+
+    // the hold posts at the proving poll — WAIT, never assert instantly
+    let reached = false;
+    for (let i = 0; i < 60; i++) {
+      if ((await health()).paused) {
+        reached = true;
+        break;
+      }
+      await sleep(500);
+    }
+    assert.equal(reached, true, 'the mpv-window pause inside loadQuiet never reached the room (W2-01)');
+    assert.equal(await mpvCall(fSock, ['get_property', 'pause']), true, 'the follower did not stay paused');
+    log('D: the room heard the pause');
+
+    // the silent-revert is dead too: a master joins, the pause SURVIVES
+    master = spawn(BIN, ['--headless', '--master', '--name', 'M', BASE], {
+      env: { ...process.env, WATCHPARTY_MPV: MPV_ARGS },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    procs.push(master);
+    await waitUntil(async () => (await health()).listeners === 2, 15000, 'the master joined');
+    await sleep(6000); // three master heartbeats
+    const h = await health();
+    const fPaused = await mpvCall(fSock, ['get_property', 'pause']).catch(() => 'n/a');
+    assert.equal(h.paused, true, `the master erased the follower's pause: ${JSON.stringify(h)}`);
+    assert.equal(fPaused, true, `the follower was silently resumed when the master joined: pause=${fPaused}`);
+    log('D: the pause survived the master join');
+  } finally {
+    for (const p of [follower, master]) {
+      if (!p) continue;
+      try {
+        execSync(`pkill -TERM -P ${p.pid}`);
+      } catch {}
+      p.kill();
+    }
+  }
+});
+
 for (const [st, name] of results) console.log(`${st}  ${name}`);
 const fails = results.filter(([st]) => st === 'FAIL').length;
 console.log(`room_pause: ${results.length - fails}/${results.length} held`);

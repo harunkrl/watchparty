@@ -9,7 +9,15 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const PORT = Number(process.env.PORT) || 8090;
+// B1-3: PORT=0 is a real request ("pick an ephemeral port"), not a falsy
+// value: Number(env)||8090 turned it into 8090. A garbage PORT still
+// falls back to the default (a NaN port would crash the listen).
+const PORT = (() => {
+  const raw = process.env.PORT;
+  if (raw === undefined || raw === '') return 8090;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : 8090;
+})();
 const VIDEOS = path.resolve(process.env.VIDEOS_DIR || path.join(__dirname, 'videos'));
 // resolved lazily on first /v or /sub request: the videos dir may not exist at boot
 let realBase;
@@ -240,9 +248,15 @@ const persistAndExit = () => {
   state.queue = Array.isArray(saved.queue) ? saved.queue.filter(onDisk) : [];
   if (saved.now && onDisk(saved.now)) {
     state.now = saved.now;
+    // F10 S3 (B1-1 + M2-02): the paused flag restores INDEPENDENTLY of
+    // the position (F9's handoff, across a restart): a room that was
+    // paused while it had no position yet must come back PAUSED — the
+    // restore nested the pause inside the pos-valid branch and lost it.
+    // The strict compare also kills the coercion nit: a hand-corrupted
+    // paused:"false" is not a pause.
+    state.paused = saved.paused === true;
     if (typeof saved.pos === 'number' && Number.isFinite(saved.pos) && saved.pos >= 0) {
       state.pos = saved.pos;
-      state.paused = !!saved.paused;
       // F2: a garbage wall must not NaN the age (hello.pos serialized as null)
       const wall = typeof saved.wall === 'number' && Number.isFinite(saved.wall) ? saved.wall : Date.now();
       state.posAt = mono() - Math.max(0, Date.now() - wall);
@@ -384,6 +398,7 @@ function advanceQueue(byNick) {
     state.now = state.queue.shift();
     state.pos = null; // positions belong to the previous file
     state.dur = null; // so does its duration
+    state.paused = false; // F10 S5 (B1-4): a newly loaded file starts playing
     const ev = { type: 'load', name: state.now, from: null };
     if (byNick) ev.nick = byNick; // actor nick (S-D); absent on restore/replay paths
     broadcast(ev);
@@ -415,6 +430,62 @@ setInterval(() => {
   for (const [id, at] of staleClients) if (mono() - at > STALE_TTL_MS) staleClients.delete(id);
 }, Math.max(1000, STALE_TTL_MS / 2)).unref();
 
+// the wrong-file gate (B2 for the positions, F10 S1 for the seeks): a post
+// that names ANOTHER file comes from a client still driving the previous
+// film — drop the post entirely and mark the poster stale for
+// STALE_TTL_MS. The notice is rate-limited (the stale master posts every
+// ~2s, so an unlimited notice would spam the room).
+const wrongFile = (cmd) => {
+  if (state.now === null || typeof cmd.file !== 'string' || cmd.file === state.now) return false;
+  if (cmd.from) {
+    // F7: the same cap-and-clear shape A5-3 gave impostorSeen: a forged
+    // POST-only id flood must not grow the map without bound
+    if (staleClients.size >= STALE_MAX) staleClients.clear();
+    staleClients.set(cmd.from, mono());
+  }
+  if (mono() - lastMovedOnNotice > 10000) {
+    lastMovedOnNotice = mono();
+    // P2-1: state.now is a client-supplied FILENAME — same trust
+    // boundary as every other notice text (w1-2 class)
+    broadcast({ type: 'notice', from: null, text: `the room moved on: now playing ${clean(state.now, 64)}` });
+  }
+  return true;
+};
+
+// F10 S2 (M2-04/B2-2 + master-2's class completion): the Go client decodes
+// EVERY event into the room.Event struct — a known field with the wrong
+// JSON type makes the client drop the WHOLE event (room.go: the decode
+// error skips the event), so the room advances while the clients miss it.
+// The server used to relay such a body raw (the p case: p:"no" committed
+// paused:true AND the raw body went out). These are the fields the client
+// decodes; a present field must have exactly its type. The server's own
+// broadcasts are typed by construction, and an UNKNOWN field keeps
+// relaying AS-IS (the wire law).
+const WIRE_TYPES = {
+  type: 'string', nick: 'string', text: 'string', name: 'string',
+  now: 'string', queue: 'strings', roster: 'strings', invite: 'string',
+  inviteAlt: 'string', t: 'number', p: 'boolean', dur: 'number',
+  file: 'string', from: 'string', pos: 'number', mechanical: 'boolean',
+};
+// wireTyped: the first known field with the wrong type, or null
+const wireTyped = (cmd) => {
+  for (const [field, want] of Object.entries(WIRE_TYPES)) {
+    const v = cmd[field];
+    if (v === undefined) continue; // absent: the field stays off the wire
+    if (want === 'string' && typeof v !== 'string') return field;
+    if (want === 'number' && (typeof v !== 'number' || !Number.isFinite(v))) return field;
+    if (want === 'boolean' && typeof v !== 'boolean') return field;
+    if (want === 'strings' && (!Array.isArray(v) || v.some((x) => typeof x !== 'string'))) return field;
+  }
+  return null;
+};
+
+// the drop log is RATE-LIMITED (the notice rate-limit's shape): a client
+// that floods typed cmds must not fill the server's stderr — the drop
+// itself is what matters, not one line per attempt.
+let lastDropLog = -Infinity;
+const DROP_LOG_MS = 1000;
+
 function handleCmd(cmd) {
   // F7: every cmd type carries a nick -> normalize it through the same
   // clean() the roster uses. A client-supplied nick is untrusted text:
@@ -433,6 +504,18 @@ function handleCmd(cmd) {
   if (cmd.type === 'play' || cmd.type === 'pause' || cmd.type === 'seek' || cmd.type === 'load') {
     cmd.nick = nickById.get(cmd.from); // undefined => field drops off the wire
   }
+  // F10 S2: the known-field type gate runs BEFORE any commit and before
+  // the broadcast — a body the client would drop must not reach the room.
+  const badField = wireTyped(cmd);
+  if (badField) {
+    if (mono() - lastDropLog > DROP_LOG_MS) {
+      lastDropLog = mono();
+      console.error(
+        `watchparty: dropped a ${clean(cmd.type || '', 24)} cmd — the field "${badField}" is not ${WIRE_TYPES[badField]}`
+      );
+    }
+    return;
+  }
   switch (cmd.type) {
     case 'chat':
       chatLog.push({ type: 'chat', nick: cmd.nick, text: cmd.text, from: cmd.from });
@@ -444,7 +527,19 @@ function handleCmd(cmd) {
       // state.pos (and every late joiner's hello.pos) gets poisoned with
       // strings/objects
       if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t) || cmd.t < 0) break;
+      // F10 S1 (M2-03): seek is a steering type — it gets the gates the
+      // other steering types have: a stale client cannot steer the room,
+      // and a post that names another file is dropped (the wrong-file
+      // gate's shape + notice).
+      if (isStale(cmd.from)) break;
+      if (wrongFile(cmd)) break;
+      // F10 S4 (B1-2): the relayed seek must also land in the room state —
+      // a late joiner's hello carried the pre-seek position (pos/posAt
+      // already exist in the persisted shape: no format change).
+      state.pos = cmd.t;
+      state.posAt = mono();
       broadcast(cmd, cmd.from);
+      saveState();
       break;
     case 'play':
     case 'pause':
@@ -455,30 +550,12 @@ function handleCmd(cmd) {
       break;
     case 'position':
       if (typeof cmd.t !== 'number' || !Number.isFinite(cmd.t) || cmd.t < 0) break; // same trust boundary as seek
-      // F3: a position post may name its file (new clients). When it names a
-      // DIFFERENT file than state.now, the poster is an old master still
-      // driving the previous film: drop the post ENTIRELY — no state.pos
-      // overwrite, no claim refresh — and tell the human (rate-limited).
+      // F3/B2: a post that names another file comes from a client still
+      // driving the previous film — drop the post ENTIRELY (no state.pos
+      // overwrite, no claim refresh) and tell the human (rate-limited).
       // No `file` = old client = exactly the file-agnostic behavior; an
       // idle room has no file to protect, so the gate stays off there.
-      if (state.now !== null && typeof cmd.file === 'string' && cmd.file !== state.now) {
-        // B2: the poster is an old master driving the previous film — it
-        // loses its steering rights for STALE_TTL_MS
-        if (cmd.from) {
-          // F7: the same cap-and-clear shape A5-3 gave impostorSeen: a
-          // forged POST-only id flood must not grow the map without bound
-          // (the TTL sweep only bounds the RATE, not a burst)
-          if (staleClients.size >= STALE_MAX) staleClients.clear();
-          staleClients.set(cmd.from, mono());
-        }
-        if (mono() - lastMovedOnNotice > 10000) {
-          lastMovedOnNotice = mono();
-          // P2-1: state.now is a client-supplied FILENAME — same trust
-          // boundary as every other notice text (w1-2 class)
-          broadcast({ type: 'notice', from: null, text: `the room moved on: now playing ${clean(state.now, 64)}` });
-        }
-        break;
-      }
+      if (wrongFile(cmd)) break;
       if (!isClockOwner(cmd.from)) break;
       state.pos = cmd.t;
       state.paused = !!cmd.p;
@@ -495,6 +572,7 @@ function handleCmd(cmd) {
       state.now = cmd.name;
       state.pos = null; // old file's position is meaningless now
       state.dur = null; // so is its duration
+      state.paused = false; // F10 S5 (B1-4): a newly loaded file starts playing
       state.queue = state.queue.filter((n) => n !== cmd.name);
       broadcast(cmd, cmd.from);
       // B2: same rebroadcast as advanceQueue — clients must see the playing
@@ -638,9 +716,9 @@ const server = http.createServer((req, res) => {
     const hello = {
       type: 'hello', now: state.now, queue: state.queue,
       roster: [...new Set(nickById.values())],
-      invite: `http://${inviteHost}:${PORT}`,
+      invite: `http://${inviteHost}:${realPort()}`,
     };
-    if (inviteHostAlt) hello.inviteAlt = `http://${inviteHostAlt}:${PORT}`; // absent when there is no second address
+    if (inviteHostAlt) hello.inviteAlt = `http://${inviteHostAlt}:${realPort()}`; // absent when there is no second address
     // F9 item 2 (A9 S1 CASE B): the room's paused flag travels AS-IS and
     // INDEPENDENTLY of the position. A room that is paused but has no
     // position yet (a lone follower paused it; no clock owner ever beat)
@@ -756,6 +834,10 @@ const server = http.createServer((req, res) => {
   res.end();
 });
 
+// the real listening port: PORT=0 means "pick one for me" (B1-3), so the
+// boot log and the invite must carry the port the server actually got
+const realPort = () => server.address()?.port ?? PORT;
+
 // gap#5: tests require() this file for inviteHosts; only the real entry
 // point listens and registers signal handlers (I-2: a leaked persistAndExit
 // would exit(0) the REQUIRING process on its own SIGINT/SIGTERM)
@@ -764,6 +846,6 @@ if (require.main === module) {
   process.on('SIGTERM', persistAndExit);
   process.on('SIGINT', persistAndExit); // m2-S6: Ctrl-C on a manual run must persist too
   server.listen(PORT, () =>
-    console.log(`watchparty: serving ${VIDEOS} on http://0.0.0.0:${PORT} (tailnet only, no auth)`)
+    console.log(`watchparty: serving ${VIDEOS} on http://0.0.0.0:${realPort()} (tailnet only, no auth)`)
   );
 }

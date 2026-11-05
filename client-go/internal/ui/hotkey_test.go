@@ -14,23 +14,28 @@ import (
 
 // recPlayer records what the engine asked mpv to do.
 type recPlayer struct {
-	pauses  []bool
-	seeks   []float64
-	vols    []float64 // F5 local volume nudges
-	mutes   int       // F5 mute toggles
-	subAdds []float64 // v1.8.0 local subtitle-timing nudges
-	subSets []float64 // v1.8.0 absolute sub-delay sets
-	hints   int       // v1.8.0 sub-delay OSD hint asks (the template is mpv's to expand)
-	pos     float64
-	hasPos  bool
+	pauses   []bool
+	seeks    []float64
+	vols     []float64 // F5 local volume nudges
+	mutes    int       // F5 mute toggles
+	subAdds  []float64 // v1.8.0 local subtitle-timing nudges
+	subSets  []float64 // v1.8.0 absolute sub-delay sets
+	hints    int       // v1.8.0 sub-delay OSD hint asks (the template is mpv's to expand)
+	pos      float64
+	hasPos   bool
+	subNames []string // F10 C4: /sub attach asks (the tell lane owns the write)
+	mpvOsd   []string // F10 C6: OSD texts that rode an ACTION tell (volume)
 }
 
-func (p *recPlayer) Load(string) error          { return nil }
-func (p *recPlayer) SetPause(v bool) error      { p.pauses = append(p.pauses, v); return nil }
-func (p *recPlayer) Seek(t float64) error       { p.seeks = append(p.seeks, t); return nil }
-func (p *recPlayer) Speed(float64) error        { return nil }
-func (p *recPlayer) ShowText(string, int) error { return nil }
-func (p *recPlayer) ShowSubDelayHint() error    { p.hints++; return nil }
+func (p *recPlayer) Load(string) error     { return nil }
+func (p *recPlayer) SetPause(v bool) error { p.pauses = append(p.pauses, v); return nil }
+func (p *recPlayer) Seek(t float64) error  { p.seeks = append(p.seeks, t); return nil }
+func (p *recPlayer) Speed(float64) error   { return nil }
+func (p *recPlayer) ShowText(s string, ms int) error {
+	p.mpvOsd = append(p.mpvOsd, s)
+	return nil
+}
+func (p *recPlayer) ShowSubDelayHint() error { p.hints++; return nil }
 func (p *recPlayer) SetVolume(delta float64) error {
 	p.vols = append(p.vols, delta)
 	return nil
