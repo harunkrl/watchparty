@@ -206,13 +206,14 @@ func TestF10C2FailedPausePostRollsBack(t *testing.T) {
 
 	e.PauseToggle() // the POST fails
 	waitTells(t, e)
-	// wait for the ROLLBACK, not the attempt: tried()==1 can be observed
-	// in the tiny window before onPostFailed clears postedPause (the flake
-	// master-2's -race stress caught)
-	waitF10(t, "the failed attempt and its rollback", func() bool {
+	// wait for the RETRY STAMP, not the attempt: tried()==1 can be observed
+	// in a tiny window before onPostFailed stamps (the flake master-2's
+	// -race stress caught). F11 C1 r2: the failure STAMPS the direction —
+	// postedPause stays set by design (the echo guards stay armed).
+	waitF10(t, "the failed attempt and its stamp", func() bool {
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		return g.tried() == 1 && e.postedPause == nil
+		return g.tried() == 1 && e.retryTyp == "pause"
 	})
 
 	if logs.count("never reached the room") == 0 {
@@ -222,13 +223,23 @@ func TestF10C2FailedPausePostRollsBack(t *testing.T) {
 		t.Fatal("C2: no OSD refusal for the failed pause")
 	}
 
+	// F11 C1 (A11-F1, master-2's design) updated the contract AGAIN: the
+	// failure restores NOTHING — the mpv stays paused, the failure stamps
+	// the retry direction, and the retry posts the SAME direction the user
+	// intended (pause). v1.9.2-F11v1's "posts play" and F11v1's "restores
+	// the mpv" were both superseded.
+	tells := pl.pausesSnapshot()
+	if len(tells) != 1 || !tells[0] {
+		t.Fatalf("C2/F11: the failure must leave the mpv exactly as pressed: %v", tells)
+	}
+
 	g.fail = false
-	e.PauseToggle() // resume: must post play, not be echo-gated
+	e.PauseToggle() // the retry: must post PAUSE (the intended direction)
 	waitTells(t, e)
 	waitF10(t, "the retry", func() bool { return g.tried() == 2 })
 	wire := g.wire()
-	if len(wire) == 0 || wire[len(wire)-1].Type != "play" {
-		t.Fatalf("C2: the second toggle did not post play: %v", wire)
+	if len(wire) == 0 || wire[len(wire)-1].Type != "pause" {
+		t.Fatalf("C2: the second toggle did not re-post the intended pause: %v", wire)
 	}
 }
 

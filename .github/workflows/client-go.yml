@@ -35,7 +35,10 @@ jobs:
       # TestCleanQuitExitsZero pins the exit-code contract (clean=0) and
       # skips without mpv — the contract must be measured in CI, not
       # only locally (F2 review P2-2)
+      # F11 S3 (A11-F9 / #79a / #81a): the apt step gets its OWN budget —
+      # a stalled mirror must not eat the job's shared 15 minutes.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv
+        timeout-minutes: 5
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: ../tests/ci_retry.sh go test -race ./...
@@ -156,6 +159,12 @@ jobs:
       # paused restore, the seek persist, the file-change pause reset,
       # PORT=0)
       - run: tests/ci_retry.sh node tests/f10_server.mjs
+      # F11: the contract pins (the wire types vs room.Event, the cmd
+      # trace's rate limit, the CI budget's apt timeout) — all static or
+      # server-only, no mpv needed
+      - run: tests/ci_retry.sh node tests/wire_contract.mjs
+      - run: tests/ci_retry.sh node tests/f5_trace.mjs
+      - run: tests/ci_retry.sh node tests/ci_budget.mjs
       - run: |
           # adversarial audit pins (server-only, no mpv needed)
           tests/ci_retry.sh node tests/audit_server.mjs
@@ -166,7 +175,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client-go/go.mod
+      # F11 S3 (#79a / #81a): the same own-budget rule as the test job's
+      # apt — a stalled mirror must not eat the node job's budget.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
+        timeout-minutes: 5
       - run: go build -o watchparty .
         working-directory: client-go
       - run: |

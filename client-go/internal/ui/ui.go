@@ -430,13 +430,15 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		// F10 C4 (A10 W2-03): the attach rides the personal tell lane — a
 		// wedged mpv can no longer hold the Update thread for the 2s write
-		// deadline. Worker-side errors land in the system pane.
+		// deadline. F11 C4 (A11-F6): the OSD/pane line moved INSIDE the tell
+		// (shown only on attach success) — the enqueue no longer claims a
+		// change that has not happened.
 		if m.engine != nil {
 			m.engine.SubAttach(msg.name)
+			return m, nil
 		} else if err := m.player.AttachSub(msg.name); err != nil {
 			return m.failf("sub attach failed: %v", err)
 		}
-		m.osd("sub " + msg.name)
 		return m.logf("> sub %s attached (j switches tracks in the player window)", msg.name), nil
 	case filesMsg:
 		if msg.err != nil {

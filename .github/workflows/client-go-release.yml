@@ -46,7 +46,15 @@ jobs:
       # mpv before the go tests: TestCleanQuitExitsZero (exit-code
       # contract, clean=0) skips without it (F2 review P2-2); ffmpeg
       # is only needed by the node e2e suites below
+      # F11 S3 (A11-F9 / #79a / #81a): the apt step gets its OWN budget.
+      # #79a's cancel was exactly this step: a stalled mirror ate the
+      # job's shared 20 minutes and the gate never reached the tests.
+      # A11's CI forensics (#81a): the packing itself is far from the
+      # timeout (the green job: median 104s, max 474s of 1200s) — the
+      # SHARED budget was the fragile part. A stalled mirror now dies in
+      # 5 minutes instead of taking the tests with it.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq mpv ffmpeg
+        timeout-minutes: 5
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: ../tests/ci_retry.sh go test -race ./...
@@ -67,7 +75,8 @@ jobs:
           for s in smoke persist audit_server audit2_server audit3_server \
                    f2_server f1_server integration pause_sync \
                    stall_family master_restart soak f6_server f10_server \
-                   status_render room_pause; do
+                   status_render room_pause \
+                   wire_contract f5_trace ci_budget; do
             # this block runs from the repo ROOT (see working-directory
             # below) — NOT the ../tests path the client-go steps use
             tests/ci_retry.sh node tests/$s.mjs || exit 1
@@ -201,6 +210,9 @@ jobs:
           # MPV_TAG and checked against the digest vetted IN THE REPO — a
           # repackaged download must fail
           sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
+          # F11 S3 (#79a / #81a): the same own-budget rule as the test
+          # job's apt — a stalled mirror must not eat the release budget.
+          timeout-minutes: 5
           tagged=$(curl -sL \
             "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/$MPV_TAG")
           pick='mpv-x86_64-[0-9]' # plain x86_64; -v3- needs AVX-512, excluded

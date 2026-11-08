@@ -161,8 +161,11 @@ func TestCtrlSpaceDoesNotFreezeOnAHungServer(t *testing.T) {
 		t.Fatalf("the UI froze for %s on a hung server", el)
 	}
 	waitTells(t, e)
-	if len(pl.pauses) != 1 {
-		t.Fatalf("the room was not paused: %v", pl.pauses)
+	// F11: the failed post's restore actuation lands from the tell worker
+	// (the post's own timeout can fire mid-test) — read via the locked
+	// snapshot, never the raw slice.
+	if got := pl.pausesSnapshot(); len(got) != 1 || !got[0] {
+		t.Fatalf("the room was not paused: %v", got)
 	}
 }
 

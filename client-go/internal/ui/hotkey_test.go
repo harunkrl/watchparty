@@ -2,6 +2,7 @@ package ui
 
 import (
 	"math"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 // recPlayer records what the engine asked mpv to do.
 type recPlayer struct {
+	mu       stdsync.Mutex // F11: restore actuations arrive from the tell worker AFTER a test's reads (a failed post can land late) — recorders must lock
 	pauses   []bool
 	seeks    []float64
 	vols     []float64 // F5 local volume nudges
@@ -27,10 +29,23 @@ type recPlayer struct {
 	mpvOsd   []string // F10 C6: OSD texts that rode an ACTION tell (volume)
 }
 
-func (p *recPlayer) Load(string) error     { return nil }
-func (p *recPlayer) SetPause(v bool) error { p.pauses = append(p.pauses, v); return nil }
-func (p *recPlayer) Seek(t float64) error  { p.seeks = append(p.seeks, t); return nil }
-func (p *recPlayer) Speed(float64) error   { return nil }
+func (p *recPlayer) Load(string) error { return nil }
+func (p *recPlayer) SetPause(v bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pauses = append(p.pauses, v)
+	return nil
+}
+
+// pausesSnapshot is the race-safe read for tests whose engine has a
+// background post worker (a failed post's restore actuation lands late).
+func (p *recPlayer) pausesSnapshot() []bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]bool(nil), p.pauses...)
+}
+func (p *recPlayer) Seek(t float64) error { p.seeks = append(p.seeks, t); return nil }
+func (p *recPlayer) Speed(float64) error  { return nil }
 func (p *recPlayer) ShowText(s string, ms int) error {
 	p.mpvOsd = append(p.mpvOsd, s)
 	return nil

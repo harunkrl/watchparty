@@ -203,6 +203,13 @@ type Engine struct {
 	actuatePause *bool     // pause state that actuation set (nil = seek); an
 	// mpv event is only an echo when it matches this — the user pressing
 	// space right after a remote apply must never be swallowed
+	actuatePending bool // F11 C3 (A11-F3): a pause actuation tell is IN FLIGHT —
+	// set at enqueue, cleared when the tell worker completes it. The
+	// reconcile skips while this is set: a poll racing a pending actuation
+	// is not the true local state, whatever the clock says.
+	undo     *toggleUndo // F11 C1 (A11-F1): the latest human toggle's pre-state
+	retryTyp string      // F11 C1 r2 (master-2 design): the failed direction —
+	// the next press re-posts THIS, whatever the mirrors say
 	lastPost time.Time // last follower discrete post (grace window)
 	// postedPause is the pause state this follower posted and the room has
 	// not confirmed yet. A heartbeat that was already in flight overwrites
@@ -259,6 +266,13 @@ func (e *Engine) postLoop() {
 		if err := e.Post(ev); err != nil {
 			e.logf("post: %s", err)
 			e.onPostFailed(ev, err)
+		} else if ev.Type == "pause" || ev.Type == "play" {
+			// F11 C1: the toggle landed — its retry stamp is spent
+			e.mu.Lock()
+			if e.retryTyp == ev.Type {
+				e.retryTyp = ""
+			}
+			e.mu.Unlock()
 		}
 		e.posts.done()
 	}
@@ -271,14 +285,18 @@ func (e *Engine) postLoop() {
 // plays on (W3).
 func (e *Engine) onPostFailed(ev room.Event, postErr error) {
 	if (ev.Type == "pause" || ev.Type == "play") && !ev.Mechanical {
-		// F10 C2 (A10 M2-05): a failed HUMAN pause/play must not leave the
-		// mirrors stuck — v1.9.1 kept postedPause set and nothing ever
-		// retried, so a lone follower stayed locally paused against a
-		// playing room with no self-heal. Roll the post mirrors back (the
-		// next toggle re-posts freely) and refuse visibly (the UI law).
+		// F11 C1 (A11-F1, master-2's design): STAMP the failed direction —
+		// the next press re-posts exactly that, whatever any mirror says.
+		// Nothing is restored and nothing is actuated: v1.9.2-F11v1's restore
+		// was itself a new mpv echo source (its echo past actuateQuiet posted
+		// a stray play — probe-proven) and clobbered a concurrent room pause
+		// by rewriting snap.paused with a pre-toggle value. The mpv keeps the
+		// user's pressed state; a snapshot follower's self-heal converges it
+		// to the room's truth within a tick, and the retry stamp carries the
+		// intent to the room. (M2-05's stickiness is dead: the next press
+		// always posts.)
 		e.mu.Lock()
-		e.postedPause = nil
-		e.lastPost = time.Time{}
+		e.retryTyp = ev.Type
 		e.mu.Unlock()
 		e.OSDShow(fmt.Sprintf("the %s didn't reach the room — try again", ev.Type), 3000)
 		e.logf("room: the %s never reached the room (%v) — try again", ev.Type, postErr)
@@ -326,6 +344,7 @@ func newPostQueue(logf func(format string, a ...any)) *postQueue {
 // owns it), and a coalesced position therefore SURVIVES while a discrete
 // is the casualty. F10 (A10 W2-02): the drop is logged, not silent.
 func (q *postQueue) push(ev room.Event) {
+	var dropNote string
 	q.mu.Lock()
 	if ev.Type == "position" {
 		// F6-A3: the heartbeat flood collapses to the LATEST position,
@@ -345,11 +364,16 @@ func (q *postQueue) push(ev room.Event) {
 		dropped := q.items[0]
 		q.items = q.items[1:] // F6-A3: the oldest dies; the coalesced tail
 		// position only reaches here once 64 newer events made it stale
-		if q.logf != nil {
-			q.logf("post: queue overflow dropped the oldest %s (cap %d) — it may never reach the room", dropped.Type, postQueueMax)
-		}
+		dropNote = fmt.Sprintf("post: queue overflow dropped the oldest %s (cap %d) — it may never reach the room", dropped.Type, postQueueMax)
 	}
 	q.mu.Unlock()
+	// F11 C5 (A11-F7): the log leaves the critical section, DETACHED — the
+	// headless logf is fmt.Printf and a full stdout pipe used to stall
+	// e.mu through OnMpvEvent→postDiscrete→push while the write blocked.
+	// Drops are bounded (≤1 per push), so the detached goroutines are too.
+	if dropNote != "" && q.logf != nil {
+		go q.logf(dropNote)
+	}
 	select {
 	case q.sig <- struct{}{}:
 	default:
@@ -536,6 +560,20 @@ func (q *tellQueue) push(t tell) bool {
 	return logDrop
 }
 
+// hasKind reports whether a tell of this kind is still QUEUED (not yet
+// popped). F11 C3: the pause gate recomputes its pending flag from this —
+// the queue is the authority, so a coalesced pair cannot leak a counter.
+func (q *tellQueue) hasKind(k tellKind) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, it := range q.items {
+		if it.kind == k {
+			return true
+		}
+	}
+	return false
+}
+
 func (q *tellQueue) personalLocked() int {
 	n := 0
 	for _, it := range q.items {
@@ -654,9 +692,29 @@ func (e *Engine) execTell(t tell) {
 		err = e.Player.ShowSubDelayHint()
 	case tellSubAttach:
 		err = e.Player.AttachSub(t.s)
+		if err == nil {
+			// F11 C4 (A11-F6): the OSD rides the attach tell — success only.
+			// v1.9.2 painted "sub X" at enqueue and buried a failing attach
+			// in the system pane (the W2-06 class the volume fix closed).
+			// The pane record is unconditional on the attach success (the
+			// OSD is best-effort: a failed ShowText must not hide the record).
+			e.logf("> sub %s attached (j switches tracks in the player window)", t.s)
+			_ = e.Player.ShowText("sub "+t.s, 3000)
+		}
 	}
 	if err != nil {
 		e.logf("mpv: %s (%s tell)", err, t.kind)
+	}
+	if t.kind == tellPause {
+		// F11 C3 (A11-F3, master-2's r2): the gate survives a SECOND in-flight
+		// pause tell — the first completion RECOMPUTES from the queue's truth
+		// instead of dropping a boolean (the v1 boolean dropped while tell #2
+		// was still in flight and the A11-M2-02 race re-fired — probe-proven).
+		// Only a PAUSE completion recomputes (condition d): a seek/volume
+		// completion says nothing about pause actuations.
+		e.mu.Lock()
+		e.actuatePending = e.tells.hasKind(tellPause)
+		e.mu.Unlock()
 	}
 }
 
@@ -690,6 +748,7 @@ func (e *Engine) setPause(paused bool) {
 	e.lastActuate = e.Clock.Now()
 	p := paused
 	e.actuatePause = &p
+	e.actuatePending = true // F11 C3: the reconcile skips until the tell COMPLETES
 	e.tell(tell{kind: tellPause, b: paused})
 }
 
@@ -794,6 +853,7 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 			}
 			if ev.P {
 				e.setPause(true)
+				e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
 				e.pausedBy = "" // the snapshot names no actor: honest empty
 			}
 		} else if ev.P {
@@ -803,6 +863,7 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 			// own actuation; postedPause mirrors the adopted state — the
 			// room already knows it, so nothing is posted.
 			e.setPause(true)
+			e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
 			e.localPause = true
 			p := true
 			e.postedPause = &p
@@ -819,6 +880,7 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		}
 	case "pause":
 		e.setPause(true)
+		e.retryTyp = ""      // F11 C1: the room's pause supersedes a failed post's stamp
 		e.lastPause = true   // master dedup stays consistent with reality
 		e.postedPause = nil  // the room's state supersedes our pending post
 		e.pausedBy = ev.Nick // the relay names the actor ("" = unstamped)
@@ -836,6 +898,7 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		e.behind = 0         // fresh stall window: resume-into-dry-cache must not re-pause instantly
 		e.mechPause = false  // the room plays again: no mechanical pause any more
 		e.setPause(false)
+		e.retryTyp = "" // F11 C1: the room's play supersedes a failed post's stamp
 		e.lastPause = false
 		e.postedPause = nil // the room's state supersedes our pending post
 		e.pausedBy = ""     // playing: nobody holds the pause
@@ -896,6 +959,15 @@ func (e *Engine) startLoad(name string) {
 	e.snap = nil
 	e.pendingPos = nil
 	e.heldPause = nil // a new file's window starts clean: the old claim is stale
+	// F11 C2 (A11-F2): a new file PLAYS — the server's S5 already reset the
+	// room's pause, and v1.9.2 carried the old film's local pause into the
+	// new file until the self-heal's grace expired (~4-6s frozen). Reset the
+	// mirror and actuate play LOCALLY: never a post (dual control — the
+	// room never hears about it, master-2's ruling).
+	e.localPause = false
+	e.setPause(false)
+	// the old film's retry stamp refers to a state that is gone
+	e.retryTyp = ""
 	if _, err := e.Player.StartLoad(name); err != nil {
 		e.logf("mpv: %s", err)
 		// F10 C3 (A10 W2-05): the claim above was SPECULATIVE — a failed
@@ -978,12 +1050,34 @@ func (e *Engine) applySnapshot(pos float64, paused bool, localPos *float64) {
 // PauseToggle is the TUI hotkey equivalent of a space-bar press in the
 // mpv window: apply locally AND post — the server never echoes a poster's
 // own event back, so posting alone would leave this player unsynced.
+// toggleUndo is the pre-toggle snapshot of every local mirror a human
+// PauseToggle touches (F11 C1 / A11-F1): onPostFailed restores ALL of them
+// and actuates the player back to the room's truth, so the OSD-invited
+// retry posts the SAME direction the user intended. snap.paused's pre-value
+// is the room's truth (the room never applied our failed post).
+type toggleUndo struct {
+	localPause bool
+	postPause  *bool
+	lastPost   time.Time
+	lastPause  bool
+	snapPaused *bool  // nil = there was no snapshot at toggle time
+	typ        string // the wire type the toggle posted ("pause" | "play")
+}
+
 func (e *Engine) PauseToggle() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.mechPause = false // a human pressed: the pause is not mechanical any more
 	var want bool
-	if e.Master {
+	if e.retryTyp != "" {
+		// F11 C1 r2 (master-2's design): the last toggle's post FAILED —
+		// this press re-posts THAT direction, no matter what any mirror says
+		// (the mirrors describe a room that never applied the failed post).
+		// Consumed here; a failure re-stamps it (the "try again" invitation
+		// is deliberate: every press while the stamp lives re-posts it).
+		want = e.retryTyp == "pause"
+		e.retryTyp = ""
+	} else if e.Master {
 		want = !e.lastPause
 		e.lastPause = want
 	} else if e.snap == nil {
@@ -1190,11 +1284,11 @@ func (e *Engine) OnMpvp(s mpv.State) {
 	// state — proving the claim against it matched "playing" and posted
 	// play to a paused room; skip and keep the hold for the post-actuation
 	// poll.
-	if !stale && e.heldPause != nil && (s.At.IsZero() || !s.At.Before(e.heldAt)) {
-		// shortcut: `stale` is a 3s time box from the tell ENQUEUE — two or
-		// more wedged tells can delay the actuation past it and re-open the
-		// race; upgrade to a pending flag cleared on tell completion if the
-		// field ever reports it
+	// F11 C3 (A11-F3): the actuatePending completion signal is the gate —
+	// the 3s enqueue-stamped time box it replaced expired under two wedged
+	// tells and re-opened this race (probe-confirmed). `stale` stays as the
+	// F9 mirror gate.
+	if !stale && !e.actuatePending && e.heldPause != nil && (s.At.IsZero() || !s.At.Before(e.heldAt)) {
 		held := *e.heldPause
 		e.heldPause = nil
 		if held == s.Pause {
@@ -1521,6 +1615,7 @@ func (e *Engine) followerTick(s mpv.State) {
 		// the gate exists to stop WIRE actions, not to keep the follower
 		// playing in a paused room.
 		e.setPause(e.snap.paused)
+		e.retryTyp = "" // F11 C1: the self-heal adoption supersedes a failed post's stamp
 		e.emitUi(mpv.State{Pos: s.Pos, Pause: e.snap.paused, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Sub: s.Sub, Layout: s.Layout}, 0)
 		return
 	}

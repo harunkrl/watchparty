@@ -486,6 +486,45 @@ const wireTyped = (cmd) => {
 let lastDropLog = -Infinity;
 const DROP_LOG_MS = 1000;
 
+// F11 F5 (A11-F5): the cmd trace is rate-limited PER TYPE, the same
+// shape as the drop log. The trace logged one line per cmd: 100 chats
+// wrote 100 lines, and the drop log never even engaged (valid traffic
+// is not dropped) — the stderr-flood class F10 closed for drops stayed
+// open through the trace. The first occurrence of a type logs at once,
+// the repeats inside 1s collapse into ONE counted summary (the count
+// must surface: a silent swallow is the bug this fixes).
+const TRACE_LOG_MS = 1000;
+const traceState = new Map(); // type -> { last, collapsed, timer }
+const traceCmd = (cmd) => {
+  const type = clean(String(cmd.type || ''), 24) || 'unknown';
+  const now = mono();
+  let st = traceState.get(type);
+  if (!st) {
+    // the type strings are client-supplied: the map must not grow
+    // without bound (a hostile client could send a million types)
+    if (traceState.size > 64) traceState.clear();
+    st = { last: 0, collapsed: 0, timer: null };
+    traceState.set(type, st);
+  }
+  if (now - st.last < TRACE_LOG_MS) {
+    st.collapsed++;
+    if (!st.timer) {
+      st.timer = setTimeout(() => {
+        st.timer = null;
+        if (st.collapsed > 0) {
+          console.log(`cmd: ${type} (${st.collapsed} suppressed in 1s)`);
+          st.collapsed = 0;
+        }
+        st.last = mono();
+      }, TRACE_LOG_MS);
+      if (st.timer.unref) st.timer.unref(); // the timer must not hold the server open
+    }
+    return;
+  }
+  st.last = now;
+  console.log(`cmd: ${type} from=${clean(String(cmd.from || ''), 32).slice(0, 8)}${cmd.type === 'seek' && cmd.t != null ? ` t=${Number(cmd.t).toFixed(1)}` : ''}${cmd.name ? ` name=${clean(cmd.name, 64)}` : ''}`);
+};
+
 function handleCmd(cmd) {
   // F7: every cmd type carries a nick -> normalize it through the same
   // clean() the roster uses. A client-supplied nick is untrusted text:
@@ -792,7 +831,7 @@ const server = http.createServer((req, res) => {
         if (cmd.type !== 'position') {
           // trace fields are client-supplied: clean() keeps ANSI escapes
           // out of the server log
-          console.log(`cmd: ${clean(cmd.type || '', 24)} from=${clean(String(cmd.from || ''), 32).slice(0, 8)}${cmd.type === 'seek' && cmd.t != null ? ` t=${Number(cmd.t).toFixed(1)}` : ''}${cmd.name ? ` name=${clean(cmd.name, 64)}` : ''}`);
+          traceCmd(cmd);
         }
         handleCmd(cmd);
         res.writeHead(204);

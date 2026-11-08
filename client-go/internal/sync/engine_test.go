@@ -12,19 +12,20 @@ import (
 )
 
 type fakePlayer struct {
-	mu       sync.Mutex
-	loads    []string
-	pauses   []bool
-	seeks    []float64
-	speeds   []float64
-	showText []string
-	vols     []float64 // F5 local volume nudges
-	mutes    int       // F5 mute toggles
-	subAdds  []float64 // v1.8.0 local subtitle-timing nudges
-	subSets  []float64 // v1.8.0 absolute sub-delay sets
-	pos      *float64
-	posCalls int   // F6-A2: SeekBy must not pay IPC round trips
-	loadErr  error // returned by Load to simulate a failed loadfile
+	mu        sync.Mutex
+	loads     []string
+	pauses    []bool
+	seeks     []float64
+	speeds    []float64
+	showText  []string
+	vols      []float64 // F5 local volume nudges
+	mutes     int       // F5 mute toggles
+	subAdds   []float64 // v1.8.0 local subtitle-timing nudges
+	subSets   []float64 // v1.8.0 absolute sub-delay sets
+	pos       *float64
+	posCalls  int   // F6-A2: SeekBy must not pay IPC round trips
+	loadErr   error // returned by Load to simulate a failed loadfile
+	attachErr error // F11 C4: returned by AttachSub to simulate a failed sub-add
 
 	// F10 C4: the /sub attach records the ask (the interface grew the
 	// method; the tell lane owns the write).
@@ -155,8 +156,9 @@ func (f *fakePlayer) AttachSubs(name string) {
 func (f *fakePlayer) AttachSub(name string) error {
 	f.mu.Lock()
 	f.subAttaches = append(f.subAttaches, name)
+	err := f.attachErr
 	f.mu.Unlock()
-	return nil
+	return err
 }
 func (f *fakePlayer) ShowText(s string, ms int) error {
 	f.mu.Lock()
@@ -216,6 +218,14 @@ type fakeClock struct {
 	now   time.Time
 	since time.Duration
 }
+
+// TRAP (master-2's A11 note + worker1's F11 rake hit twice): Since() returns
+// the canned `since` REGARDLESS of the timestamp, so a fixed fakeClock keeps
+// every real-time window (the 3s actuation box, followerGrace's 3s, the
+// loadQuiet 5s) open FOREVER — rewinding lastActuate/lastPost cannot express
+// "the window expired". Solutions: anchorClock (real Sub on a fixed Now —
+// good for "an age exceeded" scenarios) or RealClock (+sleep) when the code
+// STAMPS with Clock.Now() and the test must let those stamps age.
 
 // waitTells waits for the F8 tell worker to execute everything queued so
 // far (2s bound). The writer is asynchronous by contract — no interactive

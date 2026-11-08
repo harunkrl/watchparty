@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.9.3 — a retry that means it
+
+- client (sync): a pause/play whose POST never reached the room now
+  STAMPS the failed direction, and the next press re-posts exactly that —
+  v1.9.2 restored only the post bookkeeping and left the direction
+  mirrors standing, so the "try again" retry posted the OPPOSITE
+  direction (press pause twice, the film resumes). Nothing is restored
+  or re-actuated on failure (an earlier draft of that restore was
+  itself a new echo source and clobbered concurrent room pauses); the
+  local player keeps the pressed state until the room's truth converges
+  it, and the retry derives from the stamp on every role (proven: lone
+  follower, snapshot follower, master). While the stamp lives every
+  press re-posts the same direction — the deliberate "try again"
+  semantics
+- client (sync): a file change plays the new file LOCALLY — v1.9.2
+  carried the old film's pause into the new file for the ~4-6 seconds
+  its self-heal needed to expire the grace window; the load now resets
+  the local pause itself (local-only: the room is never told — the
+  server already reset its own pause)
+- client (sync): the machinery-gate guard is now a completion signal,
+  not a clock — v1.9.2 skipped the reconciliation only while the
+  actuation was "recent" (3s from ENQUEUE), and two wedged player
+  writes outlast that box, re-opening the play-to-a-paused-room race
+  the gate exists to prevent; the reconcile now skips until the tell
+  worker reports the actuation DONE, whatever the delay
+- client (ui): a /sub attach announces itself only when it SUCCEEDED —
+  v1.9.2 painted "sub X" at enqueue and buried a failing attach in the
+  system pane; the OSD now rides the attach tell (the same treatment
+  the volume keys got in v1.9.2)
+- client (sync): the postQueue overflow log no longer runs under the
+  queue lock — a blocking logger (the headless build's stdout) could
+  stall the whole engine while the drop note was written; the note is
+  now delivered after the lock is released
+- server: the server's wire types and the client's event struct are
+  pinned by a contract test — a field added to one side only now fails
+  CI instead of silently dropping the client's event; the pin is loud
+  (an unknown Go type or an untagged field is a failure, not a skip)
+- server: the command trace is rate-limited per type — a client that
+  floods chat no longer writes one line per message into the server
+  log (the suppressed count surfaces in one summary line; the per-type
+  map is capped)
+- ci: the CI package install has its own 5-minute budget — a stalled
+  mirror can no longer eat the release gate's shared 20 minutes and
+  cancel the run before a single test (#79a)
+
 ## v1.9.2 — a room that hears every pause
 
 - client (sync): a pause pressed in the mpv window during the first
