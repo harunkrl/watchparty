@@ -191,6 +191,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      # F11 S3 (#79a / #81a): the pack tools get their OWN step and their
+      # own budget — a stalled mirror must not eat the release budget.
+      # (The v1.9.3 hotfix: this install lived INSIDE the assembly run
+      # block, where the "timeout-minutes: 5" line was a SHELL line —
+      # "command not found" and the release went RED.)
+      - name: install the pack tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
+        timeout-minutes: 5
       - name: assemble zips + windows mpv bundle
         run: |
           mkdir dist
@@ -209,10 +218,6 @@ jobs:
           # friend bundle: portable mpv next to the exe (plan Q2), pinned to
           # MPV_TAG and checked against the digest vetted IN THE REPO — a
           # repackaged download must fail
-          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full jq
-          # F11 S3 (#79a / #81a): the same own-budget rule as the test
-          # job's apt — a stalled mirror must not eat the release budget.
-          timeout-minutes: 5
           tagged=$(curl -sL \
             "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/$MPV_TAG")
           pick='mpv-x86_64-[0-9]' # plain x86_64; -v3- needs AVX-512, excluded
