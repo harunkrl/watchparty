@@ -273,11 +273,20 @@ func TestMasterHeartbeatNoScrub(t *testing.T) {
 	e, _, po := newEngine(true)
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false})
 	e.OnMpvp(mpv.State{Pos: ptr(12), Pause: false}) // +2s: exactly PollSecs
-	// F6-A3: the steady heartbeats coalesce to the LATEST one — the pin's
-	// intent is that no scrub/seek fires on the steady cadence.
+	// F6-A3: the steady heartbeats coalesce to the LATEST one on the wire.
+	// RED ALERT-4 (post-queue twin of the tell pop race): the async post
+	// worker may pop the first position BEFORE the second enqueue lands, so
+	// BOTH can be delivered — the count is not an observable. The pin's
+	// intent: no scrub/seek fires on the steady cadence, and the room ends
+	// at the latest heartbeat (last-wins).
+	for _, ev := range po.all(t) {
+		if ev.Type != "position" {
+			t.Fatalf("steady cadence fired a %q: %v", ev.Type, evType(t, po.all(t)))
+		}
+	}
 	ev := po.all(t)
-	if len(ev) != 1 || ev[0].Type != "position" || ev[0].T != 12 {
-		t.Fatalf("events = %v, want one coalesced position{12}", evType(t, ev))
+	if len(ev) == 0 || ev[len(ev)-1].T != 12 {
+		t.Fatalf("the room did not end at the latest heartbeat: %v", evType(t, ev))
 	}
 }
 
@@ -309,8 +318,16 @@ func TestMasterPausePlayTransitions(t *testing.T) {
 	if pauses != 1 {
 		t.Fatalf("pause posted %d times, want exactly 1: %v", pauses, evType(t, evs))
 	}
-	if positions < 1 || positions > 2 {
-		t.Fatalf("positions = %d, want 1 (coalesced) or 2 (one in flight): %v", positions, evType(t, evs))
+	// RED ALERT-4: the async post worker can deliver each heartbeat
+	// separately (pop between enqueues) — the position COUNT is not an
+	// observable; the latest position is.
+	if positions < 1 {
+		t.Fatalf("no position heartbeat: %v", evType(t, evs))
+	}
+	for _, ev := range evs {
+		if ev.Type == "seek" {
+			t.Fatalf("steady cadence fired a seek: %v", evType(t, evs))
+		}
 	}
 	if lastPos != 7 {
 		t.Fatalf("the latest position is %v, want 7: %v", lastPos, evType(t, evs))
@@ -580,11 +597,15 @@ func TestOnRoomAppliesDiscreteEvents(t *testing.T) {
 	if e.loaded != "a.mkv" {
 		t.Fatalf("loaded = %q", e.loaded)
 	}
-	if len(pl.pausesSnapshot()) != 1 || pl.pausesSnapshot()[0] {
-		// F8 tell law: pause coalesces to the LATEST — the player lands in
-		// the final state; the ROOM still hears both transitions (the wire
-		// posts are never dropped, only the local writes coalesce).
-		t.Fatalf("pauses = %v, want [false] (coalesced to latest)", pl.pausesSnapshot())
+	// F8 tell law: pause coalesces to the LATEST — the player lands in
+	// the final state; the ROOM still hears both transitions (the wire
+	// posts are never dropped, only the local writes coalesce). The tell
+	// worker may pop a mid-sequence tell before the next enqueue lands
+	// (the v1.9.3 CI flake): the count is not an observable, the LAST
+	// write is.
+	pauses := pl.pausesSnapshot()
+	if len(pauses) == 0 || pauses[len(pauses)-1] {
+		t.Fatalf("pauses = %v, want the final state playing (last-wins)", pauses)
 	}
 	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 42 {
 		t.Fatalf("seeks = %v", pl.seeksSnapshot())
@@ -715,6 +736,14 @@ func TestFollowerPausePostsAndGrace(t *testing.T) {
 	e.OnRoom(masterAt(10, false))
 	e.OnMpvp(mpv.State{Pos: ptr(10), Pause: false}) // consistent baseline
 	e.OnMpvEvent("pause")                           // user pauses -> room hears it
+	// the post lands on the ASYNC post worker: poll, don't assume
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if countType(t, po.all(t), "pause") == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if n := countType(t, po.all(t), "pause"); n != 1 {
 		t.Fatalf("pause posted %d times, want 1", n)
 	}

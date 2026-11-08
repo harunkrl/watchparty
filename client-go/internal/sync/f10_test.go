@@ -215,10 +215,12 @@ func TestF10C2FailedPausePostRollsBack(t *testing.T) {
 		defer e.mu.Unlock()
 		return g.tried() == 1 && e.retryTyp == "pause"
 	})
-
-	if logs.count("never reached the room") == 0 {
-		t.Fatal("C2: the failed pause was not refused visibly (no system line)")
-	}
+	// the refusal line is logged by the POST worker AFTER the stamp (F11 C1
+	// order): the stamp wait does not imply the line landed — poll it
+	// (time.Sleep(50ms) here lost to taskset contention on slow runners)
+	waitF10(t, "the refusal line", func() bool {
+		return logs.count("never reached the room") > 0
+	})
 	if got := pl.showTextSnapshot(); len(got) == 0 {
 		t.Fatal("C2: no OSD refusal for the failed pause")
 	}
@@ -321,26 +323,26 @@ func TestF10C6SwallowedScrubLogs(t *testing.T) {
 
 	e.OnMpvEvent("seek")
 	waitTells(t, e)
-	time.Sleep(50 * time.Millisecond)
-	if n := logs.count("scrub"); n == 0 {
-		t.Fatal("C6: the swallowed scrub is still silent")
-	}
+	waitF10(t, "the swallowed scrub line", func() bool {
+		return logs.count("scrub") > 0
+	})
 }
 
 // PIN F10.9 (W2-02): the postQueue overflow drop is LOUD — the oldest
 // pending post dies with a logged line (v1.9.1 dropped silently).
 func TestF10OverflowDropIsLogged(t *testing.T) {
+	// Drive the postQueue DIRECTLY (master-2's verified shape, ×50 stable):
+	// through the Engine, the async post worker drains CONCURRENTLY with the
+	// enqueue loop, so the overflow itself was timing-dependent — on a fast
+	// runner the queue never crossed the cap and the drop never fired (the
+	// count=5 flake). No worker here: postQueueMax+2 pushes overflow for
+	// certain. The drop note is DETACHED (go q.logf — F11 C5): poll it.
 	logs := &logCap{}
-	g := &f10Post{fail: true}
-	e := &Engine{Master: false, ID: "f", Player: &fakePlayer{}, Post: g.post,
-		Logf: logs.add, Clock: fakeClock{now: time.Unix(1000, 0), since: 6 * time.Second}}
-	e.postDiscrete(room.Event{Type: "pause"})
-	for i := 0; i < 70; i++ {
-		e.postDiscrete(room.Event{Type: "chat", Text: "m"})
+	q := newPostQueue(logs.add)
+	for i := 0; i < postQueueMax+2; i++ {
+		q.push(room.Event{Type: "chat", Text: "m"})
 	}
-	waitF10(t, "the queue to drain", func() bool { return e.posts.idle() })
-	time.Sleep(50 * time.Millisecond)
-	if n := logs.count("dropped"); n == 0 {
-		t.Fatal("W2-02: the overflow drop is still silent")
-	}
+	waitF10(t, "the overflow drop line", func() bool {
+		return logs.count("dropped") > 0
+	})
 }

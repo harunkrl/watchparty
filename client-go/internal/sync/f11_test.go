@@ -53,6 +53,28 @@ func (p *f11Post) triedCount() int {
 
 func p2f(p float64) *float64 { return &p }
 
+// waitPostCountF11 polls the post log until it holds at least want entries.
+// The post worker is a separate goroutine from the tell worker: waitTells
+// returns when the ACTUATION drained, which does not imply the POST landed
+// (the CI flake on slow -race runners). Deadlines hard-fail.
+func waitPostCountF11(t *testing.T, g *f11Post, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		n := 0
+		for _, x := range g.log() {
+			if x == "pause" || x == "play" {
+				n++
+			}
+		}
+		if n >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the post queue never reached %d pause/play entries: %v", want, g.log())
+}
+
 // waitRollbackF11 waits until the failed post has been ATTEMPTED and the
 // retry stamp is on (the F11 contract: nothing is "rolled back" — the
 // failure's observable is the stamp).
@@ -118,7 +140,7 @@ func TestF11C1RetryKeepsIntentSnapshotFollower(t *testing.T) {
 	g.fail = false
 	g.mu.Unlock()
 	e.PauseToggle() // the OSD-invited retry — must be PAUSE again
-	waitTells(t, e)
+	waitPostCountF11(t, g, 2)
 	got := g.log()
 	if len(got) < 2 || got[0] != "pause" || got[len(got)-1] != "pause" {
 		t.Fatalf("C1: the retry inverted the intent: posted %v, want [pause pause]", got)
@@ -154,7 +176,7 @@ func TestF11C1RetryKeepsIntentLoneFollower(t *testing.T) {
 	g.fail = false
 	g.mu.Unlock()
 	e.PauseToggle() // the retry: PAUSE again
-	waitTells(t, e)
+	waitPostCountF11(t, g, 2)
 	got := g.log()
 	if len(got) < 2 || got[0] != "pause" || got[len(got)-1] != "pause" {
 		t.Fatalf("C1: the lone-follower retry inverted the intent: posted %v", got)
@@ -191,7 +213,7 @@ func TestF11C1RetryKeepsIntentMaster(t *testing.T) {
 	g.fail = false
 	g.mu.Unlock()
 	e.PauseToggle()
-	waitTells(t, e)
+	waitPostCountF11(t, g, 2)
 	var pauses []string
 	for _, x := range g.log() {
 		if x == "pause" || x == "play" {
@@ -323,7 +345,17 @@ func TestF11C3ReconcileSkipsWhileActuationInFlight(t *testing.T) {
 	e.OnMpvp(mpv.State{Pos: &pos, Pause: false})
 	time.Sleep(100 * time.Millisecond) // the seed's tells (no blocking kinds)
 	// the hello's pause actuation tell is ENQUEUED — the worker blocks
-	// inside SetPause for the whole scenario (pending the entire time)
+	// inside SetPause for the whole scenario (pending the entire time).
+	// The load is PRE-REGISTERED so the hello takes the same-file adoption
+	// path: exactly ONE pause tell is enqueued. A fresh load would enqueue
+	// the C2 reset (play) a few microseconds before the adoption (pause) —
+	// the tell worker can pop the reset in that window and defeat the
+	// coalesce-to-latest, leaving saw[0]=false (the CI flake on slow
+	// -race runners; the product gate holds in BOTH interleavings).
+	e.mu.Lock()
+	e.loaded = "f.mkv"
+	e.loadedAt = e.Clock.Now()
+	e.mu.Unlock()
 	e.OnRoom(room.Event{Type: "hello", Now: "f.mkv", Pos: &pos, P: true})
 	time.Sleep(150 * time.Millisecond) // let the tell worker reach the blocked write
 
@@ -526,7 +558,14 @@ func TestF11C3SecondPauseTellKeepsTheGateShut(t *testing.T) {
 	pos := 10.0
 	e.OnMpvp(mpv.State{Pos: &pos, Pause: false})
 	time.Sleep(100 * time.Millisecond)
-	// tell #1: the hello's pause actuation — the worker BLOCKS inside it
+	// tell #1: the hello's pause actuation — the worker BLOCKS inside it.
+	// The load is PRE-REGISTERED (same-file adoption path): a fresh load's
+	// C2 reset tell could be popped before the adoption tell lands, killing
+	// the coalesce and leaving saw[0]=false (the CI flake class).
+	e.mu.Lock()
+	e.loaded = "f.mkv"
+	e.loadedAt = e.Clock.Now()
+	e.mu.Unlock()
 	e.OnRoom(room.Event{Type: "hello", Now: "f.mkv", Pos: &pos, P: true})
 	time.Sleep(150 * time.Millisecond)
 
