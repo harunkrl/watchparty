@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	stdsync "sync"
 	"time"
 	"unicode/utf8"
 
@@ -21,8 +22,15 @@ import (
 // stdin EOF).
 func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine, roomCh <-chan room.Event, in io.Reader, out io.Writer) error {
 	fmt.Fprintln(out, cmd.Usage)
-	go func() { // room events -> log + engine (TUI dispatcher parity)
+	inv := &inviteStore{} // L1b G4: /invite must answer honestly, never silent
+	go func() {           // room events -> log + engine (TUI dispatcher parity)
 		for ev := range roomCh {
+			if ev.Type == "hello" {
+				inv.set(ev.Invite, ev.InviteAlt) // stored before the line prints (§6 parity)
+				if line := inv.line(); line != "" {
+					fmt.Fprintln(out, ">", line)
+				}
+			}
 			if line := RenderEvent(ev, nick); line != "" {
 				fmt.Fprintln(out, line)
 			}
@@ -88,6 +96,13 @@ func Run(nick string, api *room.Client, player *mpv.Player, engine *sync.Engine,
 			report(out, api.Post(room.Event{Type: "enqueue", Name: c.Arg}))
 		case cmd.Skip:
 			report(out, api.Post(room.Event{Type: "skip"}))
+		case cmd.Invite: // L1b G4 (#86c): honest output — the visible refusal
+			// law applies to the harness too; never a silent no-op
+			if line := inv.line(); line != "" {
+				fmt.Fprintln(out, ">", line)
+			} else {
+				fmt.Fprintln(out, "> no invite address yet — waiting for the server hello")
+			}
 		}
 	}
 	return sc.Err() // nil on EOF: clean exit like client.py's for-loop end
@@ -97,4 +112,24 @@ func report(out io.Writer, err error) {
 	if err != nil {
 		fmt.Fprintln(out, "> err:", err)
 	}
+}
+
+// inviteStore is the headless invite holder (L1b G4): the room-event
+// goroutine writes on hello, the input loop reads for /invite.
+type inviteStore struct {
+	mu   stdsync.Mutex
+	main string
+	alt  string
+}
+
+func (s *inviteStore) set(main, alt string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.main, s.alt = main, alt
+}
+
+func (s *inviteStore) line() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return inviteLine(s.main, s.alt)
 }

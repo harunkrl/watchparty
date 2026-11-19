@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.10.0 — a room that waits for you
+
+- client (ui): an IDLE room no longer auto-loads the last film on launch.
+  When you are the only one in the room, the client shows a "last
+  watched" card — the file, the position, whether it was paused —
+  instead of starting playback behind your back. A room with somebody
+  else in it keeps loading straight away, exactly as before
+- client (ui): press Enter on an empty input to resume that card: the
+  film starts where it was left, in the state it was left. With nothing
+  to resume, the key says so instead of doing nothing
+- client (ui): every hello prints the room's invite address, and
+  /invite prints it again on demand — the address a host needs to share
+  used to live only in the empty-chat placeholder
+- client (ui): a master that opens a brand-new room gets the file picker
+  once, automatically — picking the first film is the only thing a host
+  does at that point
+- client (sync): a resumed room hands the remembered position to the
+  room, so the next person joins at the right spot instead of at 0:00
+- client (sync): a follower that joins a PAUSED room now lands on the
+  room's position instead of 0:00 — the room's paused position and its
+  pause state are adopted at join time, so the film waits where it was
+  left for the person who comes in next
+
 ## v1.9.3 — a retry that means it
 
 - client (sync): a pause/play whose POST never reached the room now

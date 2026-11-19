@@ -229,7 +229,15 @@ function childPid(parentPid, ms = 15000) {
 // the cleanup: kill -> WAIT for the exits -> rm (the F8 master_restart
 // lesson: a raw rm raced the server's exit-time state flush)
 const procs = [];
+// L1 (lobby-first): a room with ONE client waits for an explicit resume
+// instead of auto-loading the file. These scenarios need the auto-load,
+// so the room must be LIVE (>= 2 unique nicks in the hello roster). A
+// ROOM MATE — a raw SSE connection, no client binary — puts a second
+// nick in the roster; the scenarios themselves are unchanged (the
+// follower still has NO master, which is what they are about).
+const mateCtrl = new AbortController();
 const cleanup = async (code) => {
+  mateCtrl.abort();
   for (const p of procs) {
     try {
       execSync(`pkill -TERM -P ${p.pid}`);
@@ -271,6 +279,15 @@ for (let i = 0; i < 100; i++) {
   }
 }
 await post({ type: 'load', from: 'F-0', nick: 'f', name: 'movie.mp4' });
+
+// the room mate joins (L1: the room must be live for the auto-load)
+await fetch(`${BASE}/events?id=mate&nick=Mate`, { signal: mateCtrl.signal })
+  .then(async (res) => {
+    const reader = res.body.getReader();
+    await reader.read(); // hold the stream open: the roster keeps the nick
+  })
+  .catch(() => {});
+await sleep(300);
 
 // ---------------------------------------------------------------- A
 await scenario('[F9-1] a lone follower ctrl+space pauses the ROOM', async () => {

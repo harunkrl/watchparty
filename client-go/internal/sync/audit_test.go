@@ -19,8 +19,8 @@ import (
 // makes every client seek again (a visible flush on a WAN link).
 func TestMasterDoesNotRepostAppliedSeek(t *testing.T) {
 	e, pl, po := newEngine(true)
-	e.OnMpvp(mpv.State{Pos: ptr(10)})         // baseline heartbeat
-	e.OnRoom(room.Event{Type: "seek", T: 60}) // a follower scrubbed: we apply it
+	e.OnMpvp(mpv.State{Pos: ptr(10), Dur: 100}) // baseline heartbeat (live file: L1b G1 parks unknown-duration seeks)
+	e.OnRoom(room.Event{Type: "seek", T: 60})   // a follower scrubbed: we apply it
 	waitTells(t, e)
 	if len(pl.seeksSnapshot()) != 1 || pl.seeksSnapshot()[0] != 60 {
 		t.Fatalf("applied seek not applied: %v", pl.seeksSnapshot())

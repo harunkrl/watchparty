@@ -588,6 +588,7 @@ func TestFollowerNeedsSnapshot(t *testing.T) {
 func TestOnRoomAppliesDiscreteEvents(t *testing.T) {
 	e, pl, _ := newEngine(false)
 	e.OnRoom(room.Event{Type: "load", Name: "a.mkv"})
+	e.OnMpvp(mpv.State{Pos: ptr(0), Dur: 100}) // the file went live (L1b G1: a seek on an unknown-duration file parks)
 	e.OnRoom(room.Event{Type: "pause"})
 	e.OnRoom(room.Event{Type: "play"})
 	e.OnRoom(room.Event{Type: "seek", T: 42})

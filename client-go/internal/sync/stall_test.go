@@ -266,6 +266,7 @@ func TestSeekEchoConsumedOnce(t *testing.T) {
 	t0 := time.Unix(3000, 0)
 	e.Clock = stepClock{now: t0} // real elapsed time: expiry must see a FRESH seek
 	e.OnRoom(masterAt(12, false))
+	e.OnMpvp(mpv.State{Pos: ptr(12), Dur: 100}) // the file went live (L1b G1: an unknown-duration file parks seeks)
 
 	e.OnRoom(room.Event{Type: "seek", T: 40}) // remote seek applied: echo pending
 	pl.setPos(40)

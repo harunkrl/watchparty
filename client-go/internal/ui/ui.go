@@ -135,7 +135,7 @@ var nudgeRe = regexp.MustCompile(`^\[\d+\.\d+\]$`)
 
 // usageTUI is the slash-style command reference shown in the TUI; the
 // bare-verb syntax stays in cmd.Usage for the headless test harness.
-const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /sub [sub] · /subdelay <±sec> · /skip · /chat <msg> · /quit · /help — plain text is chat · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+↑/↓ sub-delay ±0.5s · alt+m mute · ctrl+p files · F1 keys · ctrl+z movie mode · ctrl+g system pane"
+const usageTUI = "commands: /list · /pick · /play [file] · /queue [file] · /sub [sub] · /subdelay <±sec> · /skip · /invite · /chat <msg> · /quit · /help — plain text is chat · enter on empty input resumes the last-watched lobby · tab completes · ctrl+space play/pause · ctrl+←/→ ±5s · ctrl+shift+←/→ ±30s · alt+p play/pause · alt+←/→ ±5s · ctrl+↑/↓ volume · alt+↑/↓ sub-delay ±0.5s · alt+m mute · ctrl+p files · F1 keys · ctrl+z movie mode · ctrl+g system pane"
 
 func nickStyle(nick string) lipgloss.Style {
 	h := 0
@@ -146,55 +146,56 @@ func nickStyle(nick string) lipgloss.Style {
 }
 
 type Model struct {
-	nick        string
-	master      bool
-	api         *room.Client
-	player      *mpv.Player
-	osdHook     func(string) // test seam for the OSD hint (nil = the mpv window)
-	engine      *sync.Engine
-	input       textinput.Model
-	spin        spinner.Model  // connecting screen (pre-WindowSizeMsg)
-	vp          viewport.Model // chat pane
-	sysVp       viewport.Model // system tail: events + engine lines
-	lastErr     string         // input-row feedback until the next keystroke
-	log         []entry
-	peers       map[string]bool
-	now         string
-	invite      string   // address to invite people to (server hello "invite")
-	inviteAlt   string   // second invite address (server hello "inviteAlt")
-	queue       []string // server queue state (hello/queue events)
-	files       []string // last known video list (typo guard, any filesMsg)
-	st          *sync.UiState
-	conn        string // connecting | connected | reconnecting | lost
-	connSince   time.Time
-	retry       int // reconnect attempts since the last connect
-	retryDelay  int // current backoff in seconds
-	duration    float64
-	durCache    map[string]float64 // known file durations: a reload paints the bar instantly
-	lostAt      time.Time          // when the connection dropped (reconnect delta)
-	mode        mode
-	pickItems   []string
-	pickCursor  int
-	pickAct     pickAction      // what enter does in the picker: play or enqueue
-	hist        []string        // input history, newest last
-	histIdx     int             // -1 = live editing
-	draft       string          // saved while browsing history
-	zen         bool            // movie-night mode: one status line + input only
-	sysOff      bool            // ctrl+g: system pane hidden
-	helpOpen    bool            // F1: passive keys overlay (every other key keeps working)
-	subInFlight map[subKey]bool // /sub probes still answering: duplicate guard
-	lastCSIHint time.Time       // unknown-key-sequence hint rate limit (F9)
-	resizing    bool            // A4: a resize storm is in flight (the settle re-syncs)
-	gone        []string        // departed nicks, shown offline (cap 5)
-	eq          []float64       // vibe equalizer bar heights 0..1
-	compOpen    bool            // Tab menu of command/file completions
-	compItems   []compItem
-	compCursor  int
-	compFile    bool // completing a file argument (vs a verb)
-	compVerb    string
-	compWord    string
-	width       int
-	height      int
+	nick          string
+	master        bool
+	api           *room.Client
+	player        *mpv.Player
+	osdHook       func(string) // test seam for the OSD hint (nil = the mpv window)
+	engine        *sync.Engine
+	input         textinput.Model
+	spin          spinner.Model  // connecting screen (pre-WindowSizeMsg)
+	vp            viewport.Model // chat pane
+	sysVp         viewport.Model // system tail: events + engine lines
+	lastErr       string         // input-row feedback until the next keystroke
+	log           []entry
+	peers         map[string]bool
+	now           string
+	invite        string   // address to invite people to (server hello "invite")
+	inviteAlt     string   // second invite address (server hello "inviteAlt")
+	queue         []string // server queue state (hello/queue events)
+	pickerLatched bool     // L1 §7: the master auto-picker fired once (first hello)
+	files         []string // last known video list (typo guard, any filesMsg)
+	st            *sync.UiState
+	conn          string // connecting | connected | reconnecting | lost
+	connSince     time.Time
+	retry         int // reconnect attempts since the last connect
+	retryDelay    int // current backoff in seconds
+	duration      float64
+	durCache      map[string]float64 // known file durations: a reload paints the bar instantly
+	lostAt        time.Time          // when the connection dropped (reconnect delta)
+	mode          mode
+	pickItems     []string
+	pickCursor    int
+	pickAct       pickAction      // what enter does in the picker: play or enqueue
+	hist          []string        // input history, newest last
+	histIdx       int             // -1 = live editing
+	draft         string          // saved while browsing history
+	zen           bool            // movie-night mode: one status line + input only
+	sysOff        bool            // ctrl+g: system pane hidden
+	helpOpen      bool            // F1: passive keys overlay (every other key keeps working)
+	subInFlight   map[subKey]bool // /sub probes still answering: duplicate guard
+	lastCSIHint   time.Time       // unknown-key-sequence hint rate limit (F9)
+	resizing      bool            // A4: a resize storm is in flight (the settle re-syncs)
+	gone          []string        // departed nicks, shown offline (cap 5)
+	eq            []float64       // vibe equalizer bar heights 0..1
+	compOpen      bool            // Tab menu of command/file completions
+	compItems     []compItem
+	compCursor    int
+	compFile      bool // completing a file argument (vs a verb)
+	compVerb      string
+	compWord      string
+	width         int
+	height        int
 }
 
 // compItem is one row of the Tab completion menu.
@@ -956,6 +957,15 @@ func (m Model) submit() (Model, tea.Cmd) {
 	m.input.SetValue("")
 	m.histIdx, m.draft = -1, ""
 	if line == "" {
+		// L1 §5: enter on an empty input resumes the last-watched lobby —
+		// the key was an unbound silent no-op before. Without a lobby it
+		// refuses visibly (F9 yardstick); it never sends an empty chat.
+		if m.engine != nil {
+			if m.engine.ResumeLobby() {
+				return m, nil // startLoad already logged "> playing <file>"
+			}
+			return m.failf("nothing to resume (no last-watched lobby)")
+		}
 		return m, nil
 	}
 	m.hist = append(m.hist, line)
@@ -1019,6 +1029,11 @@ func (m Model) dispatch(line string) (Model, tea.Cmd) {
 		return m, postEvent(m.api, room.Event{Type: "chat", Nick: m.nick, Text: c.Arg})
 	case cmd.List, cmd.Pick: // /list opens the picker too: a 2-line system strip is no place for a file dump
 		return m.openPicker(pickActPlay)
+	case cmd.Invite: // L1 §6: re-print the hello's stored address (visible refusal when none)
+		if line := inviteLine(m.invite, m.inviteAlt); line != "" {
+			return m.logf("> %s", line), nil
+		}
+		return m.failf("no invite address yet — waiting for the server hello")
 	case cmd.Play:
 		if !m.knownFile(c.Arg) {
 			return m.failf("no such file: %s (try /list)", c.Arg)
@@ -1153,6 +1168,11 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		m.queue = ev.Queue
 		m.invite = ev.Invite       // the server knows its own reachable address
 		m.inviteAlt = ev.InviteAlt // ...and a second one (tailnet + LAN)
+		// L1 §6: the invite rides EVERY hello — a reconnect re-prints it
+		// (the address can change across server restarts).
+		if line := inviteLine(m.invite, m.inviteAlt); line != "" {
+			m = m.logf("> %s", line)
+		}
 		// roster replaces guesswork: a late joiner sees everyone already in
 		// the room, not only the joins that happened after them
 		m.peers = map[string]bool{}
@@ -1160,6 +1180,21 @@ func (m Model) onEvent(ev room.Event) (Model, tea.Cmd) {
 		for _, n := range ev.Roster {
 			if n != "" && n != m.nick {
 				m.peers[n] = true
+			}
+		}
+		// L1 §7: the master's FIRST hello into an empty room opens the
+		// picker once (latch) — launching into an idle room asks "what do
+		// we watch" instead of staring at an empty chat. A follower never
+		// auto-opens; later hellos never re-open (the latch is permanent).
+		if !m.pickerLatched {
+			m.pickerLatched = true
+			if m.master && ev.Now == "" {
+				var pc tea.Cmd
+				m, pc = m.openPicker(pickActPlay)
+				if c != nil {
+					pc = tea.Batch(c, pc)
+				}
+				return m, pc
 			}
 		}
 	case "join":
@@ -1305,7 +1340,7 @@ func (m Model) layoutCore() (cw, vh int, showBar, showSys, showFooter bool) {
 		inner = 3
 	}
 	if m.zen { // movie-night mode: one header row + chat + input, nothing else
-		return cw, max(1, inner-2), false, false, false
+		return cw, max(1, inner-2-m.lobbyCardH()), false, false, false
 	}
 	fixed := 3 // two header lines + input
 	showBar = m.duration > 0 && m.st != nil && m.st.Pos != nil && inner-fixed >= 6
@@ -1333,7 +1368,8 @@ func (m Model) layout() (cw, vh int, showBar, showSys, showFooter bool) {
 		return r - 2, m.chatBoxH(), false, false, false
 	}
 	cw, vh, showBar, showSys, showFooter = m.layoutCore()
-	return cw, max(1, vh-m.menuRows()), showBar, showSys, showFooter
+	// the L1 lobby card borrows rows above the input, same deal as the menu
+	return cw, max(1, vh-m.menuRows()-m.lobbyCardH()), showBar, showSys, showFooter
 }
 
 // contentWidth is the usable width inside the frame.
@@ -1393,6 +1429,19 @@ func (m Model) padChatBottom(content string) string {
 	return strings.Repeat("\n", m.vp.Height-len(lines)) + content
 }
 
+// inviteLine formats the invite line (L1 §6) — ONE format shared by the
+// hello print, the /invite re-print and the lobby card. Empty when the
+// server has not offered an address yet (no hello yet / hello failed).
+func inviteLine(invite, alt string) string {
+	if invite == "" {
+		return ""
+	}
+	if alt != "" {
+		return fmt.Sprintf("invite: %s or %s", invite, alt)
+	}
+	return "invite: " + invite
+}
+
 // inviteLines is the empty-chat placeholder: the one thing a first-time
 // host needs is the address to send the other side. The server's hello
 // carries its own reachable address (and optionally a second one); our
@@ -1424,6 +1473,45 @@ func (m Model) inviteLines() string {
 	}
 	return out + "\n" +
 		dim.Render("(everything you type here goes to the room as chat)")
+}
+
+// lobbyCardH is the rows the L1 card borrows above the input row: one
+// card line, plus the invite line when the server has offered an address.
+func (m Model) lobbyCardH() int {
+	if m.st == nil || m.st.Lobby == nil {
+		return 0
+	}
+	n := 1
+	if m.invite != "" {
+		n++
+	}
+	return n
+}
+
+// lobbyLines is the last-watched card (L1 §5): rendered while the
+// engine holds a lobby, directly above the input row — the chat stays
+// fully live and scrollable, the card never covers it (chat-first law).
+// REAL DATA ONLY: the file name as the server knows it, the lobby's
+// position and pause flag, the stored invite address.
+func (m Model) lobbyLines(w int) []string {
+	if m.st == nil || m.st.Lobby == nil {
+		return nil
+	}
+	lob := m.st.Lobby
+	pos := "0:00"
+	if lob.Pos != nil {
+		pos = clockStr(*lob.Pos)
+	}
+	pause := ""
+	if lob.Paused {
+		pause = " ⏸"
+	}
+	line := fitWidth(fmt.Sprintf("last watched: %s · %s%s — enter resume · /play pick another", lob.Now, pos, pause), w)
+	out := []string{title.Render(line)}
+	if inv := inviteLine(m.invite, m.inviteAlt); inv != "" {
+		out = append(out, dim.Render(fitWidth(inv, w)))
+	}
+	return out
 }
 
 // inviteLabel names an invite address by its network: the tailnet
@@ -1787,7 +1875,9 @@ func padLines(lines []string, n int) []string {
 // chatBase is the dashboard chat box height without the menu: the rows
 // the left column leaves to the conversation.
 func (m Model) chatBase() int {
-	return max(4, m.height-3-7-m.vibeH()-3-2)
+	// the L1 lobby card rides above the MESSAGE input in the dashboard:
+	// its rows come out of the chat viewport, the frame never overflows
+	return max(4, m.height-3-7-m.vibeH()-3-2-m.lobbyCardH())
 }
 
 // chatBoxH is the dashboard chat box height: the base minus the rows
@@ -1872,6 +1962,10 @@ func (m Model) dashView() string {
 		hint = errStyle.Render(m.lastErr)
 	}
 	msg := []string{joinLR(in, hint, rightW-4)}
+	// L1 §5: the card rides above the MESSAGE input here too — the
+	// dashboard is the layout a real terminal shows. chatBase pays the
+	// card's rows out of the CHAT viewport, so nothing overflows.
+	msg = append(m.lobbyLines(rightW-4), msg...)
 	msg = append(msg, m.menuLines(rightW-4)...) // Tab completion menu, when open
 	right := box(rightW, "CHAT", "", strings.Split(vp.View(), "\n"), bordChat)
 	if m.vibeH() > 0 {
@@ -2019,6 +2113,9 @@ func (m Model) View() string {
 	}
 	b.WriteString(vp.View() + "\n")
 	for _, l := range m.menuLines(cw) { // stacked layout: the menu floats above the input
+		b.WriteString(l + "\n")
+	}
+	for _, l := range m.lobbyLines(cw) { // L1 §5: the last-watched card rides above the input
 		b.WriteString(l + "\n")
 	}
 	if !m.zen {
@@ -2320,8 +2417,9 @@ func (m Model) helpLines() []string {
 		"ctrl+p              file browser (pick / queue)",
 		"ctrl+z              movie mode · ctrl+g system pane",
 		"enter send · up/down history · pgup/pgdn scroll · tab complete",
+		"enter on empty input  resume the last-watched lobby (visible refusal when none)",
 		"",
-		"commands: /list /pick /play [file] /queue [file] /sub [sub] /subdelay <±sec> /skip /help /quit",
+		"commands: /list /pick /play [file] /queue [file] /sub [sub] /subdelay <±sec> /skip /invite /help /quit",
 		"picker: up/down move · enter play/enqueue · q queue · esc cancel",
 		dim.Render("legacy conhost: ctrl+z / ctrl+g are dead there — alt keys and F1 still work"),
 	}

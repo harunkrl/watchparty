@@ -135,3 +135,61 @@ func TestHeadlessPrintsActorLines(t *testing.T) {
 		t.Fatalf("the queue actor is missing: %q", got)
 	}
 }
+
+// PIN L1b-G4 (#86c): headless /invite is honest — it re-prints the
+// stored address after a hello carried one, and refuses visibly without
+// one. Never a silent no-op: 9 node suites drive this adapter.
+func TestHeadlessInviteHonest(t *testing.T) {
+	api := room.New("http://127.0.0.1:1", "g4")
+	engine := &sync.Engine{
+		Player: stubPlayer{},
+		Post:   func(ev room.Event) error { return nil },
+		Clock:  sync.RealClock{},
+	}
+	out := &syncBuffer{}
+	// refusal leg: no hello has carried an address yet
+	if err := Run("g4", api, nil, engine, make(chan room.Event), strings.NewReader("invite\nquit\n"), out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "no invite address yet") {
+		t.Fatalf("/invite without an address was silent: %q", out.String())
+	}
+
+	// reprint leg: the hello carries the invite; the room-event goroutine
+	// stores it before the line prints, and the input loop's chat post is
+	// delayed by the stub server until that has happened — /invite then
+	// re-prints the stored address (two prints: the hello line + the ask).
+	helloSent := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cmd" {
+			<-helloSent // hold the chat post until the hello is in the tree
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	api2 := room.New(srv.URL, "g4b")
+	engine2 := &sync.Engine{
+		Player: stubPlayer{},
+		Post:   func(ev room.Event) error { return api2.Post(ev) },
+		Clock:  sync.RealClock{},
+	}
+	ch := make(chan room.Event, 4)
+	ch <- room.Event{Type: "hello", Now: "", Roster: []string{"g4"}, Invite: "http://10.1.2.3:8090"}
+	out2 := &syncBuffer{}
+	go func() {
+		time.Sleep(50 * time.Millisecond) // let the goroutine take the hello
+		close(helloSent)
+	}()
+	if err := Run("g4", api2, nil, engine2, ch, strings.NewReader("chat warm\ninvite\nquit\n"), out2); err != nil {
+		t.Fatal(err)
+	}
+	got := out2.String()
+	if strings.Count(got, "invite: http://10.1.2.3:8090") != 2 {
+		t.Fatalf("want the hello line + the /invite re-print, got %q", got)
+	}
+	if strings.Contains(got, "no invite address yet") {
+		t.Fatalf("the store was not seeded before /invite: %q", got)
+	}
+}

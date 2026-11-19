@@ -13,17 +13,18 @@ import (
 const ChatMaxLen = 500
 
 const (
-	List  = "list"
-	Pick  = "pick"
-	Play  = "play"
-	Queue = "queue"
-	Skip  = "skip"
-	Chat  = "chat"
-	Quit  = "quit"
-	Help  = "help"
+	List   = "list"
+	Pick   = "pick"
+	Play   = "play"
+	Queue  = "queue"
+	Skip   = "skip"
+	Chat   = "chat"
+	Invite = "invite"
+	Quit   = "quit"
+	Help   = "help"
 )
 
-const Usage = "commands: list | pick | play <file> | queue [file] | skip | chat <msg> | quit | help"
+const Usage = "commands: list | pick | play <file> | queue [file] | skip | chat <msg> | invite | quit | help"
 
 type Cmd struct {
 	Kind string
@@ -36,7 +37,7 @@ type Cmd struct {
 func IsCommand(line string) bool {
 	verb, _, _ := strings.Cut(strings.TrimSpace(line), " ")
 	switch verb {
-	case List, Pick, Play, Queue, Skip, Chat, Quit, Help:
+	case List, Pick, Play, Queue, Skip, Chat, Invite, Quit, Help:
 		return true
 	}
 	return false
@@ -48,7 +49,7 @@ func Parse(line string) (Cmd, error) {
 	verb, arg, _ := strings.Cut(strings.TrimSpace(line), " ")
 	arg = strings.TrimSpace(arg)
 	switch verb {
-	case List, Pick, Skip, Quit, Help:
+	case List, Pick, Skip, Invite, Quit, Help:
 		return Cmd{Kind: verb}, nil
 	case Queue:
 		// bare "queue" lists the queue; "queue <file>" enqueues

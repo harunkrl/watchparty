@@ -150,6 +150,17 @@ type UiState struct {
 	// master). F9 R1: without it the drift chip would fabricate "+0.0s"
 	// for a lone follower; the honest alone-indicator drives off it.
 	Room bool
+	// Lobby is the L1 last-watched state: non-nil while an idle room's
+	// hello was held back instead of auto-loading (nil = no card).
+	Lobby *Lobby
+}
+
+// Lobby is the file an idle room left behind (L1 §1): the engine held it
+// back instead of auto-loading; the UI renders it as the resume card.
+type Lobby struct {
+	Now    string   // the room's file name (raw, as the server knows it)
+	Pos    *float64 // the room's position (nil = the room had none — F9 CASE B)
+	Paused bool     // the room's pause flag at hello time
 }
 
 type Engine struct {
@@ -195,6 +206,8 @@ type Engine struct {
 	mechPause  bool      // the room is paused for a MECHANICAL reason (a stall), not a human's
 	endedAt    time.Time // follower: when we last posted 'ended' for the current file
 
+	lobby *Lobby // L1: the last-watched state while the room is idle (nil = no card)
+
 	dur          float64  // the locally known media duration (0 = unknown yet)
 	pendingPos   *float64 // a hello position waiting for the duration to clamp it
 	pendingPause bool     // the paused flag that came with the pending position
@@ -237,6 +250,50 @@ func (e *Engine) logf(format string, args ...any) {
 	if e.Logf != nil {
 		e.Logf(format, args...)
 	}
+}
+
+// ResumeLobby resumes the file the lobby gate held back (L1 §3). The
+// handoff rides the EXISTING machinery, no new mechanism:
+//   - post load: other idle clients load through the existing load handler;
+//   - post pause ONLY when the room was paused (ruling #86a): the server's
+//     load handler resets state.paused (F10 S5) and nulls state.pos, so
+//     the room must hear load->pause IN ORDER (postQueue FIFO) before
+//     anyone adopts — or the next joiner plays into a paused film;
+//   - startLoad(lobby.Now) clears the lobby (§4 choke point) and claims
+//     loaded synchronously (a self-echo of our own load post would die on
+//     ev.Name != e.loaded — and room.Stream drops own echoes anyway);
+//   - adopt through the SAME hello block (adoptRoomState): dur==0 right
+//     after startLoad, so the position rides the pendingPos flush (the F1
+//     clamp) and a paused lobby re-pauses via CASE B;
+//   - post seek(pos) IMMEDIATELY, in the wire order (L1b G3, #86c): the
+//     G1 park makes it safe for a co-resident peer whose file is still
+//     loading (the seek parks there and flushes when its duration
+//     arrives), and our own echo never comes back (room.Stream drops
+//     From==ID). The server's pos warms before anyone's file is live —
+//     without the post the next joiner lands at 0:00. Uniform for master
+//     and follower; no WaitLive deferral, no timeout log to overclaim
+//     (G4a closed by removal).
+//
+// Returns false when there is no lobby — the caller refuses visibly.
+func (e *Engine) ResumeLobby() bool {
+	e.mu.Lock()
+	lob := e.lobby
+	if lob == nil {
+		e.mu.Unlock()
+		return false
+	}
+	e.post1(room.Event{Type: "load", Name: lob.Now})
+	if lob.Paused {
+		e.postDiscrete(room.Event{Type: "pause"}) // honest "> pause" log; the room hears OUR pause
+	}
+	if lob.Pos != nil {
+		e.postDiscrete(room.Event{Type: "seek", T: *lob.Pos}) // see G3 above
+	}
+	e.startLoad(lob.Now)
+	e.adoptRoomState(lob.Pos, lob.Paused)
+	e.emitUi(mpv.State{Idle: true}, 0) // the card dies NOW, not at the next poll
+	e.mu.Unlock()
+	return true
 }
 
 // post1 hands the event to the post worker: the CALLER must never wait
@@ -800,7 +857,42 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 	case "position":
 		now := e.Clock.Now()
 		e.snap = &snapshot{t: ev.T, paused: ev.P, at: now, beat: now}
-		e.pendingPos = nil // a fresh heartbeat supersedes a pending hello position
+		// L1b F1 (#86c): a heartbeat while a lobby exists IS the "room went
+		// live" signal — the card exists ONLY for idle rooms, and a stale
+		// snapshot must never be imposed on a live room (the old resume
+		// rewound the room to the card's position and its stale Paused=false
+		// dropped a deliberate pause). AUTO-JOIN: clear the lobby (cleared
+		// by swap, never mutated — the Ui reader may still hold it) and join
+		// through the live path: load the room's file (the heartbeat's file
+		// stamp names it; the faz-3 gate guarantees it IS the room's) and
+		// adopt the heartbeat's t/p — it parks via the existing flush
+		// machinery, dur is 0 right after startLoad. An idle room has no
+		// heartbeat, so the card always survives there; an idle master
+		// posts no positions (no self-trigger).
+		if e.lobby != nil {
+			guess := e.lobby.Now // a legacy heartbeat without a file stamp
+			e.lobby = nil
+			name := ev.File
+			if name == "" {
+				name = guess
+			}
+			e.startLoad(name)
+			t := ev.T
+			e.adoptRoomState(&t, ev.P)
+			e.lastPause = ev.P // L1c F3 (M27): the C6 toggle baseline, mirrored from the hello path — a stale one posts the WRONG first toggle and a redundant pause naming us
+		} else if e.pendingPos != nil {
+			// L1-X1 (#86b): a heartbeat during the pendingPos park window (the
+			// F1 duration wait on the load path) carries FRESHER room truth
+			// than the parked hello position — UPDATE the pending value instead
+			// of dropping it. Clearing it made a follower joining a PAUSED live
+			// room land at 0:00 forever: a paused room never drift-corrects, so
+			// the parked position was the only seek source. The window is
+			// bounded by the first flush (dur known → pendingPos nil); after it
+			// a scrub while paused stays untouched — no pending, no seek, no
+			// paused-heartbeat seek loop.
+			p := ev.T
+			e.pendingPos, e.pendingPause = &p, ev.P
+		}
 	case "hello":
 		// Resume-by-design: a reconnecting client (follower OR master)
 		// reloads the room's file and seeks to the live position. For a
@@ -808,9 +900,22 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		// — bounded, self-consistent (the master is the authority), and far
 		// better than starting empty while the room still carries state.
 		// End-to-end: tests/master_restart.mjs.
-		// only (re)load when the file actually differs from what our mpv is
-		// already playing: an SSE blip must not restart a mid-film download (F3)
-		if ev.Now != "" && ev.Now != e.loaded {
+		// L1 §1: ONE discriminator — the hello roster. An IDLE room (unique
+		// nicks ≤ 1; the single entry is always us, the server registers us
+		// before writing hello) with a differing file holds the file back
+		// as the lobby instead of auto-loading: seeding a pendingPos for a
+		// never-loaded file would be a trap (the F1 clamp would wait for a
+		// duration that never arrives, and could hijack a later same-file
+		// pick). The UI surfaces the lobby as the resume card.
+		gated := lobbyIdle(ev.Roster) && ev.Now != "" && ev.Now != e.loaded
+		if gated {
+			pos := ev.Pos // keep the room's position (nil = it had none) and pause for the card
+			e.lobby = &Lobby{Now: ev.Now, Pos: pos, Paused: ev.P}
+			// surface the card NOW: mpv sits idle, nothing else will emit
+			e.emitUi(mpv.State{Idle: true}, 0)
+		} else if ev.Now != "" && ev.Now != e.loaded {
+			// only (re)load when the file actually differs from what our mpv is
+			// already playing: an SSE blip must not restart a mid-film download (F3)
 			e.startLoad(ev.Now)
 		}
 		// a reconnect is a fresh stall window: a behind-tick from before
@@ -828,46 +933,11 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		if !e.resumeSeen {
 			e.behind = 0 // a reconnect is a fresh stall window
 		}
-		// Server may carry an age-adjusted media position + paused flag
-		// from the room's live snapshot (set after every position relay,
-		// cleared by load/ended/skip). When present, snap now and seek
-		// before the first heartbeat would even arrive.
-		if ev.Pos != nil {
-			// F1: clamp the room's position to the file we actually have.
-			// mpv reports the duration only after the file is loaded, so
-			// the duration is often unknown here: seeking then could land
-			// past the end of the film (EOF). Wait for the first sample
-			// that knows the duration.
-			if e.dur > 0 {
-				// F8: the local position rides the last poll sample (polledPos,
-				// ≤2s old here — the hello lands on the dispatcher, not the poll
-				// tick). On a blip where mpv drifted 1-2s since that sample this
-				// can issue a ≤2s corrective seek where a fresh Pos() would have
-				// skipped — convergent, and the file identity (no reload) is
-				// unaffected. The pre-F8 wiring paid two Pos() round trips under
-				// e.mu instead (~10s wedged on join/reconnect, A8 master-2).
-				e.applySnapshot(*ev.Pos, ev.P, e.polledPos)
-			} else {
-				p := *ev.Pos
-				e.pendingPos, e.pendingPause = &p, ev.P
-			}
-			if ev.P {
-				e.setPause(true)
-				e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
-				e.pausedBy = "" // the snapshot names no actor: honest empty
-			}
-		} else if ev.P {
-			// F9 CASE B (client half): the room's pause state arrives
-			// WITHOUT a position — adopt it. The setPause tell pauses the
-			// player and the ACTUATION gate (:1166) eats the echo of our
-			// own actuation; postedPause mirrors the adopted state — the
-			// room already knows it, so nothing is posted.
-			e.setPause(true)
-			e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
-			e.localPause = true
-			p := true
-			e.postedPause = &p
-			e.pausedBy = "" // the snapshot names no actor: honest empty
+		// the room's position/pause adoption runs through ONE block shared
+		// with ResumeLobby (L1 §3) — the gated leg above deliberately skips
+		// it (§1: no adoption for a never-loaded file).
+		if !gated {
+			e.adoptRoomState(ev.Pos, ev.P)
 		}
 		// F10 C6 (A10 M2-06): the adopted room truth is also the master's
 		// toggle baseline — without it the first toggle posted the WRONG
@@ -884,6 +954,11 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		e.lastPause = true   // master dedup stays consistent with reality
 		e.postedPause = nil  // the room's state supersedes our pending post
 		e.pausedBy = ev.Nick // the relay names the actor ("" = unstamped)
+		// L1b G1: the park window tracks the room's live pause truth —
+		// the flush must not wipe a pause that landed after the park
+		if e.pendingPos != nil {
+			e.pendingPause = true
+		}
 		// m2-S2: a mechanical pause (a stall on the other side's link)
 		// names no human: the chip must not blame someone for it.
 		e.mechPause = ev.Mechanical
@@ -902,6 +977,11 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 		e.lastPause = false
 		e.postedPause = nil // the room's state supersedes our pending post
 		e.pausedBy = ""     // playing: nobody holds the pause
+		// L1b G1: the park window tracks the room's live pause truth —
+		// the flush must not resurrect a pause the room dropped
+		if e.pendingPos != nil {
+			e.pendingPause = false
+		}
 		if e.snap != nil {
 			e.snap.paused = false
 			// re-anchor: the snapshot's age spans the pause; aging it into
@@ -909,8 +989,24 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 			e.snap.at = e.Clock.Now()
 		}
 	case "seek":
-		e.seekTo(ev.T)
-		e.lastPos = nil // the applied seek moved us: the scrub baseline is stale
+		// L1b G1 (#86c): a seek the file cannot act on yet — still loading,
+		// no duration to clamp/apply against — PARKS in pendingPos and rides
+		// the existing flush when the duration arrives, instead of firing a
+		// tell mpv can lose at file head (the co-resident lobby peer's
+		// handoff seek). The park dies with the next startLoad's clean-slate
+		// clear: a stale seek must not hijack a later pick. A LIVE file
+		// (duration known) acts immediately, unchanged — the F8 settle seam.
+		if e.dur == 0 {
+			p := ev.T
+			// the park carries the ROOM's pause truth (lastPause) and keeps
+			// tracking it (the pause/play cases below flip the pending flag):
+			// the flush must neither wipe a pause the peer actuated (L1-9) nor
+			// resurrect one the room dropped before the flush (#86c addendum)
+			e.pendingPos, e.pendingPause = &p, e.lastPause
+		} else {
+			e.seekTo(ev.T)
+			e.lastPos = nil // the applied seek moved us: the scrub baseline is stale
+		}
 	case "chat":
 		// chat OSD over the video (client.py parity: 3s show-text) — F8: a
 		// tell enqueue, nothing blocks (the pipe write belongs to the worker)
@@ -931,6 +1027,73 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 	}
 }
 
+// lobbyIdle reports an idle room (L1 §1): the hello roster's unique
+// nicks are EXACTLY us — the server registers us before writing hello,
+// so the single entry is always ours and the engine needs no nick.
+// An ABSENT roster (zero entries) is not an idle signal: a legacy or
+// malformed hello keeps the live path (auto-load) — byte-compatible
+// with the pre-L1 tree. ACCEPTED EDGE (§8): two members sharing one
+// nick dedupe to a single roster entry — a false idle; the room then
+// shows the card until a real load event arrives. Distinct nicks are
+// the norm.
+func lobbyIdle(roster []string) bool {
+	seen := map[string]bool{}
+	for _, n := range roster {
+		seen[n] = true
+	}
+	return len(seen) == 1
+}
+
+// adoptRoomState adopts the room's position + pause: the hello case's
+// snapshot block, extracted VERBATIM so L1's ResumeLobby adopts through
+// the SAME machinery (§3) — the F1 clamp, the pendingPos wait and the
+// CASE-B pause must not drift between the two entry points. Caller holds
+// e.mu. pos may be nil (the room carries no position); paused is the
+// room's pause flag.
+func (e *Engine) adoptRoomState(pos *float64, paused bool) {
+	// Server may carry an age-adjusted media position + paused flag
+	// from the room's live snapshot (set after every position relay,
+	// cleared by load/ended/skip). When present, snap now and seek
+	// before the first heartbeat would even arrive.
+	if pos != nil {
+		// F1: clamp the room's position to the file we actually have.
+		// mpv reports the duration only after the file is loaded, so
+		// the duration is often unknown here: seeking then could land
+		// past the end of the film (EOF). Wait for the first sample
+		// that knows the duration.
+		if e.dur > 0 {
+			// F8: the local position rides the last poll sample (polledPos,
+			// ≤2s old here — the hello lands on the dispatcher, not the poll
+			// tick). On a blip where mpv drifted 1-2s since that sample this
+			// can issue a ≤2s corrective seek where a fresh Pos() would have
+			// skipped — convergent, and the file identity (no reload) is
+			// unaffected. The pre-F8 wiring paid two Pos() round trips under
+			// e.mu instead (~10s wedged on join/reconnect, A8 master-2).
+			e.applySnapshot(*pos, paused, e.polledPos)
+		} else {
+			p := *pos
+			e.pendingPos, e.pendingPause = &p, paused
+		}
+		if paused {
+			e.setPause(true)
+			e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
+			e.pausedBy = "" // the snapshot names no actor: honest empty
+		}
+	} else if paused {
+		// F9 CASE B (client half): the room's pause state arrives
+		// WITHOUT a position — adopt it. The setPause tell pauses the
+		// player and the ACTUATION gate (:1166) eats the echo of our
+		// own actuation; postedPause mirrors the adopted state — the
+		// room already knows it, so nothing is posted.
+		e.setPause(true)
+		e.retryTyp = "" // F11 C1: the room's adoption supersedes a failed post's stamp
+		e.localPause = true
+		p := true
+		e.postedPause = &p
+		e.pausedBy = "" // the snapshot names no actor: honest empty
+	}
+}
+
 // startLoad is the lock-held half of a file change (F6-A1): the
 // bookkeeping and the loadfile tell — the ONLY blocking call allowed here
 // (a bounded tell). The wait for the file to go live and the subtitle
@@ -938,6 +1101,7 @@ func (e *Engine) onRoomLocked(ev room.Event) {
 // freeze the TUI for the whole load chain anymore (~25-35s before).
 func (e *Engine) startLoad(name string) {
 	// caller holds e.mu
+	e.lobby = nil // L1 §4 choke point: any load (own resume, own picker play, received load, live hello) clears the card
 	e.behind, e.autoPaused = 0, false
 	e.resumed = false            // a new file: the next jump is a new resume
 	e.resumeSeen = false         // a new file: no unresolved jump
@@ -958,7 +1122,8 @@ func (e *Engine) startLoad(name string) {
 	// the room could be paused for a "stall" that is just the new head)
 	e.snap = nil
 	e.pendingPos = nil
-	e.heldPause = nil // a new file's window starts clean: the old claim is stale
+	e.pendingPause = false // L1b G1: a stale parked pause must not tint a later seek park's flush
+	e.heldPause = nil      // a new file's window starts clean: the old claim is stale
 	// F11 C2 (A11-F2): a new file PLAYS — the server's S5 already reset the
 	// room's pause, and v1.9.2 carried the old film's local pause into the
 	// new file until the self-heal's grace expired (~4-6s frozen). Reset the
@@ -1002,6 +1167,7 @@ func (e *Engine) continueLoad(name string, deadline time.Time) {
 func (e *Engine) OwnLoad(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.lobby = nil // L1 §4: the picker's own play clears the card too (OwnLoad bypasses startLoad)
 	e.loaded = name
 	e.loadedAt = e.Clock.Now()
 	e.behind, e.autoPaused = 0, false
@@ -1011,6 +1177,7 @@ func (e *Engine) OwnLoad(name string) {
 	e.endedAt = time.Time{}
 	e.snap = nil // same as load(): the old snapshot belongs to the old file
 	e.pendingPos = nil
+	e.pendingPause = false // L1b G1: same as load(): no stale parked pause
 }
 
 // applySnapshot anchors the room's live position, clamped to the file we
@@ -1767,7 +1934,7 @@ func (e *Engine) emitUi(s mpv.State, drift float64) {
 		by = "" // playing: the chip is not shown, the actor is moot
 	}
 	select {
-	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Mechanical: e.mechPause, Sub: s.Sub, Layout: s.Layout, Room: roomHasSnap}:
+	case e.Ui <- UiState{Drift: drift, Pos: s.Pos, Paused: s.Pause, Cache: s.Cache, Volume: s.Volume, Muted: s.Muted, Stale: stale, PausedBy: by, Mechanical: e.mechPause, Sub: s.Sub, Layout: s.Layout, Room: roomHasSnap, Lobby: e.lobby}:
 	default:
 	}
 }
